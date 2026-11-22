@@ -44,6 +44,10 @@ tree=$(tree_for "$env_name") || usage 1
 [[ -d "$tree/.repo" ]] || { echo "error: no repo tree at $tree" >&2; exit 1; }
 
 acquire_build_lock
+# Lowest CPU priority: the build and every compiler it starts yield to
+# anything interactive, but still use idle cores. (bench does not do this, so
+# its timings are not affected by the desktop.)
+renice -n 19 $$ >/dev/null
 ensure_image
 out=$BENCH_HOME/out-$env_name
 mkdir -p "$out" "$BENCH_HOME/logs"
