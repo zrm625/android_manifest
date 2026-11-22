@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Benchmark LineageOS builds for river: the frozen baseline tree against the
+# stripped tree. Runs one build at a time in a pinned podman container.
+#
+# Usage: bench <baseline|stripped> [--incremental] [--jobs N] [--target T]
+#
+#   baseline     The frozen tree at $BASELINE_TREE (manifest branch baseline-22.2).
+#   stripped     This tree (manifest branch river-22.2), as it is checked out now.
+#   --incremental  Keep the previous out/ and rebuild. Default is a cold build:
+#                  out/ is deleted first and ccache is off.
+#   --jobs N     Parallel jobs for m. Default: nproc.
+#   --target T   Build target. Default: bacon.
+#
+# The source tree is mounted read-only, so a benchmark cannot change it.
+# Results are appended to $BENCH_HOME/results/results.csv. Soong metrics, the
+# build trace, the log, and the list of project commits go to
+# $BENCH_HOME/results/<run id>/.
+set -euo pipefail
+source "$(dirname "$(realpath "$0")")/../common.sh"
+
+BENCH_HOME=${BENCH_HOME:-/mnt/storage/lineageos-bench}
+BASELINE_TREE=${BASELINE_TREE:-$HOME/git/lineageos-river-baseline}
+MIN_FREE_GB=${MIN_FREE_GB:-150}
+BENCH_DIR=$(dirname "$(realpath "$0")")
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+env_name=${1:-}; shift || true
+case "$env_name" in
+  baseline) tree=$BASELINE_TREE ;;
+  stripped) tree=$TOP ;;
+  -h|--help) usage 0 ;;
+  *) usage 1 ;;
+esac
+mode=cold jobs=$(nproc) target=bacon
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --incremental) mode=incremental ;;
+    --jobs) jobs=$2; shift ;;
+    --target) target=$2; shift ;;
+    -h|--help) usage 0 ;;
+    *) echo "unknown option: $1" >&2; usage 1 ;;
+  esac
+  shift
+done
+
+[[ -d "$tree/.repo" ]] || { echo "error: no repo tree at $tree" >&2; exit 1; }
+
+out=$BENCH_HOME/out-$env_name
+results=$BENCH_HOME/results
+mkdir -p "$out" "$results"
+
+# One benchmark at a time. Two builds at once make both timings meaningless.
+exec 9>"$BENCH_HOME/.lock"
+flock -n 9 || { echo "error: another benchmark is running" >&2; exit 1; }
+
+image="lineageos-bench:$(sha256sum "$BENCH_DIR/Containerfile" | cut -c1-12)"
+if ! podman image exists "$image"; then
+  echo "Building $image"
+  podman build -t "$image" -f "$BENCH_DIR/Containerfile" "$BENCH_DIR"
+fi
+
+if [[ "$mode" == cold ]]; then
+  echo "Deleting $out for a cold build"
+  find "$out" -mindepth 1 -delete
+fi
+free_gb=$(( $(df --output=avail -B1G "$out" | tail -1) ))
+if (( free_gb < MIN_FREE_GB )); then
+  echo "error: ${free_gb} GB free, need ${MIN_FREE_GB} GB (set MIN_FREE_GB to override)" >&2
+  exit 1
+fi
+
+run_id="$(date +%Y%m%d-%H%M%S)-$env_name-$mode"
+run_dir=$results/$run_id
+mkdir -p "$run_dir"
+
+# Record exactly what was built.
+manifest_sha=$(git -C "$tree/.repo/manifests" rev-parse HEAD)
+(cd "$tree" && "$tree/.repo/repo/repo" forall -c 'echo "$REPO_PATH $(git rev-parse HEAD)"') \
+  | sort > "$run_dir/projects.txt"
+tree_hash=$(sha256sum "$run_dir/projects.txt" | cut -c1-16)
+load1=$(cut -d' ' -f1 /proc/loadavg)
+governor=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo unknown)
+
+# The read-only tree needs an out/ mount point for the writable out mount.
+[[ -d "$tree/out" ]] || mkdir "$tree/out"
+
+if [[ "$mode" == cold ]]; then ccache_env=(-e USE_CCACHE=0 -e CCACHE_DISABLE=1); else ccache_env=(); fi
+
+echo "Run $run_id: $target, -j$jobs, tree $tree_hash, load $load1"
+set +e
+# HOME must be writable: Soong keeps a Go build cache in $HOME/.cache.
+podman run --rm --name "bench-$env_name" --userns=keep-id \
+  --tmpfs /home/build:exec -e HOME=/home/build -e USER=build \
+  -v "$tree:/src:ro" -v "$out:/src/out:rw" -w /src \
+  "${ccache_env[@]}" -e BENCH_TARGET="$target" -e BENCH_JOBS="$jobs" \
+  "$image" bash -c '
+    source build/envsetup.sh >/dev/null
+    breakfast river >/dev/null || exit 90
+    start=$(date +%s.%N)
+    m "$BENCH_TARGET" -j"$BENCH_JOBS"
+    rc=$?
+    end=$(date +%s.%N)
+    peak=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo "")
+    echo "$rc $(echo "$end - $start" | bc) $peak" > out/.bench-result
+    exit $rc
+  ' 2>&1 | tee "$run_dir/build.log"
+set -e
+
+read -r rc wall peak < <(cat "$out/.bench-result" 2>/dev/null || echo "90 0 ")
+out_bytes=$(du -sb "$out" | cut -f1)
+for f in soong_build_metrics.pb build.trace.gz build_progress.pb verbose.log.gz; do
+  [[ -e "$out/$f" ]] && cp "$out/$f" "$run_dir/"
+done
+
+csv=$results/results.csv
+[[ -s "$csv" ]] || echo "run_id,env,mode,target,jobs,exit_code,wall_seconds,memory_peak_bytes,out_bytes,manifest_sha,tree_hash,load1_before,governor,image" > "$csv"
+echo "$run_id,$env_name,$mode,$target,$jobs,$rc,$wall,$peak,$out_bytes,$manifest_sha,$tree_hash,$load1,$governor,$image" >> "$csv"
+
+echo
+echo "exit $rc, ${wall}s, peak memory ${peak:-unknown} bytes, out/ $(( out_bytes / 1024 / 1024 / 1024 )) GB"
+echo "Results: $csv"
+exit "$rc"
