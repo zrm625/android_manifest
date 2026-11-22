@@ -6,7 +6,7 @@
 #   baseline|stripped  Use $BENCH_HOME/out-<env>/target/product/river.
 #   PRODUCT_DIR        Any directory with boot.img, dtbo.img, system.img and vendor.img,
 #                      for example out/target/product/river from a normal build.
-#   --wipe       Factory reset (fastboot -w). Required the first time you move from
+#   --wipe       Factory reset (erases userdata). Required the first time you move from
 #                a build signed with other keys, such as an official LineageOS nightly.
 #   --no-reboot  Stay in the bootloader after flashing.
 #
@@ -67,7 +67,10 @@ until fastboot devices 2>/dev/null | grep -q "^$SERIAL[[:space:]]"; do
 done
 product_var=$(getvar product)
 [[ "$product_var" == "$DEVICE_CODENAME" ]] || { echo "error: bootloader reports product '$product_var', not $DEVICE_CODENAME. Refusing." >&2; exit 1; }
-[[ "$(getvar unlocked)" == yes ]] || { echo "error: bootloader is locked" >&2; exit 1; }
+# Motorola bootloaders report securestate instead of unlocked.
+unlocked=$(getvar unlocked); securestate=$(getvar securestate)
+[[ "$unlocked" == yes || "$securestate" == flashing_unlocked || "$securestate" == unlocked ]] \
+  || { echo "error: bootloader is locked (unlocked: '${unlocked}', securestate: '${securestate}')" >&2; exit 1; }
 
 current=$(getvar current-slot); current=${current#_}
 case "$current" in a) target=b ;; b) target=a ;; *) echo "error: unknown current slot '$current'" >&2; exit 1 ;; esac
@@ -77,8 +80,10 @@ for img in "${IMAGES[@]}"; do
 done
 fb --set-active="$target"
 if [[ "$wipe" == 1 ]]; then
+  # Not fastboot -w: Motorola refuses to erase metadata, which river does not
+  # use. userdata is formattable in the fstab, so Android formats it on boot.
   echo "Factory reset"
-  fb -w
+  fb erase userdata
 fi
 if [[ "$reboot" == 0 ]]; then
   echo "Done. Phone is in the bootloader, slot $target active."
