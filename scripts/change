@@ -113,7 +113,7 @@ cmd_pr() {
     has_branch "$path" "$name" || continue
     [[ "$(ahead "$path" "$remote" "$name")" != 0 ]] || continue
     [[ -z "$(git -C "$path" status --porcelain)" ]] || echo "warning: $(short "$path") has uncommitted changes; they are not in the PR" >&2
-    git -C "$path" push -q --force-with-lease "$remote" "$name:$name"
+    git -C "$path" push -q --force-with-lease "$remote" "$name:$name" 2> >(grep -v '^remote:' >&2)
     local url; url=$(pr_json "$slug" "$name" '[.[] | select(.state == "OPEN")][0].url // empty')
     if [[ -z "$url" ]]; then
       [[ -n "$title" ]] || die "no PR yet in $slug: pass -t TITLE"
