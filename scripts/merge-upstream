@@ -25,13 +25,27 @@ if [[ "${1:-}" == "--one" ]]; then
   git checkout --quiet "$FORK_BRANCH"
   git merge --quiet --ff-only "$FORK_REMOTE/$FORK_BRANCH"
   upstream_ref="lineage/$REPO__UPSTREAM_BRANCH"
+  # Checkouts made with `repo init --depth=1` lack the history a merge needs.
+  # Deepen until the fork and upstream share a commit.
+  for depth in 50 200 1000 5000; do
+    git merge-base HEAD "$upstream_ref" >/dev/null 2>&1 && break
+    [[ "$(git rev-parse --is-shallow-repository)" == true ]] || break
+    git fetch --quiet --deepen="$depth" "$FORK_REMOTE" "$FORK_BRANCH"
+  done
+  if ! git merge-base HEAD "$upstream_ref" >/dev/null 2>&1; then
+    [[ "$(git rev-parse --is-shallow-repository)" == true ]] && git fetch --quiet --unshallow "$FORK_REMOTE" "$FORK_BRANCH"
+    if ! git merge-base HEAD "$upstream_ref" >/dev/null 2>&1; then
+      echo "$REPO_PATH: FAILED, no common history with $upstream_ref"
+      exit 1
+    fi
+  fi
   count=$(git rev-list --count "HEAD..$upstream_ref")
   if [[ "$count" == 0 ]]; then
     echo "$REPO_PATH: up to date with $REPO__UPSTREAM_REPO $REPO__UPSTREAM_BRANCH"
   elif git merge --quiet --no-edit -m "Merge $REPO__UPSTREAM_REPO $REPO__UPSTREAM_BRANCH into $FORK_BRANCH" "$upstream_ref"; then
     echo "$REPO_PATH: merged $count upstream commits"
   else
-    git merge --abort
+    git merge --abort 2>/dev/null || true
     echo "$REPO_PATH: CONFLICT, merge aborted. Resolve by hand: git merge $upstream_ref"
     exit 1
   fi
