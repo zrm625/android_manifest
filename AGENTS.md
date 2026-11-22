@@ -4,6 +4,10 @@ This tree is **zrm625's fork** of LineageOS 22.2 for the Moto G7 (`river`). The
 `repo` manifest is [zrm625/android_manifest](https://github.com/zrm625/android_manifest).
 The aim is a stripped-down build. Removing projects and features is expected.
 
+The start-here guide for building, installing on the phone, and using the
+build is `~/git/river/AGENTS.md` (source: `workspace/AGENTS.md` in this repo).
+This file covers the source tree.
+
 `AGENTS.md` and `CLAUDE.md` at the top of the tree link to
 `.repo/manifests/AGENTS.md`. Edit that file and open a pull request against the
 manifest repo.
@@ -94,6 +98,9 @@ The goal is to cut build time and image size against a frozen baseline.
   It flashes the build from that tree to the Moto G7 test phone (serial
   `ZY225DPT7F`), then records boot time, RAM, processes, packages, partition
   use, and idle CPU to `device.csv`.
+- **Install a build:** `.repo/manifests/scripts/flash <baseline|stripped> [--wipe]`.
+  It uses fastboot to flash the inactive A/B slot, so the running slot stays
+  as a fallback.
 - The test phone is the USB Moto G7 only. Never run adb or fastboot commands
   against any other device, such as the Pixel on wireless adb. Always pass
   `-s ZY225DPT7F`.
