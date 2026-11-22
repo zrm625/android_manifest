@@ -53,6 +53,14 @@
     <annotation name="UPSTREAM_REPO" value="LineageOS/android_device_motorola_sdm632-common"/>
     <annotation name="UPSTREAM_BRANCH" value="lineage-22.2"/>
   </project>
+  <project name="proprietary_vendor_motorola_river" path="vendor/motorola/river" remote="zrm625" revision="refs/heads/river-22.2" dest-branch="refs/heads/river-22.2" groups="zrm625-fork">
+    <annotation name="UPSTREAM_REPO" value="TheMuppets/proprietary_vendor_motorola_river"/>
+    <annotation name="UPSTREAM_BRANCH" value="lineage-22.2"/>
+  </project>
+  <project name="proprietary_vendor_motorola_sdm632-common" path="vendor/motorola/sdm632-common" remote="zrm625" revision="refs/heads/river-22.2" dest-branch="refs/heads/river-22.2" groups="zrm625-fork">
+    <annotation name="UPSTREAM_REPO" value="TheMuppets/proprietary_vendor_motorola_sdm632-common"/>
+    <annotation name="UPSTREAM_BRANCH" value="lineage-22.2"/>
+  </project>
   <project name="LineageOS/android_device_qcom_sepolicy" path="device/qcom/sepolicy" revision="9fc52af4fdb277b5db3b17f702b040d1a7696c2d" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="qcom,qssi"/>
   <project name="LineageOS/android_device_qcom_sepolicy" path="device/qcom/sepolicy-legacy-um" revision="c52d34c91ab33e303ed0f4d4685af14ea6c4495c" upstream="lineage-22.2-legacy-um" dest-branch="lineage-22.2-legacy-um" groups="qcom,sdm660"/>
   <project name="LineageOS/android_device_qcom_sepolicy_vndr" path="device/qcom/sepolicy_vndr/legacy-um" revision="6d3b8e5a7baa5271c8823171bee35f0a528b328f" upstream="lineage-22.2-legacy-um" dest-branch="lineage-22.2-legacy-um" groups="lahaina,qcom"/>

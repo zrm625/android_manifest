@@ -22,6 +22,8 @@ remote, a `gh` default, or the GitHub UI suggests it.
 | `kernel/motorola/sdm632` | `zrm625/android_kernel_motorola_sdm632` | `river-22.2` |
 | `hardware/motorola` | `zrm625/android_hardware_motorola` | `river-22.2` |
 | `vendor/lineage` | `zrm625/android_vendor_lineage` | `river-22.2` |
+| `vendor/motorola/river` | `zrm625/proprietary_vendor_motorola_river` | `river-22.2` |
+| `vendor/motorola/sdm632-common` | `zrm625/proprietary_vendor_motorola_sdm632-common` | `river-22.2` |
 
 Always name the repo and base explicitly:
 
@@ -70,6 +72,12 @@ move them forward, regenerate those pins in a manifest pull request.
   commit. Remove projects in small batches.
 - **Less in the image.** Remove packages and features in `vendor/lineage`
   or `device/motorola/*`.
+- **Fewer proprietary blobs.** The blobs in `vendor/motorola/*` are closed-source
+  binaries from Motorola's stock firmware (forked from TheMuppets); there is no
+  source for them. To drop a blob, remove it from `proprietary-files.txt` in
+  the matching `device/motorola/*` repo, then regenerate the vendor makefiles
+  with that repo's `setup-makefiles.py`. Change both repos in matching pull
+  requests.
 
 ## New checkout
 
@@ -93,13 +101,13 @@ m bacon
 
 ## Fork another project
 
-1. `gh repo fork LineageOS/<name> --clone=false --default-branch-only`
+1. `gh repo fork <upstream owner>/<name> --clone=false --default-branch-only`
 2. Create `river-22.2` at the commit pinned in `default.xml`:
    `gh api -X POST repos/zrm625/<name>/git/refs -f ref=refs/heads/river-22.2 -f sha=<pinned sha>`
 3. Set the fork's default branch to `river-22.2`:
    `gh api -X PATCH repos/zrm625/<name> -f default_branch=river-22.2`
 4. In `default.xml`, change the project entry to match the existing forks:
-   `remote="zrm625"`, `name` without the `LineageOS/` prefix,
+   `remote="zrm625"`, `name` without the owner prefix,
    `revision` and `dest-branch` set to `refs/heads/river-22.2`, `zrm625-fork`
    added to `groups`, and `UPSTREAM_REPO` and `UPSTREAM_BRANCH` annotations.
 5. Add a row to the table above.
