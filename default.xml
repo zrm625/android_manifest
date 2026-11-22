@@ -23,7 +23,9 @@
   <project name="LineageOS/android_bionic" path="bionic" revision="30951077b29562f853a5b848414cd39639df719a" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk"/>
   <project name="LineageOS/android_bootable_deprecated-ota" path="bootable/deprecated-ota" revision="e0a8a08caf61f2e16586471e79bea80da6465967" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk-cw"/>
   <project name="LineageOS/android_bootable_recovery" path="bootable/recovery" revision="b7461833c7a75c00417208d61ee4c173c645dc1a" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk"/>
-  <project name="LineageOS/android_build" path="build/make" revision="ab5acb1281035ebc9b0f190baf22ef3ea896106e" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk,sysui-studio">
+  <project name="android_build" path="build/make" remote="zrm625" revision="refs/heads/river-22.2" dest-branch="refs/heads/river-22.2" groups="pdk,sysui-studio,zrm625-fork">
+    <annotation name="UPSTREAM_REPO" value="LineageOS/android_build"/>
+    <annotation name="UPSTREAM_BRANCH" value="lineage-22.2"/>
     <linkfile src="CleanSpec.mk" dest="build/CleanSpec.mk"/>
     <linkfile src="buildspec.mk.default" dest="build/buildspec.mk.default"/>
     <linkfile src="core" dest="build/core"/>
