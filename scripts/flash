@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Install a build on the Moto G7 test phone with fastboot.
+#
+# Usage: flash <baseline|stripped|PRODUCT_DIR> [--wipe] [--no-reboot]
+#
+#   baseline|stripped  Use $BENCH_HOME/out-<env>/target/product/river.
+#   PRODUCT_DIR        Any directory with boot.img, dtbo.img, system.img and vendor.img,
+#                      for example out/target/product/river from a normal build.
+#   --wipe       Factory reset (erases userdata). Required the first time you move from
+#                a build signed with other keys, such as an official LineageOS nightly.
+#   --no-reboot  Stay in the bootloader after flashing.
+#
+# The images go to the inactive A/B slot, and then that slot is made active. The
+# slot that was running stays intact. If the new build does not boot, switch
+# back with: fastboot -s <serial> --set-active=<old slot>
+#
+# Only the phone with serial $BENCH_DEVICE (default ZY225DPT7F) is touched, and
+# only if it reports itself as river.
+set -euo pipefail
+
+BENCH_HOME=${BENCH_HOME:-/mnt/storage/lineageos-bench}
+SERIAL=${BENCH_DEVICE:-ZY225DPT7F}
+DEVICE_CODENAME=river
+IMAGES=(boot dtbo system vendor)
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+src=${1:-}; shift || true
+case "$src" in
+  baseline|stripped) product=$BENCH_HOME/out-$src/target/product/$DEVICE_CODENAME ;;
+  -h|--help) usage 0 ;;
+  "") usage 1 ;;
+  *) product=$src ;;
+esac
+wipe=0 reboot=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --wipe) wipe=1 ;;
+    --no-reboot) reboot=0 ;;
+    -h|--help) usage 0 ;;
+    *) echo "unknown option: $1" >&2; usage 1 ;;
+  esac
+  shift
+done
+
+for img in "${IMAGES[@]}"; do
+  [[ -f "$product/$img.img" ]] || { echo "error: missing $product/$img.img; build first" >&2; exit 1; }
+done
+built_for=$(grep -m1 '^ro.product.system.device=\|^ro.product.device=' "$product/system/build.prop" 2>/dev/null | cut -d= -f2 || true)
+if [[ -n "$built_for" && "$built_for" != "$DEVICE_CODENAME" ]]; then
+  echo "error: $product was built for '$built_for', not $DEVICE_CODENAME" >&2; exit 1
+fi
+
+fb() { fastboot -s "$SERIAL" "$@"; }
+getvar() { fb getvar "$1" 2>&1 | awk -F': *' -v k="$1" '$1 == k {print $2; exit}' | tr -d '\r'; }
+
+# Get the phone into the bootloader, checking it is the river test phone.
+if [[ "$(adb -s "$SERIAL" get-state 2>/dev/null || true)" == device ]]; then
+  codename=$(adb -s "$SERIAL" shell getprop ro.product.device | tr -d '\r')
+  [[ "$codename" == "$DEVICE_CODENAME" ]] || { echo "error: $SERIAL is '$codename', not $DEVICE_CODENAME. Refusing." >&2; exit 1; }
+  adb -s "$SERIAL" reboot bootloader
+fi
+deadline=$((SECONDS + 90))
+until fastboot devices 2>/dev/null | grep -q "^$SERIAL[[:space:]]"; do
+  (( SECONDS < deadline )) || { echo "error: $SERIAL is not in adb or fastboot mode. Is it plugged in?" >&2; exit 1; }
+  sleep 1
+done
+product_var=$(getvar product)
+[[ "$product_var" == "$DEVICE_CODENAME" ]] || { echo "error: bootloader reports product '$product_var', not $DEVICE_CODENAME. Refusing." >&2; exit 1; }
+# Motorola bootloaders report securestate instead of unlocked.
+unlocked=$(getvar unlocked); securestate=$(getvar securestate)
+[[ "$unlocked" == yes || "$securestate" == flashing_unlocked || "$securestate" == unlocked ]] \
+  || { echo "error: bootloader is locked (unlocked: '${unlocked}', securestate: '${securestate}')" >&2; exit 1; }
+
+current=$(getvar current-slot); current=${current#_}
+case "$current" in a) target=b ;; b) target=a ;; *) echo "error: unknown current slot '$current'" >&2; exit 1 ;; esac
+echo "Flashing $product to slot $target (current slot: $current)"
+for img in "${IMAGES[@]}"; do
+  fb flash "${img}_$target" "$product/$img.img"
+done
+fb --set-active="$target"
+if [[ "$wipe" == 1 ]]; then
+  # Not fastboot -w: Motorola refuses to erase metadata, which river does not
+  # use. userdata is formattable in the fstab, so Android formats it on boot.
+  echo "Factory reset"
+  fb erase userdata
+fi
+if [[ "$reboot" == 0 ]]; then
+  echo "Done. Phone is in the bootloader, slot $target active."
+  exit 0
+fi
+fb reboot
+echo "Waiting for boot (the first boot after a wipe takes a few minutes)"
+adb -s "$SERIAL" wait-for-device
+deadline=$((SECONDS + 900))
+until [[ "$(adb -s "$SERIAL" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" == 1 ]]; do
+  (( SECONDS < deadline )) || { echo "error: no boot after 15 minutes. Roll back: fastboot -s $SERIAL --set-active=$current" >&2; exit 1; }
+  sleep 2
+done
+echo "Booted $(adb -s "$SERIAL" shell getprop ro.lineage.display.version | tr -d '\r') on slot $target"

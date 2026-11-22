@@ -3,12 +3,12 @@
 #
 # Usage: device-bench <baseline|stripped|current> [--flash] [--wipe] [--boots N] [--settle S]
 #
-#   baseline|stripped  Label for the results. With --flash, also picks the newest
-#                      lineage-*.zip in $BENCH_HOME/out-<env>/target/product/river.
+#   baseline|stripped  Label for the results. With --flash, also installs the images
+#                      from $BENCH_HOME/out-<env>/target/product/river.
 #   current            Measure whatever the phone runs now. Cannot be combined with --flash.
-#   --flash   Sideload the build through LineageOS recovery.
-#   --wipe    After flashing, factory reset in recovery, so each build starts
-#             from clean data. Recommended when you switch between builds.
+#   --flash   Install the build with scripts/flash (fastboot, inactive slot).
+#   --wipe    Factory reset while flashing, so each build starts from clean
+#             data. Recommended when you switch between builds.
 #   --boots N   Reboot and measure N times. Default: 3.
 #   --settle S  Seconds to wait after boot before measuring memory and CPU. Default: 120.
 #
@@ -71,22 +71,10 @@ exec 9>"$BENCH_HOME/.device-lock"
 flock -n 9 || { echo "error: another device benchmark is running" >&2; exit 1; }
 
 if [[ "$flash" == 1 ]]; then
-  zip=$(ls -t "$BENCH_HOME/out-$env_name/target/product/$DEVICE_CODENAME"/lineage-*.zip 2>/dev/null | head -1 || true)
-  [[ -n "$zip" ]] || { echo "error: no lineage-*.zip in $BENCH_HOME/out-$env_name; run bench $env_name first" >&2; exit 1; }
-  echo "Flashing $zip to $SERIAL"
-  a reboot sideload
-  a wait-for-sideload
-  # adb sideload exits 1 with "Total xfer" on success on some recoveries; check the result by booting.
-  a sideload "$zip" || true
-  a wait-for-recovery
-  if [[ "$wipe" == 1 ]]; then
-    echo "Factory reset in recovery"
-    a shell recovery --wipe_data || a shell 'echo --wipe_data > /cache/recovery/command && reboot recovery'
-    a wait-for-recovery
-  fi
-  a reboot
+  flash_args=("$env_name")
+  [[ "$wipe" == 1 ]] && flash_args+=(--wipe)
+  "$(dirname "$(realpath "$0")")/../flash" "${flash_args[@]}"
   wait_booted
-  echo "Booted $(sh_ getprop ro.lineage.display.version)"
 fi
 
 run_id="$(date +%Y%m%d-%H%M%S)-$env_name"

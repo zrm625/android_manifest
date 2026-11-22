@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Create the top-level workspace directory: links to the trees, scripts, and
+# benchmark output, plus AGENTS.md and CLAUDE.md. Safe to run more than once.
+#
+# Usage: setup-workspace [DIR]   (default: ~/git/river)
+set -euo pipefail
+source "$(dirname "$(realpath "$0")")/common.sh"
+
+dir=${1:-$HOME/git/river}
+baseline=${BASELINE_TREE:-$HOME/git/lineageos-river-baseline}
+bench_home=${BENCH_HOME:-/mnt/storage/lineageos-bench}
+
+mkdir -p "$dir"
+link() {
+  local target=$1 name=$2
+  if [[ -e "$dir/$name" && ! -L "$dir/$name" ]]; then
+    echo "warning: $dir/$name exists and is not a link; leaving it alone" >&2
+    return
+  fi
+  ln -sfn "$target" "$dir/$name"
+}
+link "$TOP" tree
+link "$baseline" baseline
+link "$TOP/.repo/manifests/scripts" scripts
+link "$bench_home" bench
+link "$TOP/.repo/manifests/workspace/AGENTS.md" AGENTS.md
+link AGENTS.md CLAUDE.md
+echo "Workspace ready at $dir"

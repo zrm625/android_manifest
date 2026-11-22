@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Build the ROM for day-to-day work. Incremental: keeps the previous output, so
+# after a small change only what depends on it is rebuilt, in minutes rather
+# than hours.
+#
+# Usage: build [--tree baseline|stripped] [--clean] [--ccache] [--jobs N] [--target T]
+#
+#   --tree     Which tree to build. Default: stripped (this tree).
+#   --clean    Delete the previous output first. Rarely needed; try without it.
+#   --ccache   Use the shared ccache in $BENCH_HOME/ccache. It only pays off when
+#              the output is deleted often. Switching it on or off changes every
+#              C/C++ compile command, so the next build recompiles all C/C++ once.
+#              Pick one setting per output directory and keep it.
+#   --jobs N   Parallel jobs. Default: nproc.
+#   --target T Build target. Default: bacon (flashable images and zip).
+#
+# Output goes to $BENCH_HOME/out-<tree>/, which is what scripts/flash installs.
+# For timing measurements, use scripts/bench/bench instead: it builds cold in a
+# separate directory and never touches this output.
+set -euo pipefail
+source "$(dirname "$(realpath "$0")")/bench/lib.sh"
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+env_name=stripped clean=0 ccache=0 jobs=$(nproc) target=bacon
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tree) env_name=$2; shift ;;
+    --clean) clean=1 ;;
+    --ccache) ccache=1 ;;
+    --jobs) jobs=$2; shift ;;
+    --target) target=$2; shift ;;
+    -h|--help) usage 0 ;;
+    *) echo "unknown option: $1" >&2; usage 1 ;;
+  esac
+  shift
+done
+tree=$(tree_for "$env_name") || usage 1
+[[ -d "$tree/.repo" ]] || { echo "error: no repo tree at $tree" >&2; exit 1; }
+
+acquire_build_lock
+ensure_image
+out=$BENCH_HOME/out-$env_name
+mkdir -p "$out" "$BENCH_HOME/logs"
+if [[ "$clean" == 1 ]]; then
+  echo "Deleting $out"
+  find "$out" -mindepth 1 -delete
+fi
+
+log=$BENCH_HOME/logs/build-$(date +%Y%m%d-%H%M%S)-$env_name.log
+echo "Building $target for $env_name into $out (log: $log)"
+rc=0
+run_build "$tree" "$out" "$target" "$jobs" "$ccache" "$log" || rc=$?
+read -r _ wall _ < <(cat "$out/.bench-result" 2>/dev/null || echo "$rc 0 ")
+echo
+if [[ "$rc" == 0 ]]; then
+  echo "Built in ${wall}s. Install with: scripts/flash $env_name"
+else
+  echo "Build failed (exit $rc). Log: $log"
+fi
+exit "$rc"

@@ -4,6 +4,10 @@ This tree is **zrm625's fork** of LineageOS 22.2 for the Moto G7 (`river`). The
 `repo` manifest is [zrm625/android_manifest](https://github.com/zrm625/android_manifest).
 The aim is a stripped-down build. Removing projects and features is expected.
 
+The start-here guide for building, installing on the phone, and using the
+build is `~/git/river/AGENTS.md` (source: `workspace/AGENTS.md` in this repo).
+This file covers the source tree.
+
 `AGENTS.md` and `CLAUDE.md` at the top of the tree link to
 `.repo/manifests/AGENTS.md`. Edit that file and open a pull request against the
 manifest repo.
@@ -86,14 +90,20 @@ The goal is to cut build time and image size against a frozen baseline.
 - **Baseline tree:** `~/git/lineageos-river-baseline`, synced to the locked
   `baseline-22.2` manifest branch. Do not edit it or sync it to anything else.
 - **Stripped tree:** this tree, on `river-22.2`.
+- **Day-to-day build:** `.repo/manifests/scripts/build`. It is incremental,
+  in a pinned podman image, into `/mnt/storage/lineageos-bench/out-stripped/`.
+  Do not cold-build to try a change.
 - **Build benchmark:** `.repo/manifests/scripts/bench/bench <baseline|stripped>`.
-  It runs a cold `m bacon` in a pinned podman image with the source mounted
-  read-only. Results go to `/mnt/storage/lineageos-bench/results/results.csv`.
-  Run one benchmark at a time; the script enforces this.
+  It runs a cold `m bacon` into a separate `out-bench-<tree>/`. Results go to
+  `/mnt/storage/lineageos-bench/results/results.csv`. Only one build of any
+  kind runs at a time; the scripts enforce this.
 - **Device benchmark:** `.repo/manifests/scripts/bench/device-bench <baseline|stripped> --flash --wipe`.
   It flashes the build from that tree to the Moto G7 test phone (serial
   `ZY225DPT7F`), then records boot time, RAM, processes, packages, partition
   use, and idle CPU to `device.csv`.
+- **Install a build:** `.repo/manifests/scripts/flash <baseline|stripped> [--wipe]`.
+  It uses fastboot to flash the inactive A/B slot, so the running slot stays
+  as a fallback.
 - The test phone is the USB Moto G7 only. Never run adb or fastboot commands
   against any other device, such as the Pixel on wireless adb. Always pass
   `-s ZY225DPT7F`.
@@ -110,13 +120,9 @@ repo sync -c -j8
 fork, checks out `river-22.2` in each fork, and links `AGENTS.md` and `CLAUDE.md`
 at the top of the tree. Run it again after every new fork.
 
-Build:
-
-```sh
-source build/envsetup.sh
-breakfast river
-m bacon
-```
+Build with `.repo/manifests/scripts/build`, which runs in the pinned build
+container. A plain `source build/envsetup.sh && breakfast river && m bacon` on
+the host also works, but it uses the host toolchain and a different `out/`.
 
 ## Fork another project
 
