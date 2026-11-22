@@ -90,10 +90,13 @@ The goal is to cut build time and image size against a frozen baseline.
 - **Baseline tree:** `~/git/lineageos-river-baseline`, synced to the locked
   `baseline-22.2` manifest branch. Do not edit it or sync it to anything else.
 - **Stripped tree:** this tree, on `river-22.2`.
+- **Day-to-day build:** `.repo/manifests/scripts/build`. It is incremental,
+  in a pinned podman image, into `/mnt/storage/lineageos-bench/out-stripped/`.
+  Do not cold-build to try a change.
 - **Build benchmark:** `.repo/manifests/scripts/bench/bench <baseline|stripped>`.
-  It runs a cold `m bacon` in a pinned podman image with the source mounted
-  read-only. Results go to `/mnt/storage/lineageos-bench/results/results.csv`.
-  Run one benchmark at a time; the script enforces this.
+  It runs a cold `m bacon` into a separate `out-bench-<tree>/`. Results go to
+  `/mnt/storage/lineageos-bench/results/results.csv`. Only one build of any
+  kind runs at a time; the scripts enforce this.
 - **Device benchmark:** `.repo/manifests/scripts/bench/device-bench <baseline|stripped> --flash --wipe`.
   It flashes the build from that tree to the Moto G7 test phone (serial
   `ZY225DPT7F`), then records boot time, RAM, processes, packages, partition
@@ -117,13 +120,9 @@ repo sync -c -j8
 fork, checks out `river-22.2` in each fork, and links `AGENTS.md` and `CLAUDE.md`
 at the top of the tree. Run it again after every new fork.
 
-Build:
-
-```sh
-source build/envsetup.sh
-breakfast river
-m bacon
-```
+Build with `.repo/manifests/scripts/build`, which runs in the pinned build
+container. A plain `source build/envsetup.sh && breakfast river && m bacon` on
+the host also works, but it uses the host toolchain and a different `out/`.
 
 ## Fork another project
 

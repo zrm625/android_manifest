@@ -14,8 +14,8 @@ it, edit it there and open a pull request (see [Rules](#rules)).
 | --- | --- | --- |
 | `tree/` | `~/git/lineageos-river` | The source tree you work in (manifest branch `river-22.2`) |
 | `baseline/` | `~/git/lineageos-river-baseline` | Frozen stock tree for comparison (locked branch `baseline-22.2`). Never edit it. |
-| `scripts/` | `tree/.repo/manifests/scripts` | `flash`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
-| `bench/` | `/mnt/storage/lineageos-bench` | Build output (`out-stripped/`, `out-baseline/`) and `results/` |
+| `scripts/` | `tree/.repo/manifests/scripts` | `build`, `flash`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
+| `bench/` | `/mnt/storage/lineageos-bench` | Working build output (`out-stripped/`), benchmark output (`out-bench-*/`), `results/`, `logs/` |
 | `phone` | Moto G7, USB serial `ZY225DPT7F` | The only test phone |
 
 `tree/AGENTS.md` has the detailed rules for the source tree: which repos are
@@ -23,18 +23,34 @@ forks, branches, upstream merges, and how to strip things out.
 
 ## Build
 
-Builds run in a pinned podman container, and the output goes to
-`bench/out-<tree>/`. The first cold build takes a few hours and uses every CPU
-core. Only one build can run at a time.
+Builds run in a pinned podman container. Only one build runs at a time, and
+the scripts enforce this.
+
+**Day to day, use `scripts/build`.** It is incremental: the output in
+`bench/out-stripped/` is kept, so after a change only what depends on it is
+rebuilt. That takes minutes, where a cold build takes a couple of hours and
+uses every CPU core.
 
 ```sh
-scripts/bench/bench stripped                 # cold build of tree/ (deletes previous output)
-scripts/bench/bench stripped --incremental   # rebuild, keeping previous output
-scripts/bench/bench baseline                 # cold build of baseline/ for comparison
+scripts/build                    # incremental build of tree/ into bench/out-stripped/
+scripts/build --clean            # start over (rarely needed)
+scripts/build --tree baseline    # incremental build of baseline/ into bench/out-baseline/
 ```
 
-Each run adds a row to `bench/results/results.csv` (build time, peak memory,
-output size, commits) and keeps the log and Soong metrics in
+Removing a package or project needs no clean build. Soong deletes installed
+files that are no longer part of the build.
+
+**For measurements, use `scripts/bench/bench`.** It builds cold, with ccache
+off, into a separate `bench/out-bench-<tree>/`, so it never wipes your working
+output.
+
+```sh
+scripts/bench/bench stripped     # cold build time of tree/
+scripts/bench/bench baseline     # cold build time of baseline/, for comparison
+```
+
+Each benchmark adds a row to `bench/results/results.csv` (build time, peak
+memory, output size, commits) and keeps the log and Soong metrics in
 `bench/results/<run id>/`.
 
 The build produces, in `bench/out-stripped/target/product/river/`:
@@ -103,17 +119,18 @@ running the same commands with `baseline`.
 
 1. Remove something in `tree/` (see "Strip the build down" in `tree/AGENTS.md`),
    on a topic branch in the affected repo.
-2. `scripts/bench/bench stripped`
+2. `scripts/build` (incremental, minutes)
 3. `scripts/flash stripped` (add `--wipe` if the build no longer boots over old data)
-4. Check the phone works, and run `scripts/bench/device-bench stripped`.
+4. Check the phone works, and run `scripts/bench/device-bench current`.
 5. Open pull requests to the `zrm625` repos and merge them.
+6. Now and then, run `scripts/bench/bench stripped` to measure cold build time.
 
 ## Rules
 
 - Pull requests go only to `zrm625` repos, base `river-22.2`. Never send one to
   LineageOS, TheMuppets, or AOSP. Details are in `tree/AGENTS.md`.
 - Do not edit `baseline/`.
-- Only one build benchmark at a time.
+- Only one build at a time.
 - adb and fastboot only ever target `-s ZY225DPT7F`.
 
 ## Set up this directory on a new machine
