@@ -33,12 +33,16 @@ uses every CPU core.
 
 ```sh
 scripts/build                    # incremental build of tree/ into bench/out-stripped/
+scripts/build --installclean     # after removing anything (see below)
 scripts/build --clean            # start over (rarely needed)
 scripts/build --tree baseline    # incremental build of baseline/ into bench/out-baseline/
 ```
 
-Removing a package or project needs no clean build. Soong deletes installed
-files that are no longer part of the build.
+**After removing a package, blob or feature, use `--installclean`.** A plain
+incremental build can leave removed files in the staged partitions, and they
+end up in the image (seen with removed IMS app libraries). `--installclean`
+deletes the staged partitions and images but keeps compiled objects, so it
+only adds a few minutes. Adding or changing things needs no install-clean.
 
 **For measurements, use `scripts/bench/bench`.** It builds cold, with ccache
 off, into a separate `bench/out-bench-<tree>/`, so it never wipes your working
@@ -119,7 +123,7 @@ running the same commands with `baseline`.
 
 1. Remove something in `tree/` (see "Strip the build down" in `tree/AGENTS.md`),
    on a topic branch in the affected repo.
-2. `scripts/build` (incremental, minutes)
+2. `scripts/build --installclean` (incremental, minutes)
 3. `scripts/flash stripped` (add `--wipe` if the build no longer boots over old data)
 4. Check the phone works, and run `scripts/bench/device-bench current`.
 5. Open pull requests to the `zrm625` repos and merge them.
