@@ -55,9 +55,13 @@ run_build() {
   rm -f "$out/.bench-result"
   set +e
   # HOME must be writable: Soong keeps a Go build cache in $HOME/.cache.
+  # .repo is a throwaway overlay (:O): the build runs `repo manifest` for
+  # build-manifest.xml, and repo writes .repo/TRACE_FILE. Writes are discarded
+  # when the container exits; the real .repo is never changed. (REPO_TRACE=0
+  # does not help: Soong strips the environment of build steps.)
   podman run --rm --name "lineageos-build" --userns=keep-id \
     --tmpfs /home/build:exec -e HOME=/home/build -e USER=build \
-    -v "$tree:/src:ro" -v "$out:/src/out:rw" -w /src \
+    -v "$tree:/src:ro" -v "$tree/.repo:/src/.repo:O" -v "$out:/src/out:rw" -w /src \
     "${ccache_args[@]}" -e BUILD_TARGET="$target" -e BUILD_JOBS="$jobs" \
     "$IMAGE" bash -c '
       source build/envsetup.sh >/dev/null
