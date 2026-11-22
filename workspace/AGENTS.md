@@ -121,12 +121,14 @@ running the same commands with `baseline`.
 
 ## Typical loop
 
-1. Remove something in `tree/` (see "Strip the build down" in `tree/AGENTS.md`),
-   on a topic branch in the affected repo.
+1. `scripts/change start <name>`, then remove something in `tree/` (see
+   "Strip the build down" in `tree/AGENTS.md`) and commit in each repo you touch.
 2. `scripts/build --installclean` (incremental, minutes)
 3. `scripts/flash stripped` (add `--wipe` if the build no longer boots over old data)
 4. Check the phone works, and run `scripts/bench/device-bench current`.
-5. Open pull requests to the `zrm625` repos and merge them.
+5. `scripts/change pr -t "<title>" -b "<test results>"`, then
+   `scripts/change merge` once you are happy. One command each, however many
+   repos the change touched.
 6. Now and then, run `scripts/bench/bench stripped` to measure cold build time.
 
 ## Rules

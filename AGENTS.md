@@ -29,7 +29,28 @@ remote, a `gh` default, or the GitHub UI suggests it.
 | `vendor/motorola/river` | `zrm625/proprietary_vendor_motorola_river` | `river-22.2` |
 | `vendor/motorola/sdm632-common` | `zrm625/proprietary_vendor_motorola_sdm632-common` | `river-22.2` |
 
-Always name the repo and base explicitly:
+### Making a change: use `scripts/change`
+
+One change often touches several repos (a device repo and its blob repo, for
+example). Handle it as one unit with `.repo/manifests/scripts/change`, not by
+hand:
+
+```sh
+S=.repo/manifests/scripts
+$S/change start <name>                  # branch <name> from river-22.2 in every fork and the manifest
+# ...edit and commit in whichever repos need it...
+$S/change status                        # which repos have commits, uncommitted files, PRs
+$S/change pr -t "<title>" -b "<why>"    # push, open/update one PR per repo, cross-link them all
+$S/change merge                         # check all PRs are mergeable, merge them together, sync local
+$S/change tag <tag>                     # optional: tag river-22.2 in every repo (e.g. baseline-2)
+```
+
+Re-run `change pr` after more commits; it pushes and refreshes the PR
+descriptions. Write the test plan once in `-b` or `-F file`; every PR gets it,
+plus its own commit list and links to the others. `change merge` merges
+nothing unless every PR in the set can merge.
+
+For a one-off PR by hand, always name the repo and base explicitly:
 
 ```sh
 gh pr create --repo zrm625/<repo> --base river-22.2
@@ -45,8 +66,8 @@ gh pr create --repo zrm625/<repo> --base river-22.2
 ## Branches
 
 - `river-22.2` is the long-lived branch in every fork and in the manifest.
-- Do work on a topic branch made from `river-22.2`, and merge it with a pull
-  request.
+- Do work on a topic branch made from `river-22.2` (`change start`), and
+  merge it with pull requests (`change pr`, then `change merge`).
 - Never rebase or force-push `river-22.2`. Upstream is merged in, not rebased,
   so published history stays stable.
 
@@ -80,8 +101,8 @@ move them forward, regenerate those pins in a manifest pull request.
   binaries from Motorola's stock firmware (forked from TheMuppets); there is no
   source for them. To drop a blob, remove it from `proprietary-files.txt` in
   the matching `device/motorola/*` repo, then regenerate the vendor makefiles
-  with that repo's `setup-makefiles.py`. Change both repos in matching pull
-  requests.
+  with that repo's `setup-makefiles.py` (run it as `./setup-makefiles.py`).
+  Commit both repos on the same `change` branch.
 
 ## Benchmarks
 
