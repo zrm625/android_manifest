@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Configure a checkout of the zrm625 fork. Run after `repo init` and `repo sync`,
+# and again after adding a fork. Safe to run more than once.
+#
+# For every project in the zrm625-fork group, this:
+#   - adds a fetch-only `lineage` remote for the upstream repo,
+#   - makes `gh` default to the zrm625 fork, so `gh pr create` targets it,
+#   - lets git push to github.com with the `gh` login,
+#   - checks out a local river-22.2 branch that tracks zrm625/river-22.2.
+# It also links AGENTS.md and CLAUDE.md at the top of the tree.
+set -euo pipefail
+source "$(dirname "$(realpath "$0")")/common.sh"
+
+if [[ "${1:-}" == "--one" ]]; then
+  # Runs inside one project, called by `repo forall` below.
+  : "${REPO__UPSTREAM_REPO:?project has no UPSTREAM_REPO annotation}"
+  upstream_url="https://github.com/$REPO__UPSTREAM_REPO"
+  if git remote get-url lineage >/dev/null 2>&1; then
+    git remote set-url lineage "$upstream_url"
+  else
+    git remote add lineage "$upstream_url"
+  fi
+  # Make pushes to upstream fail.
+  git remote set-url --push lineage "no-push://upstream-is-read-only"
+  # gh reads this to pick the default repo for `gh pr create`.
+  for r in $(git remote); do git config --unset "remote.$r.gh-resolved" || true; done
+  git config "remote.$FORK_REMOTE.gh-resolved" base
+  if command -v gh >/dev/null 2>&1; then
+    # The empty entry clears inherited helpers for github.com in this repo only.
+    git config --unset-all credential.https://github.com.helper || true
+    git config --add credential.https://github.com.helper ''
+    git config --add credential.https://github.com.helper '!gh auth git-credential'
+  fi
+  if git show-ref --verify --quiet "refs/heads/$FORK_BRANCH"; then
+    git branch --quiet --set-upstream-to "$FORK_REMOTE/$FORK_BRANCH" "$FORK_BRANCH"
+  else
+    git branch --quiet --track "$FORK_BRANCH" "$FORK_REMOTE/$FORK_BRANCH"
+  fi
+  if [[ -z "$(git symbolic-ref --quiet HEAD || true)" ]] \
+     && [[ "$(git rev-parse HEAD)" == "$(git rev-parse "$FORK_BRANCH")" ]]; then
+    git checkout --quiet "$FORK_BRANCH"
+  fi
+  echo "$REPO_PATH: PRs -> $FORK_REMOTE/$REPO_PROJECT ($FORK_BRANCH), upstream -> $REPO__UPSTREAM_REPO"
+  exit 0
+fi
+
+"$REPO" forall -g "$FORK_GROUP" -c "$(realpath "$0")" --one
+
+for f in AGENTS.md CLAUDE.md; do
+  link="$TOP/$f"
+  if [[ -e "$link" && ! -L "$link" ]]; then
+    echo "warning: $link exists and is not a link; leaving it alone" >&2
+  else
+    ln -sfn .repo/manifests/AGENTS.md "$link"
+  fi
+done
+echo "Linked AGENTS.md and CLAUDE.md at $TOP"
