@@ -125,6 +125,10 @@ The goal is to cut build time and image size against a frozen baseline.
 - **Install a build:** `.repo/manifests/scripts/flash <baseline|stripped> [--wipe]`.
   It uses fastboot to flash the inactive A/B slot, so the running slot stays
   as a fallback.
+- **Check a build on the phone:** `.repo/manifests/scripts/phone-check` after
+  every flash. It must pass before you open pull requests. The full
+  edit-build-flash-check loop is in `~/git/river/AGENTS.md` under "Build and run
+  a change".
 - The test phone is the USB Moto G7 only. Never run adb or fastboot commands
   against any other device, such as the Pixel on wireless adb. Always pass
   `-s ZY225DPT7F`.

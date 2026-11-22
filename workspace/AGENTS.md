@@ -14,7 +14,7 @@ it, edit it there and open a pull request (see [Rules](#rules)).
 | --- | --- | --- |
 | `tree/` | `~/git/lineageos-river` | The source tree you work in (manifest branch `river-22.2`) |
 | `baseline/` | `~/git/lineageos-river-baseline` | Frozen stock tree for comparison (locked branch `baseline-22.2`). Never edit it. |
-| `scripts/` | `tree/.repo/manifests/scripts` | `build`, `flash`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
+| `scripts/` | `tree/.repo/manifests/scripts` | `change`, `build`, `flash`, `phone-check`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
 | `bench/` | `/mnt/storage/lineageos-bench` | Working build output (`out-stripped/`), benchmark output (`out-bench-*/`), `results/`, `logs/` |
 | `phone` | Moto G7, USB serial `ZY225DPT7F` | The only test phone |
 
@@ -119,17 +119,78 @@ This records boot time, RAM use, process and package counts, partition use,
 and idle CPU to `bench/results/device.csv`. Compare stripped against baseline by
 running the same commands with `baseline`.
 
-## Typical loop
+## Build and run a change
 
-1. `scripts/change start <name>`, then remove something in `tree/` (see
-   "Strip the build down" in `tree/AGENTS.md`) and commit in each repo you touch.
-2. `scripts/build --installclean` (incremental, minutes)
-3. `scripts/flash stripped` (add `--wipe` if the build no longer boots over old data)
-4. Check the phone works, and run `scripts/bench/device-bench current`.
-5. `scripts/change pr -t "<title>" -b "<test results>"`, then
-   `scripts/change merge` once you are happy. One command each, however many
-   repos the change touched.
-6. Now and then, run `scripts/bench/bench stripped` to measure cold build time.
+The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
+
+1. **Start a change.** One branch name across every repo:
+
+   ```sh
+   scripts/change start <name>          # e.g. drop-fm-radio
+   ```
+
+2. **Edit and commit** in `tree/`, in whichever repos the change needs (see
+   "Strip the build down" in `tree/AGENTS.md`). Commit in each repo as usual.
+   `scripts/change status` shows which repos have commits or uncommitted files.
+
+3. **Build** (incremental, 3 to 8 minutes):
+
+   ```sh
+   scripts/build --installclean         # the change removes anything
+   scripts/build                        # the change only adds or edits
+   ```
+
+   On failure, the last lines name the log in `bench/logs/`. Search it for
+   `FAILED:` to find the step that broke.
+
+4. **Install on the phone** (about 4 minutes, including the boot):
+
+   ```sh
+   scripts/flash stripped               # same signing keys as what the phone runs: keeps data
+   scripts/flash stripped --wipe        # first install, or the phone runs a build with other keys
+   ```
+
+   Every build of this tree uses the same test keys, so updates keep the data.
+   After `--wipe`, the phone starts at the setup wizard: finish it, then turn on
+   USB debugging (Settings > About phone > tap Build number 7 times, then
+   Settings > System > Developer options > USB debugging, and "Rooted debugging"
+   for `adb root`).
+
+5. **Check the phone works:**
+
+   ```sh
+   scripts/phone-check                  # add --wait right after a flash
+   ```
+
+   It takes about 2 seconds and prints PASS, WARN or FAIL for: the phone runs
+   the build you just made, boot, SELinux, crashes and tombstones, services
+   crashing or restarting in a loop, Wi-Fi with internet, Bluetooth, GPS,
+   cameras, sensors, fingerprint, audio, and no telephony. It exits 1 on any
+   FAIL. Then use the feature you changed on the phone itself.
+
+   If the phone does not boot, see "Roll back" above: the previous build is
+   still on the other slot.
+
+6. **Measure** (about 12 minutes, the phone reboots 3 times):
+
+   ```sh
+   scripts/bench/device-bench stripped --boots 3
+   ```
+
+   Compare with the previous rows in `bench/results/device.csv`.
+
+7. **Open the pull requests and merge** them, one command each however many
+   repos the change touched. Paste the `phone-check` and `device-bench`
+   results into the description:
+
+   ```sh
+   scripts/change pr -t "<title>" -F notes.md
+   scripts/change merge
+   ```
+
+8. **Now and then**, measure the cold build time with
+   `scripts/bench/bench stripped`, and mark a milestone with
+   `scripts/change tag baseline-<n>`.
 
 ## Rules
 
