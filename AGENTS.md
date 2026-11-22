@@ -79,6 +79,25 @@ move them forward, regenerate those pins in a manifest pull request.
   with that repo's `setup-makefiles.py`. Change both repos in matching pull
   requests.
 
+## Benchmarks
+
+The goal is to cut build time and image size against a frozen baseline.
+
+- **Baseline tree:** `~/git/lineageos-river-baseline`, synced to the locked
+  `baseline-22.2` manifest branch. Do not edit it or sync it to anything else.
+- **Stripped tree:** this tree, on `river-22.2`.
+- **Build benchmark:** `.repo/manifests/scripts/bench/bench <baseline|stripped>`.
+  It runs a cold `m bacon` in a pinned podman image with the source mounted
+  read-only. Results go to `/mnt/storage/lineageos-bench/results/results.csv`.
+  Run one benchmark at a time; the script enforces this.
+- **Device benchmark:** `.repo/manifests/scripts/bench/device-bench <baseline|stripped> --flash --wipe`.
+  It flashes the build from that tree to the Moto G7 test phone (serial
+  `ZY225DPT7F`), then records boot time, RAM, processes, packages, partition
+  use, and idle CPU to `device.csv`.
+- The test phone is the USB Moto G7 only. Never run adb or fastboot commands
+  against any other device, such as the Pixel on wireless adb. Always pass
+  `-s ZY225DPT7F`.
+
 ## New checkout
 
 ```sh

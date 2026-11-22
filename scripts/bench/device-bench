@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Measure a build on the Moto G7 test phone, and optionally flash it first.
+#
+# Usage: device-bench <baseline|stripped|current> [--flash] [--wipe] [--boots N] [--settle S]
+#
+#   baseline|stripped  Label for the results. With --flash, also picks the newest
+#                      lineage-*.zip in $BENCH_HOME/out-<env>/target/product/river.
+#   current            Measure whatever the phone runs now. Cannot be combined with --flash.
+#   --flash   Sideload the build through LineageOS recovery.
+#   --wipe    After flashing, factory reset in recovery, so each build starts
+#             from clean data. Recommended when you switch between builds.
+#   --boots N   Reboot and measure N times. Default: 3.
+#   --settle S  Seconds to wait after boot before measuring memory and CPU. Default: 120.
+#
+# Only the phone with serial $BENCH_DEVICE (default ZY225DPT7F) is touched, and
+# only if it reports itself as river. Results are appended to
+# $BENCH_HOME/results/device.csv.
+set -euo pipefail
+
+BENCH_HOME=${BENCH_HOME:-/mnt/storage/lineageos-bench}
+SERIAL=${BENCH_DEVICE:-ZY225DPT7F}
+DEVICE_CODENAME=river
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+env_name=${1:-}; shift || true
+case "$env_name" in
+  baseline|stripped|current) ;;
+  -h|--help) usage 0 ;;
+  *) usage 1 ;;
+esac
+flash=0 wipe=0 boots=3 settle=120
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --flash) flash=1 ;;
+    --wipe) wipe=1 ;;
+    --boots) boots=$2; shift ;;
+    --settle) settle=$2; shift ;;
+    -h|--help) usage 0 ;;
+    *) echo "unknown option: $1" >&2; usage 1 ;;
+  esac
+  shift
+done
+if [[ "$flash" == 1 && "$env_name" == current ]]; then
+  echo "error: --flash needs baseline or stripped" >&2; exit 1
+fi
+if [[ "$wipe" == 1 && "$flash" == 0 ]]; then
+  echo "error: --wipe only applies with --flash" >&2; exit 1
+fi
+
+a() { adb -s "$SERIAL" "$@"; }
+sh_() { a shell "$@" | tr -d '\r'; }
+
+wait_booted() {
+  a wait-for-device
+  local deadline=$((SECONDS + 600))
+  until [[ "$(sh_ getprop sys.boot_completed 2>/dev/null)" == 1 ]]; do
+    (( SECONDS < deadline )) || { echo "error: phone did not finish booting in 10 minutes" >&2; exit 1; }
+    sleep 1
+  done
+}
+
+# Refuse to touch anything except the river test phone.
+state=$(adb -s "$SERIAL" get-state 2>/dev/null || true)
+[[ "$state" == device ]] || { echo "error: $SERIAL is not connected in adb device mode (state: ${state:-none})" >&2; exit 1; }
+codename=$(sh_ getprop ro.product.device)
+[[ "$codename" == "$DEVICE_CODENAME" ]] || { echo "error: $SERIAL is '$codename', not $DEVICE_CODENAME. Refusing." >&2; exit 1; }
+
+mkdir -p "$BENCH_HOME/results"
+exec 9>"$BENCH_HOME/.device-lock"
+flock -n 9 || { echo "error: another device benchmark is running" >&2; exit 1; }
+
+if [[ "$flash" == 1 ]]; then
+  zip=$(ls -t "$BENCH_HOME/out-$env_name/target/product/$DEVICE_CODENAME"/lineage-*.zip 2>/dev/null | head -1 || true)
+  [[ -n "$zip" ]] || { echo "error: no lineage-*.zip in $BENCH_HOME/out-$env_name; run bench $env_name first" >&2; exit 1; }
+  echo "Flashing $zip to $SERIAL"
+  a reboot sideload
+  a wait-for-sideload
+  # adb sideload exits 1 with "Total xfer" on success on some recoveries; check the result by booting.
+  a sideload "$zip" || true
+  a wait-for-recovery
+  if [[ "$wipe" == 1 ]]; then
+    echo "Factory reset in recovery"
+    a shell recovery --wipe_data || a shell 'echo --wipe_data > /cache/recovery/command && reboot recovery'
+    a wait-for-recovery
+  fi
+  a reboot
+  wait_booted
+  echo "Booted $(sh_ getprop ro.lineage.display.version)"
+fi
+
+run_id="$(date +%Y%m%d-%H%M%S)-$env_name"
+csv=$BENCH_HOME/results/device.csv
+[[ -s "$csv" ]] || echo "run_id,env,boot,host_boot_seconds,uptime_at_boot_completed,mem_total_kb,mem_available_kb,used_ram_kb,processes,packages,system_used_kb,vendor_used_kb,cpu_idle_pct,lineage_version,fingerprint" > "$csv"
+
+df_used() { sh_ df -k "$1" | awk 'NR==2 {print $3}'; }
+cpu_idle() {
+  # Idle share of all CPU time over 30 seconds, from /proc/stat.
+  local a b
+  a=$(sh_ head -1 /proc/stat); sleep 30; b=$(sh_ head -1 /proc/stat)
+  awk -v a="$a" -v b="$b" 'BEGIN {
+    n = split(a, x); split(b, y); t = 0
+    for (i = 2; i <= n; i++) t += y[i] - x[i]
+    idle = (y[5] - x[5]) + (y[6] - x[6])
+    printf "%.1f", 100 * idle / t }'
+}
+
+for ((i = 1; i <= boots; i++)); do
+  echo "Boot $i/$boots"
+  start=$(date +%s.%N)
+  a reboot
+  # Wait for the phone to drop off adb before waiting for it to come back.
+  while [[ "$(adb -s "$SERIAL" get-state 2>/dev/null || true)" == device ]]; do sleep 0.2; done
+  wait_booted
+  host_boot=$(awk -v s="$start" -v e="$(date +%s.%N)" 'BEGIN {printf "%.2f", e - s}')
+  uptime_boot=$(sh_ cat /proc/uptime | awk '{print $1}')
+
+  # Same screen state for every measurement.
+  sh_ input keyevent KEYCODE_SLEEP || true
+  sleep "$settle"
+
+  mem_total=$(sh_ grep MemTotal /proc/meminfo | awk '{print $2}')
+  mem_avail=$(sh_ grep MemAvailable /proc/meminfo | awk '{print $2}')
+  used_ram=$(sh_ dumpsys meminfo | awk -F'[: K(]+' '/Used RAM/ {gsub(",", "", $4); print $4; exit}')
+  procs=$(sh_ ps -A | tail -n +2 | wc -l)
+  pkgs=$(sh_ pm list packages | wc -l)
+  sys_used=$(df_used /)
+  vendor_used=$(df_used /vendor)
+  idle=$(cpu_idle)
+  version=$(sh_ getprop ro.lineage.display.version)
+  fingerprint=$(sh_ getprop ro.build.fingerprint)
+
+  echo "$run_id,$env_name,$i,$host_boot,$uptime_boot,$mem_total,$mem_avail,$used_ram,$procs,$pkgs,$sys_used,$vendor_used,$idle,$version,$fingerprint" >> "$csv"
+  printf '  boot %.1fs (uptime %ss), used RAM %s KB, %s processes, %s packages, CPU idle %s%%\n' \
+    "$host_boot" "$uptime_boot" "$used_ram" "$procs" "$pkgs" "$idle"
+done
+echo "Results: $csv"
