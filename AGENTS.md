@@ -26,6 +26,7 @@ remote, a `gh` default, or the GitHub UI suggests it.
 | `device/motorola/sdm632-common` | `zrm625/android_device_motorola_sdm632-common` | `river-22.2` |
 | `kernel/motorola/sdm632` | `zrm625/android_kernel_motorola_sdm632` | `river-22.2` |
 | `hardware/motorola` | `zrm625/android_hardware_motorola` | `river-22.2` |
+| `packages/inputmethods/LatinIME` | `zrm625/android_packages_inputmethods_LatinIME` | `river-22.2` |
 | `vendor/lineage` | `zrm625/android_vendor_lineage` | `river-22.2` |
 | `vendor/motorola/river` | `zrm625/proprietary_vendor_motorola_river` | `river-22.2` |
 | `vendor/motorola/sdm632-common` | `zrm625/proprietary_vendor_motorola_sdm632-common` | `river-22.2` |
