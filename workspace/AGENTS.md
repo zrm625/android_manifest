@@ -107,6 +107,9 @@ fastboot -s ZY225DPT7F reboot
   Recovery mode.
 - The installed build: `adb -s ZY225DPT7F shell getprop ro.lineage.display.version`.
 - The image has no Google apps. That is intentional for a stripped build.
+- Apps: Files, Settings, Clock, the keyboard and the launcher. No calls, texts,
+  mobile data, camera app, browser or gallery. Install apps with
+  `adb -s ZY225DPT7F install <apk>` if you need one for a test.
 
 ## Measure on the phone
 
@@ -151,10 +154,10 @@ The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
    ```
 
    Every build of this tree uses the same test keys, so updates keep the data.
-   After `--wipe`, the phone starts at the setup wizard: finish it, then turn on
-   USB debugging (Settings > About phone > tap Build number 7 times, then
-   Settings > System > Developer options > USB debugging, and "Rooted debugging"
-   for `adb root`).
+   After `--wipe`, adb and `adb root` work straight away: debug builds turn on
+   USB debugging and rooted debugging from first boot (set in
+   `device/motorola/river`). The phone sits at the setup wizard with no Wi-Fi;
+   that is fine for checks and benchmarks.
 
 5. **Check the phone works:**
 
@@ -177,7 +180,10 @@ The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
    scripts/bench/device-bench stripped --boots 3
    ```
 
-   Compare with the previous rows in `bench/results/device.csv`.
+   Compare with the previous rows in `bench/results/device.csv`. For
+   baselines, measure right after `scripts/flash stripped --wipe`, without
+   touching the phone (setup wizard open, no Wi-Fi), so every baseline is
+   measured the same way.
 
 7. **Open the pull requests and merge** them, one command each however many
    repos the change touched. Paste the `phone-check` and `device-bench`
