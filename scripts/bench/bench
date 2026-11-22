@@ -18,7 +18,7 @@
 set -euo pipefail
 source "$(dirname "$(realpath "$0")")/../common.sh"
 
-BENCH_HOME=${BENCH_HOME:-$HOME/git/lineageos-bench}
+BENCH_HOME=${BENCH_HOME:-/mnt/storage/lineageos-bench}
 BASELINE_TREE=${BASELINE_TREE:-$HOME/git/lineageos-river-baseline}
 MIN_FREE_GB=${MIN_FREE_GB:-150}
 BENCH_DIR=$(dirname "$(realpath "$0")")
