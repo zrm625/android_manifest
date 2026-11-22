@@ -35,12 +35,13 @@ ensure_image() {
   fi
 }
 
-# run_build TREE OUT TARGET JOBS CCACHE(0|1) LOG
+# run_build TREE OUT TARGET JOBS CCACHE(0|1) LOG [INSTALLCLEAN(0|1)]
 # Runs `m TARGET` in the container with TREE read-only and OUT writable.
+# With INSTALLCLEAN=1, runs `m installclean` first (not timed).
 # Writes "<exit code> <seconds> <peak memory bytes>" to OUT/.bench-result
 # and returns the exit code of m.
 run_build() {
-  local tree=$1 out=$2 target=$3 jobs=$4 use_ccache=$5 log=$6
+  local tree=$1 out=$2 target=$3 jobs=$4 use_ccache=$5 log=$6 installclean=${7:-0}
   local ccache_args
   if [[ "$use_ccache" == 1 ]]; then
     mkdir -p "$CCACHE_HOME"
@@ -62,10 +63,13 @@ run_build() {
   podman run --rm --name "lineageos-build" --userns=keep-id \
     --tmpfs /home/build:exec -e HOME=/home/build -e USER=build \
     -v "$tree:/src:ro" -v "$tree/.repo:/src/.repo:O" -v "$out:/src/out:rw" -w /src \
-    "${ccache_args[@]}" -e BUILD_TARGET="$target" -e BUILD_JOBS="$jobs" \
+    "${ccache_args[@]}" -e BUILD_TARGET="$target" -e BUILD_JOBS="$jobs" -e BUILD_INSTALLCLEAN="$installclean" \
     "$IMAGE" bash -c '
       source build/envsetup.sh >/dev/null
       breakfast river >/dev/null || { echo "90 0 " > out/.bench-result; exit 90; }
+      if [[ "$BUILD_INSTALLCLEAN" == 1 ]]; then
+        m installclean || { echo "91 0 " > out/.bench-result; exit 91; }
+      fi
       start=$(date +%s.%N)
       m "$BUILD_TARGET" -j"$BUILD_JOBS"
       rc=$?

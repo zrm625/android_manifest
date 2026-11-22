@@ -14,7 +14,7 @@ it, edit it there and open a pull request (see [Rules](#rules)).
 | --- | --- | --- |
 | `tree/` | `~/git/lineageos-river` | The source tree you work in (manifest branch `river-22.2`) |
 | `baseline/` | `~/git/lineageos-river-baseline` | Frozen stock tree for comparison (locked branch `baseline-22.2`). Never edit it. |
-| `scripts/` | `tree/.repo/manifests/scripts` | `build`, `flash`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
+| `scripts/` | `tree/.repo/manifests/scripts` | `change`, `build`, `flash`, `phone-check`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
 | `bench/` | `/mnt/storage/lineageos-bench` | Working build output (`out-stripped/`), benchmark output (`out-bench-*/`), `results/`, `logs/` |
 | `phone` | Moto G7, USB serial `ZY225DPT7F` | The only test phone |
 
@@ -33,12 +33,16 @@ uses every CPU core.
 
 ```sh
 scripts/build                    # incremental build of tree/ into bench/out-stripped/
+scripts/build --installclean     # after removing anything (see below)
 scripts/build --clean            # start over (rarely needed)
 scripts/build --tree baseline    # incremental build of baseline/ into bench/out-baseline/
 ```
 
-Removing a package or project needs no clean build. Soong deletes installed
-files that are no longer part of the build.
+**After removing a package, blob or feature, use `--installclean`.** A plain
+incremental build can leave removed files in the staged partitions, and they
+end up in the image (seen with removed IMS app libraries). `--installclean`
+deletes the staged partitions and images but keeps compiled objects, so it
+only adds a few minutes. Adding or changing things needs no install-clean.
 
 **For measurements, use `scripts/bench/bench`.** It builds cold, with ccache
 off, into a separate `bench/out-bench-<tree>/`, so it never wipes your working
@@ -103,6 +107,9 @@ fastboot -s ZY225DPT7F reboot
   Recovery mode.
 - The installed build: `adb -s ZY225DPT7F shell getprop ro.lineage.display.version`.
 - The image has no Google apps. That is intentional for a stripped build.
+- Apps: Files, Settings, Clock, the keyboard and the launcher. No calls, texts,
+  mobile data, camera app, browser or gallery. Install apps with
+  `adb -s ZY225DPT7F install <apk>` if you need one for a test.
 
 ## Measure on the phone
 
@@ -115,15 +122,81 @@ This records boot time, RAM use, process and package counts, partition use,
 and idle CPU to `bench/results/device.csv`. Compare stripped against baseline by
 running the same commands with `baseline`.
 
-## Typical loop
+## Build and run a change
 
-1. Remove something in `tree/` (see "Strip the build down" in `tree/AGENTS.md`),
-   on a topic branch in the affected repo.
-2. `scripts/build` (incremental, minutes)
-3. `scripts/flash stripped` (add `--wipe` if the build no longer boots over old data)
-4. Check the phone works, and run `scripts/bench/device-bench current`.
-5. Open pull requests to the `zrm625` repos and merge them.
-6. Now and then, run `scripts/bench/bench stripped` to measure cold build time.
+The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
+
+1. **Start a change.** One branch name across every repo:
+
+   ```sh
+   scripts/change start <name>          # e.g. drop-fm-radio
+   ```
+
+2. **Edit and commit** in `tree/`, in whichever repos the change needs (see
+   "Strip the build down" in `tree/AGENTS.md`). Commit in each repo as usual.
+   `scripts/change status` shows which repos have commits or uncommitted files.
+
+3. **Build** (incremental, 3 to 8 minutes):
+
+   ```sh
+   scripts/build --installclean         # the change removes anything
+   scripts/build                        # the change only adds or edits
+   ```
+
+   On failure, the last lines name the log in `bench/logs/`. Search it for
+   `FAILED:` to find the step that broke.
+
+4. **Install on the phone** (about 4 minutes, including the boot):
+
+   ```sh
+   scripts/flash stripped               # same signing keys as what the phone runs: keeps data
+   scripts/flash stripped --wipe        # first install, or the phone runs a build with other keys
+   ```
+
+   Every build of this tree uses the same test keys, so updates keep the data.
+   After `--wipe`, adb and `adb root` work straight away: debug builds turn on
+   USB debugging and rooted debugging from first boot (set in
+   `device/motorola/river`). The phone sits at the setup wizard with no Wi-Fi;
+   that is fine for checks and benchmarks.
+
+5. **Check the phone works:**
+
+   ```sh
+   scripts/phone-check                  # add --wait right after a flash
+   ```
+
+   It takes about 2 seconds and prints PASS, WARN or FAIL for: the phone runs
+   the build you just made, boot, SELinux, crashes and tombstones, services
+   crashing or restarting in a loop, Wi-Fi with internet, Bluetooth, GPS,
+   cameras, sensors, fingerprint, audio, and no telephony. It exits 1 on any
+   FAIL. Then use the feature you changed on the phone itself.
+
+   If the phone does not boot, see "Roll back" above: the previous build is
+   still on the other slot.
+
+6. **Measure** (about 12 minutes, the phone reboots 3 times):
+
+   ```sh
+   scripts/bench/device-bench stripped --boots 3
+   ```
+
+   Compare with the previous rows in `bench/results/device.csv`. For
+   baselines, measure right after `scripts/flash stripped --wipe`, without
+   touching the phone (setup wizard open, no Wi-Fi), so every baseline is
+   measured the same way.
+
+7. **Open the pull requests and merge** them, one command each however many
+   repos the change touched. Paste the `phone-check` and `device-bench`
+   results into the description:
+
+   ```sh
+   scripts/change pr -t "<title>" -F notes.md
+   scripts/change merge
+   ```
+
+8. **Now and then**, measure the cold build time with
+   `scripts/bench/bench stripped`, and mark a milestone with
+   `scripts/change tag baseline-<n>`.
 
 ## Rules
 

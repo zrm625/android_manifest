@@ -3,9 +3,13 @@
 # after a small change only what depends on it is rebuilt, in minutes rather
 # than hours.
 #
-# Usage: build [--tree baseline|stripped] [--clean] [--ccache] [--jobs N] [--target T]
+# Usage: build [--tree baseline|stripped] [--installclean] [--clean] [--ccache] [--jobs N] [--target T]
 #
 #   --tree     Which tree to build. Default: stripped (this tree).
+#   --installclean  Delete the staged partitions and images first, but keep
+#              compiled objects. Use it after removing packages, blobs or
+#              features: an incremental build can leave removed files behind,
+#              and they end up in the image. Costs a few extra minutes.
 #   --clean    Delete the previous output first. Rarely needed; try without it.
 #   --ccache   Use the shared ccache in $BENCH_HOME/ccache. It only pays off when
 #              the output is deleted often. Switching it on or off changes every
@@ -22,10 +26,11 @@ source "$(dirname "$(realpath "$0")")/bench/lib.sh"
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-env_name=stripped clean=0 ccache=0 jobs=$(nproc) target=bacon
+env_name=stripped installclean=0 clean=0 ccache=0 jobs=$(nproc) target=bacon
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tree) env_name=$2; shift ;;
+    --installclean) installclean=1 ;;
     --clean) clean=1 ;;
     --ccache) ccache=1 ;;
     --jobs) jobs=$2; shift ;;
@@ -50,7 +55,7 @@ fi
 log=$BENCH_HOME/logs/build-$(date +%Y%m%d-%H%M%S)-$env_name.log
 echo "Building $target for $env_name into $out (log: $log)"
 rc=0
-run_build "$tree" "$out" "$target" "$jobs" "$ccache" "$log" || rc=$?
+run_build "$tree" "$out" "$target" "$jobs" "$ccache" "$log" "$installclean" || rc=$?
 read -r _ wall _ < <(cat "$out/.bench-result" 2>/dev/null || echo "$rc 0 ")
 echo
 if [[ "$rc" == 0 ]]; then
