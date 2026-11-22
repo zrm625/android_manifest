@@ -109,7 +109,7 @@ for ((i = 1; i <= boots; i++)); do
 
   mem_total=$(sh_ grep MemTotal /proc/meminfo | awk '{print $2}')
   mem_avail=$(sh_ grep MemAvailable /proc/meminfo | awk '{print $2}')
-  used_ram=$(sh_ dumpsys meminfo | awk -F'[: K(]+' '/Used RAM/ {gsub(",", "", $4); print $4; exit}')
+  used_ram=$(sh_ dumpsys meminfo | awk -F'[: K(]+' '/Used RAM/ {gsub(",", "", $4); if (!f) print $4; f=1}')
   procs=$(sh_ ps -A | tail -n +2 | wc -l)
   pkgs=$(sh_ pm list packages | wc -l)
   sys_used=$(df_used /)
