@@ -21,6 +21,7 @@ remote, a `gh` default, or the GitHub UI suggests it.
 | Path in tree | Pull requests go to | Base branch |
 | --- | --- | --- |
 | `.repo/manifests` (this manifest) | `zrm625/android_manifest` | `river-22.2` |
+| `build/make` | `zrm625/android_build` | `river-22.2` |
 | `device/motorola/river` | `zrm625/android_device_motorola_river` | `river-22.2` |
 | `device/motorola/sdm632-common` | `zrm625/android_device_motorola_sdm632-common` | `river-22.2` |
 | `kernel/motorola/sdm632` | `zrm625/android_kernel_motorola_sdm632` | `river-22.2` |

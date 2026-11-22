@@ -52,7 +52,9 @@ if [[ -n "$built_for" && "$built_for" != "$DEVICE_CODENAME" ]]; then
 fi
 
 fb() { fastboot -s "$SERIAL" "$@"; }
-getvar() { fb getvar "$1" 2>&1 | awk -F': *' -v k="$1" '$1 == k {print $2; exit}' | tr -d '\r'; }
+# Read all of fastboot's output: stopping early (awk exit) can SIGPIPE
+# fastboot, and pipefail then kills the script without a message.
+getvar() { fb getvar "$1" 2>&1 | awk -F': *' -v k="$1" '$1 == k && !f {print $2; f=1}' | tr -d '\r'; }
 
 # Get the phone into the bootloader, checking it is the river test phone.
 if [[ "$(adb -s "$SERIAL" get-state 2>/dev/null || true)" == device ]]; then
