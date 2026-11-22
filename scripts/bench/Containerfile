@@ -4,12 +4,15 @@ FROM docker.io/library/ubuntu@sha256:b682e31336cc8e0a73ed91ab32b7a95e32591c5ff09
 
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-# Package list from the LineageOS build guide for Ubuntu 22.04.
+# Package list from the LineageOS build guide for Ubuntu 22.04, plus unzip,
+# xz-utils, cpio, file, kmod and openssl, which the build calls but a minimal
+# Ubuntu image lacks.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bc bison build-essential ca-certificates ccache curl flex g++-multilib \
       gcc-multilib git git-lfs gnupg gperf imagemagick lib32ncurses5-dev \
       lib32readline-dev lib32z1-dev libdw-dev libelf-dev libncurses5 \
       libsdl1.2-dev libssl-dev libxml2 libxml2-utils lz4 lzop pngcrush \
       procps protobuf-compiler python-is-python3 python3 python3-protobuf \
-      rsync schedtool squashfs-tools time xsltproc zip zlib1g-dev \
+      rsync schedtool squashfs-tools time unzip xsltproc xz-utils zip zlib1g-dev \
+      cpio file kmod openssl \
     && rm -rf /var/lib/apt/lists/*
