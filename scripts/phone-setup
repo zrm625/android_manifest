@@ -16,13 +16,19 @@
 # river-22.2 already default to most of this (and dark theme, low brightness,
 # no click sounds); the script sets them again so older images match too.
 #
-# Only the phone with serial $BENCH_DEVICE (default ZY225DPT7F) is touched.
+# Only the phone with serial ZY225DPT7F is touched (fixed; BENCH_DEVICE may
+# only repeat it), and only if it reports itself as river. It
+# takes the shared device lock, or reuses it when BENCH_LOCK_TOKEN matches.
 set -euo pipefail
+source "$(dirname "$(realpath "$0")")/common.sh"
 
-SERIAL=${BENCH_DEVICE:-ZY225DPT7F}
+SERIAL=ZY225DPT7F
+if [[ -n "${BENCH_DEVICE:-}" && "$BENCH_DEVICE" != "$SERIAL" ]]; then
+  echo "error: BENCH_DEVICE=$BENCH_DEVICE is not the test phone $SERIAL. Refusing." >&2; exit 1
+fi
 DEVICE_CODENAME=river
 
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 ssid_file='' psk_file='' extra_dim=1
 while (($#)); do
@@ -35,14 +41,18 @@ while (($#)); do
   shift
 done
 
+device_lock
 a() { adb -s "$SERIAL" "$@"; }
-# Read the whole output before filtering (see phone-check about SIGPIPE).
+# Read the whole output before filtering: closing a dumpsys pipe early sends
+# SIGPIPE to the service being dumped.
 sh_() { a shell "$@" 2>/dev/null | tr -d '\r'; }
 
 state=$(a get-state 2>/dev/null || true)
 [[ "$state" == device ]] || { echo "error: $SERIAL is not connected in adb device mode (state: ${state:-none})" >&2; exit 1; }
 codename=$(sh_ getprop ro.product.device)
 [[ "$codename" == "$DEVICE_CODENAME" ]] || { echo "error: $SERIAL is '$codename', not $DEVICE_CODENAME. Refusing." >&2; exit 1; }
+serialno=$(sh_ getprop ro.serialno)
+[[ -z "$serialno" || "$serialno" == "$SERIAL" ]] || { echo "error: adb -s $SERIAL reached a phone with serial $serialno. Refusing." >&2; exit 1; }
 deadline=$((SECONDS + 900))
 until [[ "$(sh_ getprop sys.boot_completed)" == 1 ]]; do
   (( SECONDS < deadline )) || { echo "error: phone did not finish booting" >&2; exit 1; }
@@ -70,7 +80,21 @@ fi
 # Screens stacked on top of the wizard (for example Settings screens opened by
 # a crash sweep) would make Back walk through all of them. Clear them first.
 a shell am force-stop com.android.settings >/dev/null 2>&1 || true
-a shell input keyevent WAKEUP >/dev/null 2>&1 || true
+
+# A bench or boot-timing run leaves the screen asleep, and taps on a sleeping
+# screen do nothing. Wake it and confirm it is awake (mWakefulness=Awake)
+# before every tap, retrying.
+awake() { [[ "$(sh_ dumpsys power)" == *mWakefulness=Awake* ]]; }
+wake() {
+  local i
+  for i in $(seq 10); do
+    awake && return 0
+    a shell input keyevent WAKEUP >/dev/null 2>&1 || true
+    sleep 1
+  done
+  awake || { echo "error: the screen does not wake up (mWakefulness is not Awake)" >&2; exit 1; }
+}
+wake
 # Mute touch, lock and charging sounds before tapping anything.
 a shell settings put system sound_effects_enabled 0
 a shell settings put system lockscreen_sounds_enabled 0
@@ -123,6 +147,7 @@ for step in $(seq 60); do
     echo "Setup wizard: finished"
     break
   fi
+  wake
   xml=''
   for _ in 1 2 3; do
     a shell uiautomator dump /sdcard/phone-setup.xml >/dev/null 2>&1 &&
@@ -144,6 +169,7 @@ for step in $(seq 60); do
   fi
   last=$action
   echo "  tap: $label"
+  wake
   a shell input tap "$x" "$y"
   sleep 2
 done

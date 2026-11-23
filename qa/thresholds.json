@@ -1,0 +1,47 @@
+{
+  "comment": "phone-qa thresholds and calibrated parameters. 'values' can never go below the hard floors in features.FLOORS. 'calibrated' stays false until the Perch calibration (DESIGN.md step 4) sets the functional thresholds; changing this file changes the harness version and clears the controls.",
+  "calibrated": false,
+  "values": {
+    "audio_min_db": 15.0,
+    "audio_gap_db": 10.0,
+    "video_psnr_db": 30.0,
+    "camera_luma_std": 4.0,
+    "camera_frame_diff": 0.0,
+    "extra_dim_drop": 0.3,
+    "torch_delta": 5.0
+  },
+  "params": {
+    "audio_volume": 7,
+    "audio_amplitude": 0.5,
+    "audio_level_floor_dbfs": -70.0,
+    "camera0_photo_iso": 800,
+    "camera0_photo_exposure_ns": 60000000,
+    "keyboard_word": "river",
+    "keyboard_keys": {
+      "r": [
+        378,
+        1560
+      ],
+      "i": [
+        810,
+        1560
+      ],
+      "v": [
+        540,
+        1880
+      ],
+      "e": [
+        270,
+        1560
+      ]
+    },
+    "swipe_up": null,
+    "back_swipe": null,
+    "brave_firstrun_taps": [
+      "Maybe later",
+      "Continue",
+      "Start browsing"
+    ],
+    "video_output": "buffer"
+  }
+}

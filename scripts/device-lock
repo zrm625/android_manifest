@@ -1,0 +1,23 @@
+#!/usr/bin/env -S python3 -I
+# Hold the shared device lock ($BENCH_HOME/.device-lock) while running one
+# command, with BENCH_LOCK_TOKEN exported so flash, device-bench, phone-setup
+# and phone-qa inside it reuse the lock. The batch runner does the same.
+#
+# Usage: device-lock COMMAND [ARGS...]
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "qa", "lib"))
+from riverqa.lock import DeviceLock, LockError  # noqa: E402
+
+if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    print("Usage: device-lock COMMAND [ARGS...]\n\nRuns COMMAND holding $BENCH_HOME/.device-lock, "
+          "with BENCH_LOCK_TOKEN exported.")
+    sys.exit(0 if len(sys.argv) > 1 else 1)
+try:
+    with DeviceLock():
+        sys.exit(subprocess.call(sys.argv[1:]))
+except LockError as e:
+    print(f"error: {e}", file=sys.stderr)
+    sys.exit(1)

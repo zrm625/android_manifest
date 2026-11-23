@@ -14,7 +14,7 @@ it, edit it there and open a pull request (see [Rules](#rules)).
 | --- | --- | --- |
 | `tree/` | `~/git/lineageos-river` | The source tree you work in (manifest branch `river-22.2`) |
 | `baseline/` | `~/git/lineageos-river-baseline` | Frozen stock tree for comparison (locked branch `baseline-22.2`). Never edit it. |
-| `scripts/` | `tree/.repo/manifests/scripts` | `change`, `build`, `flash`, `phone-check`, `phone-setup`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
+| `scripts/` | `tree/.repo/manifests/scripts` | `change`, `build`, `flash`, `phone-qa`, `phone-setup`, `device-lock`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
 | `bench/` | `/mnt/storage/lineageos-bench` | Working build output (`out-stripped/`), benchmark output (`out-bench-*/`), `results/`, `logs/` |
 | `phone` | Moto G7, USB serial `ZY225DPT7F` | The only test phone |
 
@@ -60,7 +60,11 @@ The build produces, in `bench/out-stripped/target/product/river/`:
 Requirements:
 
 - The Moto G7 is plugged in over USB and appears in `adb devices` as
-  `ZY225DPT7F`, or is in fastboot mode.
+  `ZY225DPT7F`, or is in fastboot mode. Before the QA harness has a
+  known-good slot (no `$BENCH_HOME/slot-state.json`), it must be booted to
+  Android with adb authorized: `flash` writes only after it has read that
+  the active slot finished booting. From fastboot, `fastboot -s ZY225DPT7F
+  reboot` and wait for Android first.
 - The bootloader is unlocked. It is.
 - Run all `adb` and `fastboot` commands with `-s ZY225DPT7F`. A Pixel is
   sometimes connected over wireless adb. Never touch it.
@@ -75,12 +79,25 @@ scripts/flash stripped            # update over a previous build of this tree
 `scripts/flash` reboots the phone to the bootloader and checks that it is
 `river`. It writes `boot`, `dtbo`, `system` and `vendor` to the **inactive**
 A/B slot, switches to that slot, and waits for the phone to boot. The slot that
-was running stays untouched.
+was running stays untouched. Once the QA harness has a known-good slot
+(`$BENCH_HOME/slot-state.json`), `flash` always writes the other slot, never
+the known-good one; `scripts/flash --status` shows which is which, and
+`scripts/flash --rollback` returns to the known-good build (it wipes data).
 
 `--wipe` erases all data on the phone. It is needed whenever the signing keys
 change. Builds from this tree are signed with test keys, so moving from an
 official LineageOS nightly to this build, or the other way, needs `--wipe`.
 Without it the phone boot-loops.
+
+**First install for the QA harness.** Before the first baseline, `phone-qa`
+needs the phone to run a stamped build from this tree. So the first install
+(step 0 in `.repo/manifests/qa/README.md`, "Calibration and bootstrap") is
+`scripts/flash stripped --wipe` whenever the phone runs a build that is not
+from this tree (an official nightly, or any build with other signing keys):
+without the wipe it boot-loops. The stamp (`ro.river.build_id`) comes from
+device PR #7 (zrm625/android_device_motorola_river, `9851f11`), which merges
+together with harness PR #10. Until both are merged, build with branch
+`qa-harness` checked out in `device/motorola/river` and in the manifest.
 
 **Roll back** if the new build does not boot. Hold Power + Volume Down to get
 to the bootloader, then:
@@ -155,14 +172,17 @@ The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
 5. **Check the phone works:**
 
    ```sh
-   scripts/phone-check                  # add --wait right after a flash
+   scripts/phone-qa --quick             # add --wait right after a flash
    ```
 
-   It takes about 2 seconds and prints PASS, WARN or FAIL for: the phone runs
-   the build you just made, boot, SELinux, crashes and tombstones, services
-   crashing or restarting in a loop, Wi-Fi with internet, Bluetooth, GPS,
-   cameras, sensors, fingerprint, audio, and no telephony. It exits 1 on any
-   FAIL. Then use the feature you changed on the phone itself.
+   It takes a few seconds and checks the health group: boot finished, SELinux
+   enforcing, no crashes since boot, no new tombstones, no services crashing
+   or restarting in a loop, and no telephony. These gate: it exits 1 on any
+   FAIL. It also prints INFO lines for the build in `bench/out-stripped`,
+   Wi-Fi, Bluetooth, GPS, cameras, sensors, fingerprint and audio, which need
+   a look but never fail the run. The full QA (`phone-qa --batch`) is for
+   batches; see `tree/.repo/manifests/qa/README.md`. Then use the feature you
+   changed on the phone itself.
 
    If the phone does not boot, see "Roll back" above: the previous build is
    still on the other slot.
@@ -196,7 +216,7 @@ The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
    no image default, so the script sets it.
 
 7. **Open the pull requests and merge** them, one command each however many
-   repos the change touched. Paste the `phone-check` and `device-bench`
+   repos the change touched. Paste the `phone-qa --quick` and `device-bench`
    results into the description:
 
    ```sh

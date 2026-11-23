@@ -1,0 +1,315 @@
+"""Review round 12, the dev flash before the first baseline (no
+slot-state.json). R12-1: what may be overwritten is decided by the active
+slot alone, so that slot must be shown to boot (the phone in Android with
+sys.boot_completed=1) before the other slot is written; a phone in fastboot,
+or one that answers adb without completing boot, is refused before anything
+is cleared or written. Halts in this state with an obligation pending give
+the R10-3/R11-1 way back, never flash --recover. R12-2: the advice after a
+--set-active or wipe timeout keeps the caller's --wipe choice and starts by
+confirming the active slot.
+
+The fakes are those of rounds 9 and 10, so these regressions also run at
+the round-11 code (c4064da). No adb or fastboot."""
+import unittest
+
+import _path  # noqa: F401
+from benchhome import bench_home
+from riverqa import fbmode, flashing
+from test_round8 import DEV_BID
+from test_round9 import R9Phone, booting_reboot, dev_flash, flashes, legacy_entry
+from test_slot_recovery import BID
+
+
+def not_booted(p):
+    """adb answers in Android, but the boot never completes."""
+    real = p.getprop
+
+    def getprop(name, real=real):
+        if name == "sys.boot_completed":
+            return ""
+        return real(name)
+    p.getprop = getprop
+
+
+class R12_1PreBaselineBootedSlot(unittest.TestCase):
+    def test_adb_without_boot_completed_writes_nothing(self):
+        """Sol round 12: slot b answers adb but never completes boot; slot a
+        is the only slot that boots. At c4064da the flash wrote all four a
+        partitions."""
+        for owed in (False, True):
+            with self.subTest(owed=owed), bench_home():
+                p = R9Phone(where="android", active="b", bootable=("a",), fb=False, builds={"a": BID})
+                not_booted(p)
+                if owed:
+                    legacy_entry()
+                rc, err = dev_flash(p, reboot=booting_reboot)
+                self.assertEqual(rc, flashing.EXIT_HALT if owed else flashing.EXIT_ERROR, err)
+                self.assertIn("has not completed boot", err)
+                self.assertEqual(flashes(p.calls), [])
+                self.assertNotIn(("fb_mode_clear",), p.calls)
+                if owed:
+                    self.assertIsNotNone(fbmode.pending())
+                    self.assertNotIn("flash --recover", err)
+
+    def test_second_no_reboot_flash_keeps_the_original_slot(self):
+        """Sol round 12: two pre-baseline --no-reboot flashes. The first
+        writes b from a booted a and leaves the phone in fastboot on b; at
+        c4064da the second wrote a before b had ever booted. Now it is
+        refused (exit 1) with nothing written."""
+        with bench_home():
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False,
+                        builds={"a": BID, "b": DEV_BID})
+            rc, err = dev_flash(p, "--no-reboot")
+            self.assertEqual(rc, flashing.EXIT_OK, err)
+            self.assertEqual({c[2][-1] for c in flashes(p.calls)}, {"b"})
+            p.calls.clear()
+            rc, err = dev_flash(p, "--no-reboot")
+            self.assertEqual(rc, flashing.EXIT_ERROR, err)
+            self.assertIn("nothing shows that slot b boots", err)
+            self.assertEqual(flashes(p.calls), [])
+
+    def test_booted_phone_still_flashes(self):
+        """The bootstrap's step 0 is unchanged: from a booted phone the dev
+        flash writes the other slot and verifies its boot."""
+        with bench_home():
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False,
+                        builds={"a": BID, "b": DEV_BID})
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_OK, err)
+            self.assertEqual({c[2][-1] for c in flashes(p.calls)}, {"b"})
+
+    def test_pre_write_halts_give_the_slotless_way_back(self):
+        """Sol round 12 (minor): before the first baseline a halt before any
+        write sent a slotless entry to flash --recover, which can't verify it."""
+        with bench_home():
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False)
+            p.getprop = lambda name: "1" if name == "sys.boot_completed" else ""
+            legacy_entry()
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+            self.assertIn("records no slot", err)
+            self.assertNotIn("flash --recover finishes it", err)
+            self.assertEqual(flashes(p.calls), [])
+
+
+class R12_2TimeoutAdvice(unittest.TestCase):
+    def test_set_active_timeout_without_wipe_advises_no_erase(self):
+        """Sol and Opus round 12: with no --wipe, nothing pending, a
+        --set-active timeout advised erasing userdata. Now the advice checks
+        the active slot first and never names an erase."""
+        for argv in (("--no-reboot",), ()):
+            for st in (True, False):
+                with self.subTest(argv=argv, state=st), bench_home():
+                    if st:
+                        from test_slot_recovery import state
+                        state(pair_kind=None)
+                    p = R9Phone(where="fastboot" if st else "android", active="a", bootable=("a", "b"),
+                                fb=bool(st))
+                    real_ok = p.fastboot_ok
+
+                    def fastboot_ok(*args, timeout=300, real_ok=real_ok):
+                        if args[:1] == ("--set-active=b",):
+                            raise TimeoutError("fastboot --set-active=b: timed out after 60 s")
+                        return real_ok(*args, timeout=timeout)
+                    p.fastboot_ok = fastboot_ok
+                    rc, err = dev_flash(p, *argv, reboot=None if argv else booting_reboot)
+                    self.assertEqual(rc, flashing.EXIT_HALT, err)
+                    self.assertIn("getvar current-slot", err)
+                    self.assertIn("run without --wipe", err)
+                    self.assertNotIn("erase userdata", err)
+
+
+
+
+class R13FollowUps(unittest.TestCase):
+    def test_slot_and_boot_state_come_from_one_boot(self):
+        """Sol round 13 (major 1): slot b answers adb before completing boot
+        and the phone falls back to a between two separate getprop calls.
+        At a1abb2a the flash paired b's suffix with a's completed boot,
+        targeted a and wrote it. With one shell call both values are from
+        the same boot (here: a, completed), so it writes b."""
+        with bench_home():
+            p = R9Phone(where="android", active="b", bootable=("a", "b"), fb=False,
+                        builds={"a": BID, "b": DEV_BID})
+            real = p.getprop
+
+            def getprop(name, real=real, p=p):
+                if name == "ro.boot.slot_suffix" and p.running == "b":
+                    v = real(name)
+                    p.running = p.active = "a"      # fell back to a before the next read
+                    return v
+                return real(name)
+            p.getprop = getprop
+            # One shell call sees one boot: the one the phone fell back to.
+            p.slot_boot_state = lambda: ("_a", True)
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertNotIn("a", {c[2][-1] for c in flashes(p.calls)}, err)
+
+    def test_sentinel_entry_in_fastboot_advice_leads_out(self):
+        """Opus round 13 (m1): no slot-state.json, an obligation armed on a
+        with the unstamped sentinel, the phone in fastboot on a. R12-1
+        refuses; at a1abb2a the advice said "run flash stripped with slot a
+        active", the command just refused. Now it says to clear fb_mode and
+        boot slot a first, and following it lets the next flash settle."""
+        from test_round8 import arm_entry
+        with bench_home():
+            p = R9Phone(where="fastboot", active="a", bootable=("a", "b"), builds={"a": BID, "b": DEV_BID})
+            arm_entry("a", ids=("unstamped", "unstamped"))
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+            self.assertIn("phone-qa recover: it clears fb_mode, boots slot a to completion", err)
+            self.assertEqual(flashes(p.calls), [])
+            # Follow the advice (Sol round 13): phone-qa recover boots slot a
+            # and leaves the obligation pending; then the flash settles it.
+            from test_round10 import recover_cmd
+            rc, out = recover_cmd(p)
+            self.assertEqual(rc, 0, out)
+            self.assertIsNotNone(fbmode.pending())
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_OK, err)
+            self.assertIsNone(fbmode.pending())
+            self.assertEqual({c[2][-1] for c in flashes(p.calls)}, {"b"})
+
+    def test_not_booted_with_nothing_pending_says_wait(self):
+        """Opus round 13 (m2): in Android before boot completes, the advice
+        first says to wait for the boot to finish."""
+        with bench_home():
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False)
+            not_booted(p)
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_ERROR, err)
+            self.assertIn("If the phone is still booting, wait until it finishes", err)
+
+
+class R13GeminiMinors(unittest.TestCase):
+    def test_pre_baseline_clear_failure_gives_the_way_back(self):
+        """Gemini round 13 (m2): the second clear fails before the first
+        baseline. The advice said "run the flash again", which R12-1 refuses
+        from fastboot; now it gives the R10-3 way back."""
+        from test_round8 import arm_entry
+        with bench_home():
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False, clear_fails_after=1,
+                        builds={"a": BID, "b": DEV_BID})
+            arm_entry("a")
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+            self.assertIn("phone-qa recover", err)
+            self.assertNotIn("then run the flash again", err)
+            self.assertEqual(flashes(p.calls), [])
+            self.assertIsNotNone(fbmode.pending())
+
+    def test_not_booted_advice_reboots_to_the_bootloader_first(self):
+        """Gemini round 13 (m3)."""
+        with bench_home():
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False)
+            not_booted(p)
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_ERROR, err)
+            self.assertIn("adb -s ZY225DPT7F reboot bootloader, then fastboot", err)
+
+
+class R14OpusMinors(unittest.TestCase):
+    def test_boot_only_ok_has_one_caller(self):
+        """Opus round 14 (m1): only phone-qa recover passes boot_only_ok."""
+        import ast
+        from pathlib import Path
+        lib = Path(flashing.__file__).parent
+        users = set()
+        for f in sorted(lib.glob("*.py")):
+            tree = ast.parse(f.read_text())
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for c in ast.walk(fn):
+                    if isinstance(c, ast.Call) and any(k.arg == "boot_only_ok" for k in c.keywords):
+                        users.add((f.stem, fn.name))
+        self.assertEqual(users, {("qa", "cmd_recover")})
+
+    def test_slot_boot_state_parser(self):
+        """Opus round 14 (m2): the real parser on success, a failed call, a
+        missing key and an empty suffix."""
+        from unittest import mock
+        from riverqa.device import Device
+        cases = [((0, "S=_a\nC=1\n", ""), ("_a", True)),
+                 ((0, "S=_b\nC=\n", ""), ("_b", False)),
+                 ((0, "S=\nC=1\n", ""), ("", True)),
+                 ((1, "S=_a\n", "error: closed"), RuntimeError),
+                 ((0, "S=_a\n", ""), RuntimeError),
+                 ((0, "", ""), RuntimeError)]
+        for ret, want in cases:
+            with self.subTest(ret=ret):
+                d = Device.__new__(Device)
+                d.serial = "ZY225DPT7F"
+                with mock.patch.object(Device, "sh_rc", return_value=ret):
+                    if want is RuntimeError:
+                        with self.assertRaises(RuntimeError):
+                            d.slot_boot_state()
+                    else:
+                        self.assertEqual(d.slot_boot_state(), want)
+
+
+class R14GeminiMinors(unittest.TestCase):
+    def test_boot_only_edges(self):
+        """Gemini round 14 (m4): with a sentinel entry armed on a and slot b
+        active, phone-qa recover raises WrongSlot before any clear; and
+        fbmode.recover without boot_only_ok still refuses the entry."""
+        from test_round8 import arm_entry
+        from test_round10 import recover_cmd
+        with bench_home():
+            p = R9Phone(where="fastboot", active="b", bootable=("a", "b"), builds={"a": BID, "b": DEV_BID})
+            arm_entry("a", ids=("unstamped", "unstamped"))
+            rc, out = recover_cmd(p)
+            self.assertEqual(rc, 3, out)
+            self.assertNotIn(("fb_mode_clear",), p.calls)
+            self.assertEqual(p.boots, [])
+            self.assertIsNotNone(fbmode.pending())
+        with bench_home():
+            p = R9Phone(where="fastboot", active="a", bootable=("a", "b"), builds={"a": BID, "b": DEV_BID})
+            arm_entry("a", ids=("unstamped", "unstamped"))
+            with self.assertRaisesRegex(RuntimeError, "no recorded slot and build IDs"):
+                fbmode.recover(p, 10, boot=True)
+            self.assertEqual((p.calls, p.boots), ([], []))
+
+
+class R14SolMinors(unittest.TestCase):
+    def test_boot_only_final_check_needs_one_completed_boot(self):
+        """Sol round 14: a same-slot restart between the completion wait
+        and the slot read. The final check reads slot and completion in one
+        call; not completed raises, exit 3, obligation pending."""
+        from test_round8 import arm_entry
+        from test_round10 import recover_cmd
+        with bench_home():
+            p = R9Phone(where="fastboot", active="a", bootable=("a", "b"), builds={"a": BID, "b": DEV_BID})
+            arm_entry("a", ids=("unstamped", "unstamped"))
+            p.slot_boot_state = lambda: ("_a", False)
+            rc, out = recover_cmd(p)
+            self.assertEqual(rc, 3, out)
+            self.assertIn("has not completed boot", out)
+            self.assertIsNotNone(fbmode.pending())
+
+    def test_unauthorized_state_and_message(self):
+        """Sol round 14: adb get-state exits nonzero with "unauthorized" on
+        stderr; Device.state keeps it, and the dev flash asks for the
+        USB-debugging prompt with nothing touched."""
+        import subprocess
+        from unittest import mock
+        from riverqa.device import Device
+        d = Device.__new__(Device)
+        d.serial = "ZY225DPT7F"
+        r = subprocess.CompletedProcess([], 1, "", "error: device unauthorized.\n")
+        with mock.patch.object(Device, "adb", return_value=r):
+            self.assertEqual(d.state(), "unauthorized")
+        r = subprocess.CompletedProcess([], 1, "", "error: no devices/emulators found\n")
+        with mock.patch.object(Device, "adb", return_value=r):
+            self.assertEqual(d.state(), "")
+        with bench_home():
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False)
+            p.state = lambda: "unauthorized"
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_ERROR, err)
+            self.assertIn("accept the USB-debugging prompt", err)
+            self.assertEqual(flashes(p.calls), [])
+
+
+if __name__ == "__main__":
+    unittest.main()

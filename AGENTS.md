@@ -130,12 +130,16 @@ The goal is to cut build time and image size against a frozen baseline.
   `ZY225DPT7F`), then records boot time, RAM, processes, packages, partition
   use, and idle CPU to `device.csv`.
 - **Install a build:** `.repo/manifests/scripts/flash <baseline|stripped> [--wipe]`.
-  It uses fastboot to flash the inactive A/B slot, so the running slot stays
-  as a fallback.
-- **Check a build on the phone:** `.repo/manifests/scripts/phone-check` after
-  every flash. It must pass before you open pull requests. The full
-  edit-build-flash-check loop is in `~/git/river/AGENTS.md` under "Build and run
-  a change".
+  It uses fastboot to flash the slot that is not the known-good one, so the
+  known-good slot (`known_good_slot` in `slot-state.json`) stays as the
+  fallback. That is not necessarily the build running now.
+- **Check a build on the phone:** `.repo/manifests/scripts/phone-qa --quick`
+  after every flash (add `--wait` straight after one). It must pass before you
+  open pull requests. The full edit-build-flash-check loop is in
+  `~/git/river/AGENTS.md` under "Build and run a change".
+- **QA harness:** `phone-qa` is the gate for automatic batch merges. Its usage
+  is in `.repo/manifests/qa/README.md` and its design in `qa/DESIGN.md`. Unit
+  tests: `python3 -I -m unittest discover -s .repo/manifests/qa/tests -t .repo/manifests/qa/tests`.
 - The test phone is the USB Moto G7 only. Never run adb or fastboot commands
   against any other device, such as the Pixel on wireless adb. Always pass
   `-s ZY225DPT7F`.

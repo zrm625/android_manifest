@@ -1,0 +1,81 @@
+{
+  "dir": "$BENCH_HOME/qa/fixtures",
+  "server": {
+    "lan_addr": "192.168.4.44",
+    "lan_port": 47801,
+    "local_port": 47800,
+    "phone_wifi_addr": "192.168.4.60",
+    "forge_bt_addr": "04:68:74:AA:CC:26"
+  },
+  "files": {
+    "brave": {
+      "file": "Bravearm64Universal.apk",
+      "version": "1.100.58",
+      "package": "com.brave.browser",
+      "sha256": "1d35a8bf481735b10f134530b6f8517cad1a080bd2d94da267179bf1dbf8e7a7"
+    },
+    "tailscale": {
+      "file": "tailscale-android-universal-1.104.7.apk",
+      "version": "1.104.7",
+      "package": "com.tailscale.ipn",
+      "activity": "com.tailscale.ipn/.MainActivity",
+      "sha256": "5a620e118c36a203bdde43ddd93ef4122ce2d8ab2f7ad59ec30b6bbf391e01d9"
+    },
+    "t3code": {
+      "file": "t3code-android-internal-2.3.0-815.apk",
+      "version": "2.3.0 (815)",
+      "package": "com.t3tools.t3code",
+      "activity": "com.t3tools.t3code/.MainActivity",
+      "sha256": "cdc73a95ac8bd91305fa30c80864480f98795f1828218e5483d10dc22b25aa00"
+    },
+    "clip": {
+      "file": "testsrc2-640x352.mp4",
+      "frames": 150,
+      "width": 640,
+      "height": 352,
+      "sha256": "2b874ea37535ad84e6d701279c6aea8dca872f40a3ce9558fde67d9ad6ad07c5",
+      "made_by": "qa/fixtures/make-fixtures"
+    },
+    "frame0": {
+      "file": "testsrc2-frame-0.gray",
+      "frame": 0,
+      "sha256": "d861e129272f15fcff84e1ff97e5b79add4f763d4268c31ee9820ce6d98593d4",
+      "made_by": "qa/fixtures/make-fixtures"
+    },
+    "frame30": {
+      "file": "testsrc2-frame-30.gray",
+      "frame": 30,
+      "sha256": "aaa0af1a7e8237232d891514787c069c4ceddf4ba6ae7a70f19e9dde8f3b8e08",
+      "made_by": "qa/fixtures/make-fixtures"
+    },
+    "frame60": {
+      "file": "testsrc2-frame-60.gray",
+      "frame": 60,
+      "sha256": "cd3ec813546e24adfce43d744922dd7e586fc260f7358a4d42faed9ad9d5cf50",
+      "made_by": "qa/fixtures/make-fixtures"
+    },
+    "frame90": {
+      "file": "testsrc2-frame-90.gray",
+      "frame": 90,
+      "sha256": "defa0d3141321bb8e67f62bc3fdfaebe1916f081c1b9bcceb3235104971b4479",
+      "made_by": "qa/fixtures/make-fixtures"
+    },
+    "frame120": {
+      "file": "testsrc2-frame-120.gray",
+      "frame": 120,
+      "sha256": "c872c70019a2815877f906405e5ffa7972a5260a96d4e950628efc97e3663043",
+      "made_by": "qa/fixtures/make-fixtures"
+    },
+    "frame149": {
+      "file": "testsrc2-frame-149.gray",
+      "frame": 149,
+      "sha256": "a8d8469669f4d281bb742dae431bd7a2b5f556c5cd0fecf65eebf17b72fd2492",
+      "made_by": "qa/fixtures/make-fixtures"
+    },
+    "page": {
+      "file": "page.html",
+      "sha256": "f597ece351d60ad783b3e031f9fd04e4ca232ff83fe104c964ba7d3490bd48a4",
+      "made_by": "qa/fixtures/make-fixtures (copy of qa/fixtures/page.html)"
+    }
+  }
+}
