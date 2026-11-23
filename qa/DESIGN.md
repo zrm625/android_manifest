@@ -1169,11 +1169,13 @@ amendments A1 and A1′. A1′ rules 1-2 stay, for the chain only.
   reboot` path on pstore can't work on river. The dumps are in
   `$BENCH_HOME/qa/pstore-noanchor/`.
 - **The immediate kernel reboot is as stable as fastboot.** `sync; echo b >
-  /proc/sysrq-trigger` as root (it works with `kernel.sysrq=0`), measured
-  three times: command to USB gone 1.17-1.28 s; USB gone to kernel start
-  10.06-10.08 s. The fastboot path's normal pass is 10.06-10.08 s, and an
+  /proc/sysrq-trigger` as root (it works with `kernel.sysrq=0`): command to
+  USB gone 1.17-1.28 s (three trials); USB gone to kernel start 9.89-9.93 s
+  (the four step-1 normal reboots of 2026-11-23: 9.888, 9.909, 9.909 and
+  9.931 s). The fastboot path's normal pass is 10.05-10.09 s, and an
   injected extra pass adds about 4.4 s. USB drops at the reset itself, so
-  there is no variable shutdown tail.
+  there is no variable shutdown tail. (This text first gave 10.06-10.08 s
+  for the `sysrq` pass, copied from the fastboot path; corrected in R4-7.)
 
 **The rule.**
 1. **Bench boot 1 stays a normal `adb reboot`.** The charter's boot metric
@@ -1232,14 +1234,19 @@ amendments A1 and A1′. A1′ rules 1-2 stay, for the chain only.
    samples (and the first-boot record in `wipes.jsonl` that only they used),
    `clock: reset-anchor`, and `pstore-noanchor/`. Step 1 now keeps the raw
    pstore of every reboot whose chain did not pass in
-   `$BENCH_HOME/qa/pstore-unproven/`.
+   `$BENCH_HOME/qa/pstore-nopass/` (A2.1 renamed it from `pstore-unproven/`).
 
 **Residual risk.** A reset during bench boot 1 that happens before the
 interrupted kernel initialises ramoops (its first ~1 s) leaves the marker
 kernel's log in place, so the chain passes and that boot doesn't detect it.
 Only a kernel or bootloader change can cause such a reset, and in the same
 batch the fastboot first boot and the `sysrq` bench boot(s) are still
-uptime-gated, so the same change is very likely to show up there. A second
+uptime-gated, so the same change is very likely to show up there. On the
+gated paths, a reset inside the bootloader in its first ~2 s repeats less
+than the margin between A and the normal pass (about 2.2 s on river), so the
+uptime gate can't see it, and the chain can't either (no kernel ran). That is
+outside the threat model: the gates are there to catch an extra kernel boot
+or a whole extra bootloader pass (R4-7). A second
 residual: if every marker copy's stamp is damaged, the chain is UNVERIFIED
 and the boot is rerun; on the A1′ step-1 data, 2 of 13 boots had exact
 copies but no proven one.
@@ -1470,3 +1477,7 @@ enqueued never counts.
   ramdisk carries the build date and the kernel image its build timestamp).
   baseline-1 and baseline-2 have the same kernel commit but different boot,
   kernel and ramdisk hashes.
+- **Wording (Opus 5).** A2's data now gives the measured `sysrq` pass,
+  9.89-9.93 s, not the fastboot path's figure; A2 rule 7 names
+  `pstore-nopass/`; and A2's residual risk states that a bootloader reset in
+  the first ~2 s falls under the margin and is outside the threat model.

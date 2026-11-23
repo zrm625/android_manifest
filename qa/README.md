@@ -224,8 +224,8 @@ drops several seconds before the kernel resets on `adb reboot`, so a clock
 that starts at the disconnect includes a variable shutdown tail. Amendments
 A1 and A1′ tried to read the reset from pstore instead; ramoops damages too
 many lines on river for that to work, so A2 dropped it. The `sysrq` reboot
-resets at once (USB gone 1.17-1.28 s after the command, then 10.06-10.08 s to
-kernel start, like the fastboot path).
+resets at once (USB gone 1.17-1.28 s after the command, then 9.89-9.93 s to
+kernel start; the fastboot path's pass is 10.05-10.09 s).
 
 The chain passes when the previous kernel's log holds a copy of this
 attempt's leaving marker, within 3 wrong characters, with no new kernel
