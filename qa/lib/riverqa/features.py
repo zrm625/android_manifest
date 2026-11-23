@@ -559,19 +559,20 @@ def check_cameras(run) -> list[Result]:
         std_min = th(run, "camera_luma_std", 4.0)
         fs, l0, l1, s1 = cap["flash_states"], cap["luma_off"], cap["luma_on"], cap["std_on"]
         torch_ok, torch_why = torch_assertion(cap, delta_min)
+        rejected = torch_rejections(cap, delta_min)
         torch_detail = {"flash_states": fs, "luma_off": l0, "luma_on": l1, "std_on": s1, "iso": iso,
                         "exposure_ns": exp, "led_control": led_note, "valid_capture": cap["valid"],
-                        "torch_assertion": torch_why}
+                        "torch_assertion": torch_why, "torch_rejections": rejected}
         details["camera0_photo"] = torch_detail
-        if control_active() == "torch-disabled" and took and held and cap["valid"] and not torch_ok:
-            # Only a valid capture that the torch assertion itself rejected
-            # (FLASH_STATE_FIRED or the luma delta) counts, never any other
-            # FAIL of hardware.cameras (review round 3).
+        if control_active() == "torch-disabled" and took and held and rejected:
+            # Only the torch's own rejection counts: a usable flash state
+            # that says not fired, or a valid luma pair that failed the
+            # delta (review rounds 3 and 4). Missing metadata never does.
             injected(run, "torch-disabled")
         if not cap["valid"]:
             problems.append(f"camera 0 photo: incomplete capture result ({cap['why']})")
         elif not (torch_ok and l1 >= 20 and s1 >= std_min):
-            problems.append(f"camera 0 photo: FLASH_STATE {fs[1] if len(fs) > 1 else '?'}, luma off {l0:.1f} on "
+            problems.append(f"camera 0 photo: FLASH_STATE {cap['flash_on']}, luma off {l0:.1f} on "
                             f"{l1:.1f} (need +{delta_min}), on >= 20, std {s1:.1f} (need {std_min})")
     for camid in [c for c in expected if c != 0]:
         r = helper.instrument(run, "camera_photo", {"id": camid, "torch": 0}, timeout=60)
@@ -592,34 +593,67 @@ def check_cameras(run) -> list[Result]:
     return out
 
 
-def torch_capture(r) -> dict:
-    """The torch photo's result, parsed: valid only if the helper reported
-    the flash states of both frames and both lumas and the "on" std as
-    numbers."""
-    fs = [x for x in (r.get("flash_states") or "").split(",") if x != ""]
-    out = {"flash_states": fs, "luma_off": 0.0, "luma_on": 0.0, "std_on": 0.0, "valid": False, "why": ""}
+FLASH_STATES = {0, 1, 2, 3, 4}   # CaptureResult.FLASH_STATE_UNAVAILABLE .. FLASH_STATE_PARTIAL
+FLASH_STATE_FIRED = 3
+
+
+def _finite(v) -> float | None:
     try:
-        out["luma_off"], out["luma_on"] = float(r.get("luma0")), float(r.get("luma1"))
-        out["std_on"] = float(r.get("std1"))
+        f = float(v)
     except (TypeError, ValueError):
-        out["why"] = "luma or std missing"
-        return out
-    if len(fs) < 2:
-        out["why"] = f"flash states {fs or 'missing'}"
-        return out
-    out["valid"] = True
+        return None
+    return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
+def torch_capture(r) -> dict:
+    """The torch photo's result, parsed.
+
+    ``flash_on`` is the "on" frame's FLASH_STATE, only if the helper
+    reported a real value (0-4): a missing capture result comes back as
+    ``null`` and is never usable (review round 4). ``luma_valid``: both
+    lumas and the "on" std are finite numbers. ``valid`` needs both."""
+    fs = [x for x in (r.get("flash_states") or "").split(",") if x != ""]
+    out = {"flash_states": fs, "flash_on": None, "luma_off": 0.0, "luma_on": 0.0, "std_on": 0.0,
+           "luma_valid": False, "valid": False, "why": ""}
+    why = []
+    if len(fs) > 1 and fs[1].isdigit() and int(fs[1]) in FLASH_STATES:
+        out["flash_on"] = int(fs[1])
+    else:
+        why.append(f"no usable torch-on flash state ({fs or 'missing'})")
+    l0, l1, s1 = _finite(r.get("luma0")), _finite(r.get("luma1")), _finite(r.get("std1"))
+    if None in (l0, l1, s1):
+        why.append("luma or std missing")
+    else:
+        out.update(luma_off=l0, luma_on=l1, std_on=s1, luma_valid=True)
+    out["valid"] = out["luma_valid"] and out["flash_on"] is not None
+    out["why"] = "; ".join(why)
     return out
 
 
 def torch_assertion(cap: dict, delta_min: float) -> tuple[bool, str]:
     """The torch assertion itself: FLASH_STATE_FIRED on the "on" frame and a
     luma rise of at least ``delta_min``."""
-    fs = cap["flash_states"]
-    if not (len(fs) > 1 and fs[1] == "3"):  # FLASH_STATE_FIRED
-        return False, f"not FIRED (FLASH_STATE {fs[1] if len(fs) > 1 else '?'})"
+    if cap["flash_on"] != FLASH_STATE_FIRED:
+        return False, f"not FIRED (FLASH_STATE {cap['flash_on'] if cap['flash_on'] is not None else '?'})"
+    if not cap["luma_valid"]:
+        return False, "no luma pair"
     if cap["luma_on"] - cap["luma_off"] < delta_min:
         return False, f"luma rose {cap['luma_on'] - cap['luma_off']:.1f} (< {delta_min})"
     return True, "FIRED, luma rose"
+
+
+def torch_rejections(cap: dict, delta_min: float) -> list[str]:
+    """The evidence that the torch itself was rejected, for the
+    torch-disabled control (review round 4). Only two things count: a
+    usable torch-on flash state that says not fired, and a valid luma pair
+    that fails the delta check. A missing capture result or missing
+    metadata never counts."""
+    out = []
+    if cap["flash_on"] is not None and cap["flash_on"] != FLASH_STATE_FIRED:
+        out.append(f"FLASH_STATE {cap['flash_on']}, not FIRED")
+    if cap["luma_valid"] and cap["luma_on"] - cap["luma_off"] < delta_min:
+        out.append(f"luma rose {cap['luma_on'] - cap['luma_off']:.1f} (< {delta_min})")
+    return out
 
 
 def torch_leds(run) -> list[str]:

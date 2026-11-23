@@ -332,14 +332,29 @@ class Attribution(unittest.TestCase):
         r, marked = self.torch_run(lit_flat)
         self.assertEqual(r.state, FAIL)
         self.assertIsNone(marked)
-        # An incomplete capture result proves nothing.
-        r, marked = self.torch_run({"flash_states": "0", "luma0": "40", "luma1": "41", "std1": "9"})
-        self.assertEqual(r.state, FAIL)
-        self.assertIsNone(marked)
-        r, marked = self.torch_run({"flash_states": "0,2", "luma0": "40", "std1": "9"})
-        self.assertIsNone(marked)
         # The cap did not hold through the capture.
         self.assertIsNone(self.torch_run(dark, held=False)[1])
+
+    def test_torch_missing_metadata_never_qualifies(self):
+        """Review round 4: the helper reports ``2,null`` when the torch
+        frame's capture result never came. That is no evidence."""
+        cases = (
+            # (photo, qualifies)
+            ({"flash_states": "2,null", "luma0": "40", "std1": "9"}, False),               # Sol's case
+            ({"flash_states": "2,null"}, False),
+            ({"flash_states": "0,2"}, True),                                                 # usable, not fired
+            ({"flash_states": "0,2", "luma0": "40", "std1": "9"}, True),
+            ({"flash_states": "2,null", "luma0": "40", "luma1": "41", "std1": "9"}, True),  # luma fails by itself
+            ({"flash_states": "2,null", "luma0": "40", "luma1": "90", "std1": "9"}, False), # luma rose: no rejection
+            ({"flash_states": "0", "luma0": "40", "luma1": "41", "std1": "9"}, True),
+            ({"flash_states": "0", "luma0": "40", "luma1": "nan", "std1": "9"}, False),
+            ({"flash_states": "2,7", "luma0": "40", "std1": "9"}, False),                   # not a flash state
+            ({"flash_states": "", "luma0": "40", "luma1": "", "std1": "9"}, False),
+        )
+        for photo, want in cases:
+            r, marked = self.torch_run(photo)
+            self.assertEqual(r.state, FAIL, photo)
+            self.assertEqual(marked, "torch-disabled" if want else None, photo)
 
     def test_torch_must_stay_capped_through_the_capture(self):
         from fakes import FakeShell

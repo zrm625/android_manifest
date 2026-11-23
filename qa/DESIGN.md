@@ -1422,3 +1422,14 @@ for its boot evidence, so every batch now has at least two RAM rows.
   the two paths. Both end in the same Android boot and the RAM reading is
   taken after the same settle time, so no difference is expected. There is
   no paired adb/sysrq RAM data yet (see "Phone notes" below).
+
+**R4-5. The torch control needs the torch's own rejection.** The helper
+reports `flash_states` as `String.valueOf` of each frame's `FLASH_STATE`,
+so a torch frame whose capture result never arrived comes back as
+`2,null`. That used to count as "not FIRED" and qualify `torch-disabled`.
+Now `features.torch_capture` takes the torch-on flash state only if it is a
+real `FLASH_STATE` value (0-4), and `features.torch_rejections` counts only
+a usable torch-on flash state that is not FIRED, or a valid luma pair that
+fails the delta check. A missing capture result or missing metadata never
+qualifies the control. For the normal check a missing flash state is an
+incomplete capture (FAIL), as before.
