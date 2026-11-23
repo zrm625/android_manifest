@@ -2058,3 +2058,26 @@ the host dies right after it.
    1. A failure after it: the entry stays for the next recovery.
 9. Journal restore (`_fb_mode`): row 1, then re-read the journal;
    `restore_entry` never resolves an fb_mode entry itself.
+
+**Phone notes (2026-11-23, after R8, build 22-20261123-UNOFFICIAL-river, no
+wipe).**
+- `phone-qa --quick` passed (7 passed) before the checks and, with `--wait`,
+  after them.
+- `phone-qa boot-timing` (fresh normals) qualified every path (exit 0):
+  A = 12.45 s (fastboot, range 10.27-14.64, extra pass 4.404 s) and 12.58 s
+  (`sysrq`, range 10.72-14.45, extra pass 4.355 s). The record has
+  `rules_version` 3 and no problems. Over its 17 reboots the disconnect
+  gap was 0.116-0.160 s and the status read 0.082-0.177 s. Each of the
+  three injected `sysrq` passes armed fb_mode with the identity read in
+  Android (slot a, `baseline-2-7cc61b3f30` twice), cleared it at the stop,
+  and settled only with a `VerifiedBoot` of the next boot (three "fb_mode
+  obligation settled: verified slot a, ..." lines, each with a new
+  `boot_id`). The controls were rejected as before.
+- fb_mode kill test, with a watcher on `journal.json`: armed as the control
+  does, then SIGKILL with fb_mode set (entry pending, `cleared_at` null);
+  `phone-qa recover` killed the moment the clear was stamped (phone left in
+  fastboot, fb_mode clear, entry still pending, `cleared_at` set); `phone-qa
+  recover` again: it stamped a new clear, booted slot a, verified slot and
+  both build IDs, and only then resolved the entry (the watcher saw it go
+  with the phone back in adb). Exit 0.
+- Final state: slot a, `known_good_slot` a, no pair, journal empty.
