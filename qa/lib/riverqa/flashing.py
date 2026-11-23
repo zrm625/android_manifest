@@ -312,7 +312,7 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         # touched.
         log("error: an fb_mode obligation is pending and there is no known-good slot yet (no slot-state.json), "
             "so flash --no-reboot is refused: it would leave the obligation pending with another slot active, "
-            "and the next flash would write the slot the obligation was armed on.")
+            "and the next flash could write the only slot known to boot.")
         log(armed_way_back(owed, None))
         return EXIT_ERROR
     # Only now, with the inputs and the pair checked (R7-3), is the phone
@@ -510,8 +510,8 @@ def armed_way_back(e: dict | None, active: str | None) -> str:
         first = (f"set slot {slot} active by hand (from Android, adb -s {SERIAL} reboot bootloader first; then "
                  f"fastboot -s {SERIAL} --set-active={slot}), then ")
     else:
-        first = (f"if fastboot -s {SERIAL} getvar current-slot reports another slot, set slot {slot} active by "
-                 f"hand (from Android, adb -s {SERIAL} reboot bootloader first; then fastboot -s {SERIAL} "
+        first = (f"from Android, adb -s {SERIAL} reboot bootloader first; then if fastboot -s {SERIAL} getvar "
+                 f"current-slot reports another slot, set slot {slot} active by hand (fastboot -s {SERIAL} "
                  f"--set-active={slot}), then ")
     try:
         fbmode.armed_want(e)

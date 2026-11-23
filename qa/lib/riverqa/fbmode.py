@@ -259,8 +259,9 @@ def armed_want(e: dict) -> Want:
     if x.get("slot") not in SLOTS or not ids or len(ids) != 2 or any(stamp(b) is None for b in ids):
         raise RuntimeError("the fb_mode obligation has no recorded slot and build IDs to verify a boot against "
                            "(armed before round 8, or on an unstamped build). A dev flash "
-                           "(flash stripped) settles it with the verified boot of the slot it writes; with a "
-                           "known-good slot, flash --rollback or a batch flash does too")
+                           "(flash stripped) settles it with the verified boot of the slot it writes (before the "
+                           "first baseline, only from a phone booted to Android; it prints the way back otherwise); "
+                           "with a known-good slot, flash --rollback or a batch flash does too")
     return Want(x["slot"], (ids[0], ids[1]))
 
 

@@ -2568,3 +2568,10 @@ wrote all four a partitions, the second `--no-reboot` flash exited 0, the
 slotless pre-write halt named `flash --recover`, and the no-wipe timeout
 advice named an erase and no `getvar current-slot`.
 
+
+Gemini's round-12 minors: m1 (adb up is not a completed boot) and m2
+(no-wipe timeout advice) are R12-1 and R12-2. m3 wording: the pre-baseline
+`--no-reboot` refusal no longer names an armed slot a slotless entry
+lacks; `armed_way_back` says to reboot to the bootloader before
+`getvar current-slot`; `armed_want`'s hint mentions the pre-baseline
+booted-phone rule.
