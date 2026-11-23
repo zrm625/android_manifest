@@ -1786,3 +1786,17 @@ comes from fresh samples.
   Indirect targets (`t=/proc/sysrq-trigger; echo b > $t`, or a symlink
   written later) are out of scope: the threat model is accidental breakage
   by agents that follow the rules, not crafted commands.
+
+**Phone notes (2026-11-23, after R6, build 22-20261123-UNOFFICIAL-river, no
+wipe).**
+- `phone-qa boot-timing --reuse-normals` refused the stored normals
+  ("written under calibration rules 2, not 3; 8 normal sample(s) without
+  the rules 3 stamp") and measured fresh ones. It qualified every path
+  (exit 0). All 10 samples that can set A carry `rules_version` 3, and
+  `record_problems` finds nothing wrong with the record. A is 12.45 s
+  (fastboot) and 12.27 s (`sysrq`); no sample was excluded. Over its 17
+  reboots the disconnect gap was 0.112-0.158 s and the status read
+  0.090-0.206 s, and no read needed a retry. The controls were rejected as
+  before.
+- `phone-qa --quick --wait` passed (7 passed) on slot a,
+  `known_good_slot` a, no pair, journal empty.
