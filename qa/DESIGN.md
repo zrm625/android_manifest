@@ -1,6 +1,6 @@
 # Design: `phone-qa`, the QA harness for river batches (revision 11)
 
-Status: **approved by the council in round 11** (Opus 9, Sol 9, Gemini 9). This is revision 11, plus [amendment A1](#amendment-a1-the-adb-path-uptime-clock), which the council approved with conditions in code review round 1. The implementation notes from each round are at the end and must be applied during the build.
+Status: **approved by the council in round 11** (Opus 9, Sol 9, Gemini 9). This is revision 11, plus [amendment A1](#amendment-a1-the-adb-path-uptime-clock), which the council approved with conditions in code review round 1 and made strict in code review round 3. The implementation notes from each round are at the end and must be applied during the build.
 
 ## Council review
 
@@ -965,11 +965,15 @@ chain UNVERIFIED and the boot's combined verdict UNVERIFIED on every path.
 so it is less independent of the kernel-log chain than before. The boot count
 is still independent of both.
 
-**Phone runs still needed.** `flash --wipe`, then step 1 straight away: the
-first adb reboot after the wipe must get an anchor, later adb boots, and both
-injected controls on each path. These runs also show on the phone that the
-checked kmsg write, the base64 pstore read (its size must match `stat`) and
-the microsecond live/pstore marker match and the clean-tail rule work as designed. Then the order of
+**Phone runs still needed.** `flash --wipe` with this code (so `wipes.jsonl`
+records the wipe's first boot), then step 1 straight away: the first adb
+reboot after the wipe must get an anchor, later adb boots, and both injected
+controls on each path. These runs also show on the phone that the checked
+kmsg write, the base64 pstore read (its size must match `stat`), the
+microsecond live/pstore marker match and the clean-tail rule work as
+designed, and how often a tail is clean (each step-1 record keeps its
+`anchor_note`). If too few tails are clean for step 1 to set a bound, the
+strict rule needs the council before anything is relaxed. Then the order of
 qualification in the README.
 
 ## Code review round 2: changes to the amendment and the design
