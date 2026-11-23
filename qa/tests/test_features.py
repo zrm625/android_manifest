@@ -58,15 +58,31 @@ class CameraApproval(unittest.TestCase):
         self.assertFalse(self.ok({"url": URL, "set": [0, 2]}, gh(rc=1)))
 
 
+def proxy_dump(connected="true", enabled="true", bound="true", comp="app.zak.perch/.QuickstepService"):
+    return (f"OverviewProxyService state:\n  isConnected={connected}\n  mIsEnabled={enabled}\n"
+            f"  mRecentsComponentName=ComponentInfo{{{comp}}}\n"
+            f"  mQuickStepIntent=Intent {{ act=android.intent.action.QUICKSTEP_SERVICE pkg={comp.split('/')[0]} }}\n"
+            f"  mBound={bound}\n  mCurrentBoundedUserId=0\n")
+
+
 class Gestures(unittest.TestCase):
-    def test_positive_state_required(self):
-        self.assertTrue(F.overview_proxy_bound("OverviewProxyService: app.zak.perch/.Overview isConnected=true"))
-        self.assertTrue(F.overview_proxy_bound("app.zak.perch mIsConnected=true"))
-        self.assertTrue(F.overview_proxy_bound("app.zak.perch mIsEnabled=true"))
-        self.assertFalse(F.overview_proxy_bound("app.zak.perch isConnected=false"))
-        self.assertFalse(F.overview_proxy_bound("app.zak.perch Connected"))
-        self.assertFalse(F.overview_proxy_bound("app.zak.perch isConnected=trueish"))
-        self.assertFalse(F.overview_proxy_bound("com.android.launcher3 isConnected=true"))
+    def test_connected_and_bound_to_perch(self):
+        self.assertTrue(F.overview_proxy_bound(proxy_dump()))
+
+    def test_enabled_alone_is_rejected(self):
+        # SystemUI derives mIsEnabled from resolving the service, not from a
+        # connection (review round 2).
+        self.assertFalse(F.overview_proxy_bound(proxy_dump(connected="false", enabled="true", bound="false")))
+        self.assertFalse(F.overview_proxy_bound(proxy_dump(connected="true", bound="false")))
+        self.assertFalse(F.overview_proxy_bound(proxy_dump(connected="false", bound="true")))
+
+    def test_other_component_or_loose_text_is_rejected(self):
+        self.assertFalse(F.overview_proxy_bound(proxy_dump(comp="com.android.launcher3/.QuickstepService")))
+        self.assertFalse(F.overview_proxy_bound("app.zak.perch isConnected=true mBound=true"))
+        self.assertFalse(F.overview_proxy_bound(proxy_dump(connected="trueish")))
+
+
+NOTIF = "Current Notification Manager state:\n"
 
 
 class Alarm(unittest.TestCase):
@@ -76,19 +92,43 @@ class Alarm(unittest.TestCase):
         return [(self.T + a, self.T + b, f) for a, b, f in rel]
 
     def test_absent_then_firing(self):
-        st, _ = F.alarm_verdict(self.polls((-10.2, -9.0, False), (-1, 0.5, False), (1.0, 2.5, True)), self.T)
+        st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, False), (-1, 0.5, False), (1.0, 2.5, True)), self.T)
         self.assertEqual(st, PASS)
 
     def test_observation_must_finish_inside_the_deadline(self):
         # The dumpsys that showed firing finished at +10.6 s: too late.
-        st, _ = F.alarm_verdict(self.polls((-10.2, -9.0, False), (9.0, 10.6, True)), self.T)
+        st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, False), (9.0, 10.6, True)), self.T)
         self.assertEqual(st, FAIL)
 
-    def test_absence_needs_a_timely_observation(self):
-        st, _ = F.alarm_verdict(self.polls((-12.0, -10.8, False), (1.0, 2.0, True)), self.T)
-        self.assertEqual(st, FAIL)   # started before target - 10.5 s
+    def test_absence_must_be_at_or_before_minus_10(self):
+        st, _ = F.alarm_verdict(self.polls((-10.2, -9.0, False), (1.0, 2.0, True)), self.T)
+        self.assertEqual(st, FAIL)   # finished after target - 10 s
         st, _ = F.alarm_verdict(self.polls((-6.0, -4.0, False), (1.0, 2.0, True)), self.T)
-        self.assertEqual(st, FAIL)   # finished after target - 5 s
+        self.assertEqual(st, FAIL)
+        st, _ = F.alarm_verdict(self.polls((-18.0, -16.8, False), (1.0, 2.0, True)), self.T)
+        self.assertEqual(st, FAIL)   # started before target - 16 s
+
+    def test_unreadable_sample_is_no_evidence(self):
+        # The only sample in the absence window failed: it can't stand for absence.
+        st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, None), (1.0, 2.0, True)), self.T)
+        self.assertEqual(st, FAIL)
+        # Nor for firing.
+        st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, False), (1.0, 2.0, None)), self.T)
+        self.assertEqual(st, FAIL)
+        # A failed sample between two good ones changes nothing.
+        st, _ = F.alarm_verdict(self.polls((-13.0, -12.0, False), (-11.2, -10.0, None), (1.0, 2.0, True)), self.T)
+        self.assertEqual(st, PASS)
+
+    def test_each_sample_carries_the_dump_status(self):
+        ok = F.parse_alarm_sample(0, f"1.0\n{NOTIF}nothing\n__DUMP_RC__0\n2.0\n", "lbl")
+        self.assertEqual(ok, (1.0, 2.0, False))
+        # dumpsys failed but the trailing date succeeded: no evidence.
+        self.assertEqual(F.parse_alarm_sample(0, "1.0\nCan't find service\n__DUMP_RC__1\n2.0\n", "lbl"),
+                         (1.0, 2.0, None))
+        # Exit 0 but not a notification dump (cut off, or another service).
+        self.assertEqual(F.parse_alarm_sample(0, "1.0\n\n__DUMP_RC__0\n2.0\n", "lbl"), (1.0, 2.0, None))
+        self.assertIsNone(F.parse_alarm_sample(1, "", "lbl"))
+        self.assertIsNone(F.parse_alarm_sample(0, "x\n__DUMP_RC__0\n2.0\n", "lbl"))
 
     def test_early_firing_fails(self):
         st, _ = F.alarm_verdict(self.polls((-13.0, -11.0, True), (-10.2, -9.0, True)), self.T)
@@ -97,7 +137,7 @@ class Alarm(unittest.TestCase):
     def test_alarm_checked_one_minute_early_fails(self):
         # The control shifts the target 60 s early: nothing fires by then.
         eff = self.T - 60
-        polls = [(eff + a, eff + a + 1.2, False) for a in range(-14, 12, 2)]
+        polls = [(eff + a, eff + a + 1.2, False) for a in range(-16, 12, 2)]
         self.assertEqual(F.alarm_verdict(polls, eff)[0], FAIL)
 
 

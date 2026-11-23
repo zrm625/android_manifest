@@ -1025,7 +1025,7 @@ def check_gestures(run) -> Result:
     nav = dev.sh("settings get secure navigation_mode").strip()
     home = dev.sh("cmd package resolve-activity --brief -a android.intent.action.MAIN "
                   "-c android.intent.category.HOME").strip().splitlines()[-1:]
-    proxy = re.search(r"OverviewProxyService.*?(?=\n\S|\Z)", sysui, re.S)
+    proxy = re.search(r"OverviewProxyService state:.*?(?=\n\S|\Z)", sysui, re.S)
     proxy_txt = proxy.group(0) if proxy else ""
     bound = overview_proxy_bound(proxy_txt)
     d = {"navigation_mode": nav, "home": home, "overview_proxy": proxy_txt[:600]}
@@ -1033,7 +1033,7 @@ def check_gestures(run) -> Result:
     if nav != "2":
         problems.append(f"navigation_mode {nav}, not gesture (2)")
     if not bound:
-        problems.append("overview proxy not bound to app.zak.perch")
+        problems.append("overview proxy not connected to app.zak.perch (isConnected/mBound)")
     if not home or not home[0].startswith("app.zak.perch/"):
         problems.append(f"HOME resolves to {home}")
     w, h = screen_size(dev)
@@ -1087,14 +1087,18 @@ def check_gestures(run) -> Result:
                   helper_terminal=True)
 
 
-PROXY_STATE_RE = re.compile(r"\b(?:m?[Ii]sConnected|mIsEnabled)=true\b")
+PERCH = "app.zak.perch"
 
 
 def overview_proxy_bound(proxy_txt: str) -> bool:
-    """SystemUI's overview proxy names Perch and states, positively, that it
-    is connected or enabled (A8). 'isConnected=false' or a bare 'Connected'
-    is not enough."""
-    return "app.zak.perch" in proxy_txt and bool(PROXY_STATE_RE.search(proxy_txt))
+    """SystemUI's overview proxy is really connected to Perch (A8, review
+    round 2): the dump names Perch as the recents component (or in the
+    quickstep intent) and says isConnected=true and mBound=true. mIsEnabled
+    alone doesn't count: SystemUI derives it from resolving the service,
+    not from a connection (OverviewProxyService.updateEnabledState)."""
+    fields = dict(re.findall(r"^\s*(\w+)=(.*?)\s*$", proxy_txt, re.M))
+    named = PERCH in fields.get("mRecentsComponentName", "") or PERCH in fields.get("mQuickStepIntent", "")
+    return named and fields.get("isConnected") == "true" and fields.get("mBound") == "true"
 
 
 def screen_size(dev) -> tuple[int, int]:
@@ -1115,36 +1119,55 @@ def alarm_firing(dump: str, label: str) -> bool:
     return False
 
 
-def alarm_observe(dev, label: str) -> tuple[float, float, bool] | None:
-    """One observation, timed on the phone: (phone time before dumpsys,
-    phone time after it returned, firing?). None if the read failed."""
-    r = dev.read("date +%s.%N; dumpsys notification --noredact; date +%s.%N", timeout=30)
-    lines = r.out.rstrip("\n").split("\n")
-    if not r.ok or len(lines) < 2:
+NOTIF_HEADER = "Current Notification Manager state"
+ALARM_ABSENT_FROM_S = -16.0   # an absence sample may start no earlier than this...
+ALARM_ABSENT_BY_S = -10.0     # ...and must have finished by this (review round 2)
+ALARM_FIRED_BY_S = 10.0
+
+
+def parse_alarm_sample(rc: int, out: str, label: str) -> tuple[float, float, bool | None] | None:
+    """One sample: (phone time before dumpsys, phone time after it, firing?).
+    firing is None when the dump itself failed or doesn't look like a
+    notification dump: that sample is no evidence either way. None if the
+    phone times are unreadable. Pure."""
+    lines = out.replace("\r", "").rstrip("\n").split("\n")
+    if rc != 0 or len(lines) < 3:
         return None
     try:
         t0, t1 = float(lines[0]), float(lines[-1])
     except ValueError:
         return None
-    return t0, t1, alarm_firing("\n".join(lines[1:-1]), label)
+    status, dump = lines[-2], "\n".join(lines[1:-2])
+    if status != "__DUMP_RC__0" or NOTIF_HEADER not in dump:
+        return t0, t1, None
+    return t0, t1, alarm_firing(dump, label)
 
 
-def alarm_verdict(polls: list[tuple[float, float, bool]], target_s: float) -> tuple[str, str]:
-    """Judge firing evidence by phone time (A9). An absence counts only from
-    an observation that started at target - 10.5 s or later and finished by
-    target - 5 s; firing counts only from an observation that finished by
+def alarm_observe(dev, label: str) -> tuple[float, float, bool | None] | None:
+    """One observation, timed on the phone, with dumpsys's own exit status
+    (a trailing date can't hide a failed dump)."""
+    r = dev.read("date +%s.%N; dumpsys notification --noredact; echo __DUMP_RC__$?; date +%s.%N", timeout=30)
+    return parse_alarm_sample(r.rc, r.out, label)
+
+
+def alarm_verdict(polls: list[tuple[float, float, bool | None]], target_s: float) -> tuple[str, str]:
+    """Judge firing evidence by phone time (A9, review round 2). Samples
+    whose dump failed (firing None) are no evidence either way. Absence
+    needs a successful sample that started at target - 16 s or later and
+    finished by target - 10 s, and the last such sample must show no firing.
+    Firing counts only from a successful sample that finished by
     target + 10 s. Firing seen in anything that finished before target - 10 s
     means it fired early."""
-    rel = [(a - target_s, b - target_s, f) for a, b, f in polls]
-    early = [r for r in rel if r[2] and r[1] < -10]
+    rel = [(a - target_s, b - target_s, f) for a, b, f in polls if f is not None]
+    early = [r for r in rel if r[2] and r[1] < ALARM_ABSENT_BY_S]
     if early:
         return FAIL, f"firing evidence already at {early[0][1]:+.1f} s"
-    window = [r for r in rel if r[0] >= -10.5 and r[1] <= -5]
+    window = [r for r in rel if r[0] >= ALARM_ABSENT_FROM_S and r[1] <= ALARM_ABSENT_BY_S]
     if not window:
-        return FAIL, "no observation inside target - 10.5 s .. target - 5 s"
-    if any(r[2] for r in window):
+        return FAIL, "no successful observation inside target - 16 s .. target - 10 s"
+    if window[-1][2]:
         return FAIL, "firing evidence present at target - 10 s"
-    fired = [r for r in rel if r[2] and r[1] <= 10]
+    fired = [r for r in rel if r[2] and r[1] <= ALARM_FIRED_BY_S]
     if not fired:
         return FAIL, "no firing notification observed by target + 10 s"
     return PASS, f"absent at {window[-1][1]:+.1f} s, firing by {fired[0][1]:+.1f} s (phone time)"
@@ -1178,13 +1201,13 @@ def check_alarms(run) -> Result:
     screen_off(dev)
     polls = []
     while phone_now() < eff + 12:
-        if phone_now() >= eff - 14:
+        if phone_now() >= eff + ALARM_ABSENT_FROM_S:
             obs = alarm_observe(dev, label)
             if obs is not None:
                 polls.append(obs)
             time.sleep(1.0)
         else:
-            time.sleep(max(0.2, min(3.0, eff - 14 - phone_now())))
+            time.sleep(max(0.2, min(3.0, eff + ALARM_ABSENT_FROM_S - phone_now())))
     state, msg = alarm_verdict(polls, eff)
     activity = top_activity(dev)
     d = {"label": label, "target_ms": res.get("target_ms"), "shift_s": shift, "tz": res.get("tz"),
@@ -1193,7 +1216,7 @@ def check_alarms(run) -> Result:
     dis = helper.instrument(run, "alarm_dismiss", {"label": label}, timeout=30, need_foreground=False)
     time.sleep(2)
     after = alarm_observe(dev, label)
-    still = after is None or after[2]
+    still = after is None or after[2] is not False    # unreadable is not proof it was removed
     dev.sh("am force-stop com.android.deskclock")
     ok_clear, _ = restore_now(run, RES, "alarm", label)
     d["dismissed"] = dis.terminal and not still
