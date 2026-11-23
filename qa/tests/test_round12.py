@@ -181,3 +181,30 @@ class R13FollowUps(unittest.TestCase):
             rc, err = dev_flash(p, reboot=booting_reboot)
             self.assertEqual(rc, flashing.EXIT_ERROR, err)
             self.assertIn("If the phone is still booting, wait until it finishes", err)
+
+
+class R13GeminiMinors(unittest.TestCase):
+    def test_pre_baseline_clear_failure_gives_the_way_back(self):
+        """Gemini round 13 (m2): the second clear fails before the first
+        baseline. The advice said "run the flash again", which R12-1 refuses
+        from fastboot; now it gives the R10-3 way back."""
+        from test_round8 import arm_entry
+        with bench_home():
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False, clear_fails_after=1,
+                        builds={"a": BID, "b": DEV_BID})
+            arm_entry("a")
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+            self.assertIn("phone-qa recover", err)
+            self.assertNotIn("then run the flash again", err)
+            self.assertEqual(flashes(p.calls), [])
+            self.assertIsNotNone(fbmode.pending())
+
+    def test_not_booted_advice_reboots_to_the_bootloader_first(self):
+        """Gemini round 13 (m3)."""
+        with bench_home():
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False)
+            not_booted(p)
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_ERROR, err)
+            self.assertIn("adb -s ZY225DPT7F reboot bootloader, then fastboot", err)

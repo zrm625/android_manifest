@@ -2626,3 +2626,10 @@ Regressions (`test_round12.R13FollowUps`): at `a1abb2a` the fallback race
 wrote slot a; the sentinel advice named the refused flash; the not-booted
 advice had no "wait".
 
+
+Gemini's round-13 minors: m1, m4 and m5 were already fixed (R13-2, the
+no-clear assertion, the README wording). m2: before the first baseline a
+`ClearFailed` from the second clear gives the R10-3 way back instead of
+"run the flash again". m3: the not-booted advice from Android says to
+reboot to the bootloader before `fastboot --set-active`. Tests:
+`test_round12.R13GeminiMinors`.

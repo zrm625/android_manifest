@@ -373,8 +373,9 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         log(f"error: {msg}.")
         log(("If the phone is still booting, wait until it finishes and run the flash again. Otherwise b"
              if source == "getprop" else "B")
-            + f"oot the phone to Android on a slot that works and let it finish booting (for slot X: fastboot -s "
-            f"{SERIAL} --set-active=X, then fastboot -s {SERIAL} reboot), then run the flash again.")
+            + f"oot the phone to Android on a slot that works and let it finish booting (for slot X: "
+            + (f"adb -s {SERIAL} reboot bootloader, then " if source == "getprop" else "")
+            + f"fastboot -s {SERIAL} --set-active=X, then fastboot -s {SERIAL} reboot), then run the flash again.")
         return EXIT_ERROR
     if st is None and owed is not None and fbmode.armed_slot(owed) == target:
         # R10-3: before the first baseline the armed slot is the only slot
@@ -414,6 +415,12 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         # that, or any other fastboot failure on the way, halts cleanly with
         # the obligation pending instead of escaping as a traceback.
         if isinstance(e, fbmode.ClearFailed):
+            if st is None:
+                # Gemini round 13: before the first baseline a retry needs a
+                # booted phone (R12-1); nothing was written, so the R10-3 way
+                # back applies.
+                return recovery_halt(e, advice=f"Clear fb_mode by hand (fastboot -s {SERIAL} oem fb_mode_clear). "
+                                     + way_back(current))
             return recovery_halt(e, advice=f"The fb_mode obligation stays pending. Clear it by hand (fastboot -s "
                                  f"{SERIAL} oem fb_mode_clear), then run the flash again.")
         if isinstance(e, WipeFailed):
