@@ -1,0 +1,823 @@
+# Design: `phone-qa`, the QA harness for river batches (revision 11)
+
+Status: **approved by the council in round 11** (Opus 9, Sol 9, Gemini 9). This is revision 11. The implementation notes from each round are at the end and must be applied during the build.
+
+## Council review
+
+Rounds: 11
+
+| Delegate | R1 | R2 | R3 | R4 | R5 | R6 | R7 | R8 | R9 | R10 | R11 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Claude Opus 5.5 | 5 | 7 | 8 ✓ | 8 ✓ | 9 ✓ | 9 ✓ | 9 ✓ | 9 ✓ | 9 ✓ | 9 ✓ | 9 ✓ |
+| GPT-6.2 Sol | 4 | 6 | 7 | 7 | 7 | 8 | 8 | 8 | 8 | 8 | 9 ✓ |
+| Gemini 4 Neon | 5 | 7 | 8 | 8 | 9 ✓ | 9 ✓ | 8 | 8 | 8 | 9 ✓ | 9 ✓ |
+
+✓ = approved. Round 11 was a narrow confirmation round: all three reviewers checked only the diff from revision 10, which Opus and Gemini had already approved.
+
+Round 11 implementation notes (Sol, Opus, Gemini):
+
+- Put "controls qualified" in the main merge-eligibility checklist.
+- Judge each control by its table row's expected result. For the two interruption controls, the expected result is a successful recovery.
+- Only control mode can mark a fastboot enumeration as planned. A `--batch` run that finds any control override must refuse to run, or write FAIL.
+- Add a second extra-pass control without the planned marking. It must FAIL through the unplanned-enumeration rule.
+- Each control records which check failed, not only that it failed.
+- "Harness version" is a content hash of `phone-qa`, the helper sources, the thresholds, the allowance A and the known-good seed.
+- The step-1 boot-timing proofs are part of the control set.
+
+## Why we need it
+
+The batch pipeline in `CHARTER.md` (merged as manifest PR #9) merges a batch
+automatically when it is clean. Clean includes passing QA on every item of the
+must-work list. `scripts/phone-check` mostly checks that things are present. A
+check like that would let a broken camera, speaker or sensor auto-merge.
+
+`phone-qa` must:
+
+- show that each must-work feature works;
+- prove that the evidence comes from the exact batch under test;
+- run with no one at the desk;
+- never let an incomplete or uncertain run authorize a merge.
+
+## Context
+
+- **The phone.**
+  - Moto G7 `river`, model XT1962-1 (US), serial `ZY225DPT7F`.
+  - Connected over USB to the workstation `forge` (bus 8, root port; USB ID
+    `18d1:4ee7` in adb mode). Always on the charger.
+  - LineageOS 22.2 (Android 15) userdebug, kernel 4.9.337.
+  - Timezone `Pacific/Midway`.
+  - No NFC chip, no SIM, no telephony, no screen lock.
+- **The build fingerprint can't tell builds apart.** `ro.build.fingerprint` is
+  the stock Motorola fingerprint for every build. The `*.build.date.utc`
+  properties can.
+- **Decisions in the charter (binding).**
+  - The must-work list. The apps on it are Brave, Tailscale, T3 Code and Perch.
+  - Deep sleep and the headphone jack are not checked.
+  - Rear main camera: a photo with the torch that isn't black. Front and depth
+    cameras: liveness only.
+  - Boot: `host_boot_seconds` of the first `device-bench` boot after the flash
+    must be 55 s or less. The first boot after the wipe is only recorded.
+  - RAM:
+    - The reference is the lowest known-good 3-boot median.
+    - If a single boot is more than 10 MB over the reference, measure 3 boots.
+    - Fail if that median is more than 5 MB over the reference.
+    - At or under 1,050 MB, always measure 3 boots.
+  - Size: `/system` and `/vendor` may not grow compared with the latest
+    known-good build, unless the batch's RAM median is below the reference.
+  - Low-RAM mode is an experiment and never merges.
+- **Facts checked on the phone during the round-2 fixes.**
+  - Turning Extra dim on changes SurfaceFlinger's `colorTransformMatrix`. The
+    diagonal goes from about 1.0–1.09 to about 0.54–0.57.
+  - Brave 1.100.58 (arm64), Tailscale 1.104.7 and T3 Code 2.3.0 (815) each
+    installed and opened on the phone, then were removed.
+  - With the screen off, the phone dozes. `config_dozeAfterScreenOffByDefault`
+    is true, so `mWakefulness` stays `Dozing` and never becomes `Asleep`.
+  - River has no AVB vbmeta (`ro.boot.vbmeta.digest` is empty), so nothing on
+    the phone identifies the flashed images by itself.
+  - The phone (192.168.4.60) and forge (192.168.4.44) are on the same Wi-Fi
+    LAN.
+  - The phone hard-reset twice during review. Boot reason: `hardware_reset`.
+    pstore had no panic.
+
+## The batch sequence
+
+`phone-qa` is one step. The batch runner (`change batch`, a separate change)
+owns the whole sequence and holds one lock across all of it.
+
+1. **Stage.** Copy the build's images into `$BENCH_HOME/batches/<id>/images/`
+   and record a SHA-256 for each image. Also record:
+   - the commit set (each repo's SHA);
+   - `ro.build.date.utc`, `ro.vendor.build.date.utc` and
+     `ro.bootimage.build.date.utc`;
+   - the expected camera set, from the switch values in the device repo at the
+     batch commit;
+   - `experiment: true|false`.
+   - a unique build ID, `<batch id>-<short hash of the commit set>`. The batch
+     build passes it in as `RIVER_BUILD_ID`. The device repo writes it to two
+     separate properties: `ro.river.build_id` in `/system/build.prop` and
+     `ro.vendor.river.build_id` in `/vendor/build.prop`. Two names are needed
+     because Android loads every partition's properties into one map, so a
+     single shared name would let one partition's value hide the other's. The
+     stamping is a small device-repo change that ships together with the
+     harness, before calibration.
+   - copies of `installed-files.json` and `installed-files-vendor.json`, with
+     their hashes. The NFC build check reads these copies, never the mutable
+     `out-stripped`.
+
+   All of this goes into `batch.json`.
+2. **Flash** from the staged directory. `flash --images <dir> --wipe` checks
+   every hash before it writes, and records the slot it wrote. The time of the
+   first boot after the wipe is recorded in `batch.json` for information. The
+   flash record gets its own attempt ID and notes that the wipe succeeded.
+   Every adb and fastboot wait has a hard deadline.
+
+   **The slot pair is fixed before anything is written.** Before the first
+   write, `flash` saves the slot pair to `$BENCH_HOME/slot-state.json` and
+   `batch.json`:
+   - `target`: the slot this batch writes;
+   - `fallback`: the slot that keeps the last good build;
+   - the SHA-256 of the fallback slot's whole boot partition, taken before the
+     flash.
+
+   The pair is never worked out again from fastboot's `current-slot`,
+   because that may already point at the candidate after `--set-active`.
+   **Retries follow one rule.** A retry that writes images first completes a
+   verified rollback to `known_good_slot`. It then writes to the same
+   `target` saved in its own pair. The "no unresolved pair" check below
+   applies to pairs left by other batches. A batch's own pair is reused
+   only after that verified rollback.
+
+   **`slot-state.json` also keeps `known_good_slot` permanently.**
+
+   **First-run transition.** The file doesn't exist before the first
+   baseline. The first `--baseline` run therefore starts by recording the slot
+   running now as a *provisional* `known_good_slot`, together with the SHA-256
+   of that slot's whole boot partition, checked live against the phone. Then
+   it flashes the baseline to the other slot under the normal pair rules.
+   - If the baseline passes, its own pair is closed at once. There are no PRs
+     to check. `known_good_slot` becomes the baseline's slot, with its build
+     ID and boot hash confirmed and saved.
+   - If it fails, rollback returns the phone to the provisional slot.
+
+   Perch calibration runs only after this checkpoint. After that,
+   `known_good_slot` is always the slot holding the latest tagged build. A batch's pair
+   is resolved in one of two ways only:
+   - **Rolled back.** This happens after a FAIL, an UNVERIFIED result, an
+     experiment, a calibration run of a candidate, a slot rescue, or a
+     bootloader fallback the harness detects. An interrupted run goes through
+     the recovery rule below, which may roll it back or promote it. There is
+     only one rollback procedure, and rescue uses it too:
+     1. Set the batch's `fallback` slot (always `known_good_slot`) active with
+        `fastboot --set-active`.
+     2. Run `fastboot erase userdata`. It must succeed, and the wipe is
+        recorded for the journal. This is the erase `scripts/flash` uses:
+        river's bootloader rejects `fastboot -w`, because it also tries to
+        erase a `metadata` partition the phone doesn't have. The old build
+        then never starts on data the candidate wrote.
+     3. Reboot, then check the slot and the build: the build ID, or the saved
+        boot hash.
+
+     Only after that check is the pair released.
+   - **Promoted.** The tester has merged and tagged the batch, and recorded
+     that durably. Before saving, the runner confirms the candidate slot's
+     build ID and records its boot hash. Then `known_good_slot` becomes the
+     candidate's slot.
+
+   **Recovery checks GitHub first.** At the start of any batch, if a pair is
+   still unresolved, the runner looks up that exact batch's merge and tag
+   state with `gh` and `git ls-remote` for the tag in every repo:
+   - If every PR is merged and every repo has the tag, the batch is promoted.
+   - If none are, it is rolled back.
+   - If only some are, the runner halts and notifies Zak.
+   - Pairs that never have PRs (baseline before it passes, calibration,
+     experiments) always roll back.
+   - If the lookup itself fails, for example because the network or `gh` is
+     down, the runner halts. A failed lookup never counts as "none merged".
+
+   The pair stays reserved until that decision is recorded durably. This
+   applies to every unresolved pair, not only after a host crash. If a
+   rollback fails, the runner halts and notifies Zak.
+
+   Until one of these happens, the pair stays in `slot-state.json`. Before
+   any flash, the runner checks three things:
+   - there is no unresolved pair from another batch;
+   - the running slot is `known_good_slot`;
+   - the inactive slot, which is the write target, is not `known_good_slot`.
+
+
+
+   A failed boot during the flash or during any `device-bench` boot starts
+   slot rescue:
+   1. Get to fastboot. If fastboot already answers, use it. If adb answers
+      while `sys.boot_completed` is still unset, run `adb -s <serial> reboot
+      bootloader`.
+   2. Run the rollback procedure above: set the fallback active, run
+      `fastboot erase userdata` and record the wipe, then reboot.
+   3. Check that the fallback is up. Check the slot suffix. Then
+      check its build ID if it has one; otherwise compare the SHA-256 of its
+      whole boot partition with the hash saved before the flash. The build
+      running now has no stamp, so the hash is the check until a stamped
+      build is the fallback.
+   4. Mark the batch failed.
+
+   A completed slot rescue counts as **Rolled back** under the rules above.
+   Nothing else releases the pair. If the bootloader falls back to the old
+   slot by itself, the slot and build-ID checks catch it, and the batch is
+   reported failed. If neither adb nor fastboot can be reached, the pipeline
+   stops and Zak is notified.
+
+   When `flash` sees `sys.boot_completed=1`, it records that boot's `boot_id`
+   in the flash record at once. Before `device-bench` reboots, the runner saves
+   the same health evidence for that first boot as for the measured boots,
+   running `adb root` first. That evidence is `boot_id`, the boot reason,
+   `dmesg` service deaths and restart loops, `logcat -b crash`, the SELinux
+   mode, and `sys.boot_completed`. The record carries the flash attempt ID and
+   the `boot_id` read at collection time. Collection is complete only if that
+   `boot_id` equals the one `flash` recorded. If it differs, a reset happened
+   in between, and the evidence is from the wrong boot. In the same way,
+   `device-bench` records each measured boot's `boot_id` when it sees boot
+   completed, and that boot's evidence has to match it. QA gates on all of
+   this the same way. The 55 s limit still applies only to bench boot 1.
+   `boot_id` and `sys.boot_completed` are always read in the same shell
+   command.
+
+   **Catching a reset before boot completes.** A matching `boot_id` can't
+   show that no other boot came before the one that completed. Three
+   separate signals cover that gap:
+   - **Kernel-log chain.** Before every planned reboot, the harness writes a
+     short marker token, made from the attempt number and a few characters of
+     `boot_id`, to `/dev/kmsg` as root. It writes the token several times,
+     because ramoops on this phone has no ECC and flips bits. Matching
+     tolerates a few flipped characters, and calibration records the
+     corruption rate. That
+     includes the reboot into the bootloader for flashing and every bench
+     reboot. At each boot completion it reads
+     `/sys/fs/pstore/console-ramoops*`, which holds the previous kernel's log.
+     That log must end with the latest leaving marker. If a different kernel
+     session shows up in between, for example a log that ends a few seconds
+     into a boot, that is a FAIL. If pstore is missing or too corrupt to read
+     the marker, the check is UNVERIFIED. Calibration tests whether the chain
+     survives each kind of reboot, including the trip through fastboot. A
+     reboot kind where it doesn't survive is written down, and those boots
+     rely on the other two signals.
+   - **Uptime.** The clock starts at the first USB disconnect after the
+     harness's reboot command, which leaves Android's variable shutdown time
+     out of it. Any fastboot enumeration the harness didn't plan counts as an
+     extra boot. At boot completion, `/proc/uptime` must be at least the time
+     since that disconnect, minus a bootloader allowance A set by calibration:
+     - A must be at least the longest normal bootloader pass calibration
+       measured;
+     - A must be less than the shortest normal pass plus one more bootloader
+       pass.
+
+     Any reset, even one too early for ramoops to record, adds at least one
+     more bootloader pass, so the uptime comes up short. If no value of A
+     meets both conditions, that reboot path is UNVERIFIED.
+   - **Boot count.** After a wipe, dropbox starts empty. The number of
+     `SYSTEM_BOOT` entries must equal the boots expected since the wipe. The
+     entry is written after `BOOT_COMPLETED`, so the count is read only once
+     it has settled. Dropbox entries are compared by name and count, never by
+     timestamp: on this phone every entry carries the same time.
+
+   Any positive sign of an extra boot is a FAIL. This phone has hard-reset
+   on its own before, so now and then this may fail a good batch. A rerun
+   settles that, and it is better than a false pass. The `sys.boot.reason`
+   string is recorded but not trusted. It differs from boot to boot on this
+   phone and isn't needed by any rule.
+3. **Bench boot 1.** `device-bench current --boots 1 --batch <id>`. The setup
+   wizard is still untouched. Before any later reboot, `device-bench` records
+   health evidence for the boot it just measured. Each boot row gets a unique
+   key (`run_id` plus `boot`). The evidence is:
+   - `boot_id` and `sys.boot.reason`;
+   - `logcat -b crash`;
+   - service deaths and restart loops from `dmesg`;
+   - SELinux mode and `sys.boot_completed`.
+
+   `device-bench` runs `adb root` first. The evidence goes into
+   `$BENCH_HOME/batches/<id>/boots/<row key>/`. QA fails the batch on any of
+   these in any measured boot:
+   - a crash;
+   - a restart loop;
+   - SELinux not enforcing;
+   - `boot_completed` not equal to 1.
+
+   If a boot's evidence is missing, the check is UNVERIFIED.
+4. **Bench boots 2–3, when the charter calls for them.** The runner decides
+   before `phone-setup`, so every boot is measured in the same untouched state.
+   It runs `device-bench current --boots 2 --batch <id>` if any of these is
+   true:
+   - boot 1 is more than the reference + 10 MB;
+   - boot 1 is at or under 1,050 MB;
+   - `/system` or `/vendor` grew compared with the latest known-good build (so
+     the RAM exception can be claimed);
+   - there is no reference yet, or `ram_reference` is still the calibration
+     seed.
+
+   The median is boot 1 plus these 2 boots. All three run IDs go into
+   `batch.json`. MB here means `used_ram_kb / 1024`.
+5. **`phone-setup --wifi ...`.** It turns location off, Extra dim on and
+   gesture navigation on.
+6. **`phone-qa --batch <id>`.**
+
+`device-bench` gets new columns: `build_date_utc`, `vendor_date_utc`, `slot`
+and `batch`. The harness accepts a row only if all four match `batch.json` and
+the flash record.
+
+**The shared lock.** The runner takes `$BENCH_HOME/.device-lock` and exports
+`BENCH_LOCK_TOKEN`. `flash`, `device-bench`, `phone-setup` and `phone-qa`
+reuse the lock when the token matches, and refuse to run otherwise.
+
+## Result states and the merge gate
+
+| State | Meaning | Merge-eligible? |
+| --- | --- | --- |
+| `PASS` | Seen working on this batch | yes |
+| `FAIL` | Seen broken, or the evidence contradicts the batch | no |
+| `UNVERIFIED` | No verdict was possible: missing fixture, unreadable diagnostics, no helper result, or something only Zak can decide | no |
+| `INFO` | Reported only. Used for non-must-work data, such as photos from the front and depth cameras | n/a |
+
+- The harness holds a canonical list of required check IDs. A run passes only
+  if every required ID is `PASS`, so a harness bug that drops a check can't
+  pass.
+- **Exit codes:**
+  - 1 if any check is `FAIL`. This wins over `UNVERIFIED`.
+  - Otherwise 2 if any check is `UNVERIFIED`.
+  - Otherwise 0.
+- **Merge eligibility.** A run is merge-eligible (`eligible: true`) only if all
+  of these hold:
+  - it ran in `--batch` mode with the full check set (no `--only`, `--skip`,
+    `--calibrate` or `--baseline`);
+  - `batch.json` has `experiment: false`, and the phone's `ro.config.low_ram`
+    is not `true`. If `ro.config.low_ram` is `true` while `experiment` is
+    `false`, that is a FAIL;
+  - every helper test returned a terminal result;
+  - the build identity matched;
+  - `boot_id` didn't change;
+  - the final checks, which run after cleanup, passed.
+- **The tester's rule.** The tester merges only when all of these are true:
+  exit 0, `eligible: true`, batch mode, and the batch ID matches.
+- **`--quick`.** A quick run (health group only, for the edit-flash loop)
+  exits 0 when the health checks pass. It always reports `eligible: false` and
+  skips the regression checks.
+
+## Pieces
+
+1. **`scripts/phone-qa`.** Python 3, standard library only, run as
+   `python3 -I`. It:
+   - runs `adb root` and `wait-for-device` once, before any `adb reverse`;
+   - checks the serial and the `river` guard before every group;
+   - writes `results.json`, `report.html` and the artifacts to
+     `$BENCH_HOME/qa/<run-id>/`;
+   - puts every adb call under a deadline.
+2. **The helper APK, `river-qa`.** Plain Java, with no Gradle and no
+   dependencies. The source lives in `.repo/manifests/qa/helper/`.
+   - **Build:** offline, against `platforms/android-36/android.jar`, using
+     aapt2, javac, d8, zipalign and apksigner from build-tools 37. Signed with
+     the debug key. The cache key covers the sources and the toolchain
+     versions.
+   - **Structure:** an `android.app.Instrumentation` subclass, plus activities
+     that the checks bring to the foreground.
+   - **Foreground rule:** every device-side check runs while a helper activity
+     is resumed in front with the screen on, and the harness confirms that
+     each time with `dumpsys activity top`.
+   - **One UiAutomation at a time:** only one UiAutomation connection can exist
+     at once. Host `uiautomator` commands never overlap an instrumentation run.
+   - **Normal permissions,** declared in the manifest:
+     - `INTERNET`
+     - `ACCESS_NETWORK_STATE`
+     - `CHANGE_NETWORK_STATE`
+     - `VIBRATE`
+     - `USE_BIOMETRIC`
+     - `USE_FINGERPRINT`
+     - `com.android.alarm.permission.SET_ALARM`
+   - **Runtime permissions,** granted with `pm grant` after install:
+     - `CAMERA`
+     - `RECORD_AUDIO`
+     - `ACCESS_FINE_LOCATION`
+     - `BLUETOOTH_SCAN` (declared `neverForLocation`)
+     - `BLUETOOTH_CONNECT`
+   - **Foreground scope.** The foreground rule covers only helper operations.
+     Turning the screen off on purpose and showing another app on purpose
+     (DeskClock, Brave, Tailscale, T3 Code) are allowed.
+   - **Uninstall order.** The helper is uninstalled last, after every cleanup
+     step that needs it, such as unbonding and restoring the scan mode.
+   - **Privileged Bluetooth calls:** the instrumentation adopts shell's
+     `BLUETOOTH_PRIVILEGED` only around those
+     calls (`setPairingConfirmation`, `setScanMode`, `removeBond`), using
+     `UiAutomation.adoptShellPermissionIdentity`.
+   - **Hidden API:** `BluetoothDevice.removeBond()`, `BluetoothAdapter.setScanMode()` and `setDiscoverableTimeout()` are hidden or system APIs. The helper calls them by reflection, with `hidden_api_policy` relaxed through the journal while they run.
+   - **Cleartext:** a network-security-config allows cleartext to exactly two
+     hosts: `127.0.0.1` and forge's LAN address. The LAN address is filled in
+     when the helper is built and is part of the cache key.
+3. **`phone-check` folds into `phone-qa`** and is deleted in the same change.
+   Every caller and doc moves to `phone-qa --quick`.
+4. **Fixtures.** They live in `$BENCH_HOME/qa/fixtures/`, each pinned by
+   SHA-256 in `qa/fixtures.json`:
+   - `Bravearm64Universal.apk` 1.100.58
+   - `tailscale-android-universal-1.104.7.apk`
+   - `t3code-android-internal-2.3.0-815.apk`
+   - a 5 s H.264 `testsrc2` clip, with reference frames generated by ffmpeg
+   - the test page
+
+   The host serves the page over `adb reverse`. Each run, and each consumer
+   (WebView and Brave), gets its own token. The host logs every request with
+   its path, token, User-Agent and timestamp.
+
+   A missing fixture or a hash mismatch makes preflight `UNVERIFIED`, and
+   nothing else runs. The charter says an app whose APK can't be found any
+   more is dropped from the list in a charter change.
+5. **The state journal,** `$BENCH_HOME/qa/journal.json`. Before any change is
+   made, the journal records the original value. Each entry is tagged with
+   where it lives:
+   - **Phone entries,** tagged with the flash attempt ID. A phone entry is
+     dropped only when the flash record shows a successful wipe after that
+     attempt. Otherwise it is restored, even after a reboot or a failed flash.
+   - **Host entries:** Bluetooth adapter state, gvfs mounts and the `adb
+     reverse` ports. These are always restored.
+   - **Resources the run created:** the alarm label, the marker file, the
+     on-phone watchdog PID and the Bluetooth bond. These are cleaned up by
+     identity.
+
+   Journal recovery runs only after the lock is held and the guards have
+   confirmed the phone. A leftover alarm that was dismissed before it fired is
+   still in DeskClock's database. Recovery clears it with
+   `pm clear com.android.deskclock`; the test phone has no alarms of its own.
+6. **History,** `$BENCH_HOME/qa/history.jsonl`. It is written only in batch
+   mode, and is used for reports only.
+
+## Run structure
+
+1. **Preflight.**
+   - Check the lock token, the guards and the fixture hashes.
+   - Restore anything left in the journal.
+   - Build or verify the helper.
+   - Record `boot_id`, the uptime, and the PIDs and start times of
+     `system_server`, `cameraserver`, `audioserver`, the vendor camera
+     provider, the audio HAL and the fingerprint HAL. Start times come from
+     `/proc/<pid>/stat`.
+   - Start streaming `logcat -b crash,kernel,main` to an artifact file.
+2. **Identity.** Every one of these is a FAIL on mismatch:
+   - `ro.river.build_id` read directly from `/system/build.prop`, and
+     `ro.vendor.river.build_id` read directly from `/vendor/build.prop`, both
+     as root, against `batch.json`'s build ID;
+   - the SHA-256 of exactly the first `size(boot.img)` bytes of
+     `/dev/block/by-name/boot<slot>`, read as root, against the staged
+     `boot.img`. A short read is a FAIL. The partition is 33,554,432 bytes and
+     today's image is 29,327,360, so hashing the whole partition would never
+     match;
+   - the phone's `ro.build.date.utc`, `ro.vendor.build.date.utc`,
+     `ro.bootimage.build.date.utc` and `ro.boot.slot_suffix` against
+     `batch.json` and the flash record;
+   - the benchmark rows (matched by run ID, batch, dates and slot);
+   - the image hashes recorded by `flash`.
+3. **Health baseline.**
+   - `sys.boot_completed` is 1.
+   - SELinux is enforcing.
+   - The saved per-boot evidence, for the first boot after the wipe and for
+     every measured boot, shows no crashes, no restart loops, SELinux
+     enforcing and boot completed. Each record's `boot_id` must equal the one
+     recorded when that boot completed: by `flash` for the first boot after
+     the wipe, and by `device-bench` for the measured boots. Missing evidence,
+     or a `boot_id` mismatch, is UNVERIFIED.
+   - `dumpsys dropbox` has no entry (counting all of them, with no wall-clock
+     filter, because `/data` was wiped) tagged
+     `system_server_crash`, `system_app_crash`, `data_app_crash`,
+     `SYSTEM_TOMBSTONE`, `system_server_native_crash`, `*_anr` or
+     `SYSTEM_LAST_KMSG` with a panic. Dropbox survives the bench reboots.
+   - `/data/tombstones` is empty.
+   - `/sys/fs/pstore` has no panic or oops.
+   - No service is crashing or restarting in a loop in `dmesg`.
+   - No telephony features.
+   - Unreadable diagnostics are `UNVERIFIED`.
+4. **Regression.** See the table below.
+5. **Feature checks.**
+6. **Cleanup.**
+   - Remove the Bluetooth bond on both ends, and restore the scan mode and
+     Bluetooth on/off to their snapshots.
+   - Remove the alarm. `ACTION_DISMISS_ALARM` only disables it, so also run
+     `pm clear com.android.deskclock`.
+   - Remove the marker file and kill the watchdog.
+   - Uninstall the apps.
+   - Restore everything from the journal.
+   - Uninstall the helper, last.
+   - Go home and turn the screen off.
+   - Every cleanup step is verified. A failed cleanup is a FAIL.
+7. **Final checks**, after cleanup:
+   - Run the health checks again. Dropbox, tombstones, pstore, `dmesg` and the
+     streamed logcat must show nothing new since preflight.
+   - Each recorded process must have the same PID and start time.
+   - `HAL deaths since last reboot: 0`.
+   - `boot_id` must be unchanged.
+   - The phone settings must equal `phone-setup`'s choices.
+
+   Only then is `eligible` written.
+
+## Retries
+
+Only **environmental** outcomes are retried, and each check names its own:
+
+- **GPS:** the engine started, but no satellite has Cn0 > 0 yet.
+- **Bluetooth:** forge was not discovered within the scan window.
+
+Each gets one retry, and the first attempt is reported. Functional errors are
+never retried. These are exceptions, HAL or service errors, crashes, wrong
+values, and timeouts inside an exercise.
+
+## Checks
+
+| Group | Check | Method | Pass rule |
+| --- | --- | --- | --- |
+| health | regression | Read the batch rows and `known-good.json`. That file has two separate records. `latest` is replaced at every clean tag: the tag, the commit set, the run IDs, `host_boot_seconds`, `system_used_kb`, `vendor_used_kb` and the camera set. `ram_reference` is a running minimum: the tag, the run IDs, the 3-boot median and `seed`. It changes only when a clean tag has a 3-boot median strictly lower than the stored one. The calibration seed is retired at the first real tag. The reference then becomes the lower of the seed's median and the tag's median, and keeps that value's provenance, so retiring the seed can never raise it. The `seed` flag is cleared either way. A tag with only one boot, or with a higher median, never changes it. | The charter rules. Boot 1 `host_boot_seconds` ≤ 55. **RAM:** if a 3-boot median is required (see the sequence) and missing, UNVERIFIED. If it is present, it must be ≤ reference + 5 MB. If boot 1 is used alone, it must be ≤ reference + 10 MB. No reference at all: UNVERIFIED. **Size:** `system_used_kb` and `vendor_used_kb` no bigger than `latest`, unless the 3-boot median is below `ram_reference`. In `--calibrate` mode, nothing is compared: the run records the 3 boots, the sizes and the camera set, and is never eligible. |
+| radios | wifi | The helper calls `requestNetwork(TRANSPORT_WIFI)` and binds its sockets to that network. It fetches two things: a page from forge's LAN address (the host test server also listens on the LAN on a fixed port, with a fresh token per fetch and `Cache-Control: no-store`. forge's ufw allows that port only from the phone's address; the rule is set up once, with sudo through `request_secret`), and `https://connectivitycheck.gstatic.com/generate_204`. Then the harness turns the screen off and waits until `dumpsys power` shows `mWakefulness` of `Dozing` or `Asleep` and `dumpsys display` shows `Display State=OFF`. It waits 30 s, wakes the phone, and the helper fetches both again with new tokens. | Each time: the page body has that fetch's token, the host log shows the request came from the phone's Wi-Fi address, and `generate_204` returns HTTP 204. |
+| radios | bluetooth | **Phone:** `cmd bluetooth_manager enable`, then `wait-for-state:STATE_ON`, then read `settings get secure bluetooth_address`. **Host:** run a dedicated `bluetoothctl` subprocess with its own `agent NoInputNoOutput`, and **don't** make it the default agent, so the desktop agent is left alone. Snapshot the adapter's `Discoverable` setting. Remove any existing host bond for the phone's address; that address is only ever the test phone, so the bond is QA's. **Discovery:** turn `discoverable on` on the host. The helper, in front, scans and must find forge's address. Then restore `Discoverable`. **Making the phone visible:** the helper snapshots the scan mode in the journal, then sets `SCAN_MODE_CONNECTABLE_DISCOVERABLE` for 120 s with `setScanMode` (reflection plus shell `BLUETOOTH_PRIVILEGED`). The host session runs `scan bredr` until the phone's address appears, with a deadline, then `scan off`. **Pairing:** started from the host (`pair <phone>`) and accepted by the session's own agent. On the phone, a high-priority receiver for `ACTION_PAIRING_REQUEST` accepts the request only for forge's address and variant 3 (CONSENT, which also covers Just Works; written as a literal because the constant is hidden). It calls `setPairingConfirmation(true)` and then `abortBroadcast()`, so Settings doesn't show its own dialog. Afterwards the scan mode and Bluetooth on/off go back to their journal snapshots. `setScanMode(int)` takes one argument; the 120 s comes from `setDiscoverableTimeout`. Both `setScanMode` and `removeBond` are hidden APIs, so `hidden_api_policy` is relaxed through the journal while they run. **Cleanup:** `removeBond()` on the phone and `remove <phone>` on the host, both verified. | Forge found in a new scan. The phone reports `BOND_BONDED` for forge, and the host shows `Paired: yes`. Cleanup is verified on both ends. The host's `Discoverable` matches its snapshot. The phone's scan mode and Bluetooth on/off match theirs. |
+| radios | nfc | **On the phone:** the `com.android.nfcservices` APEX is active under `/apex`. Tag (`com.android.apps.tag`) is installed. `/vendor/bin/hw/android.hardware.nfc@1.2-service` and its init `.rc` exist, as do `/odm/etc/permissions/sku_nfc/*.xml`, `/odm/etc/vintf/manifest_nfc.xml`, `/vendor/etc/libnfc-nxp.conf`, `/vendor/etc/libnfc-nci.conf` and `/vendor/lib64/nfc_nci_nxp.so`. **In the staged build:** the paths in the staged, hashed copies of `installed-files*.json`: `/system/apex/com.android.nfcservices.capex`, `/system/priv-app/Tag/Tag.apk`, `/vendor/odm/etc/permissions/sku_nfc/*.xml`, `/vendor/odm/etc/vintf/manifest_nfc.xml` and `/vendor/lib64/nfc_nci_nxp.so`. | All present. This is a build check, because the phone has no NFC chip. |
+| radios | gps | Turn location on with `cmd location set-location-enabled true`, recorded in the journal. The helper, in front, calls `requestLocationUpdates(GPS_PROVIDER)` and registers `GnssStatus.Callback`. Location is turned off again afterwards. | `onStarted()` fires and status callbacks arrive. At least one satellite has Cn0 > 0 within 120 s; zero satellites gets one retry. Calibration must see satellites in 5 out of 5 runs, or this item goes to Zak before gating starts. |
+| hardware | cameras | **Expected set:** taken from `batch.json`. It must equal `known-good.json`'s set and the phone's `ro.vendor.river.cameras` once that exists. The bootstrap set is {0, 1, 2}. Any difference between these sources is UNVERIFIED: "camera set changed, needs Zak". The one exception is a camera-set change Zak has approved. `batch.json` then carries `camera_set_change`, which links Zak's approval (the PR or comment URL) and gives the new set. `gh` must confirm the approval was written by `zrm625`. The new set must still match the device repo's switch values and `ro.vendor.river.cameras`. That set becomes the expected set, and the tester writes it to `latest` when the batch is tagged. A missing or malformed source is UNVERIFIED, never an empty set. `getCameraIdList()` must equal the expected set exactly. **Liveness (every camera):** with `MANUAL_SENSOR`, use the camera's maximum sensitivity and maximum exposure, with a matching frame duration. On this phone the longest is 487 ms, so 10 frames take under 5 s. The whole capture has a 20 s deadline. Without it, auto exposure. Capture 10 frames in the YUV format the camera offers. **Camera 0 photo** (only when camera 0 is in the expected set): take two JPEG stills with the sensitivity, exposure and white balance locked manually. The settings are chosen by calibration so a lit room doesn't saturate the torch-off still; they are separate from the maximum exposure used for liveness. The first still is taken with the torch off. The second is taken with `FLASH_MODE_TORCH` in the still request itself. Luma is measured on the decoded full-range 0–255 image. **Cameras 1 and 2 photos:** best effort. | **Liveness:** every camera delivers 10 frames with increasing timestamps, and the frame-to-frame difference is above a calibrated floor (hard minimum: more than 0). **Camera 0:** the torch-on still's capture result reports `FLASH_STATE_FIRED`. Its mean luma is higher than the torch-off still's by at least a calibrated amount, with a hard floor of 5 levels. The torch-on still itself has mean luma ≥ 20 and spatial standard deviation ≥ 4. The torch evidence and the photo are the same image. **Cameras 1 and 2:** photo numbers are INFO. A failed JPEG capture on those two is INFO, not FAIL. Only their liveness gates. |
+| hardware | audio | The helper is in front. It sets `STREAM_MUSIC` to a fixed level, recorded in the journal. The record source is `UNPROCESSED` if supported, otherwise `VOICE_RECOGNITION`. It records 1 s of silence, then plays 1 kHz, a 300 ms gap, 2.5 kHz, a 300 ms gap, and 1 kHz. Once playback and capture have started, it checks `getRoutedDevice()`. | Routed devices are `TYPE_BUILTIN_SPEAKER` and `TYPE_BUILTIN_MIC`. The recording isn't all zeros. In every burst, the burst frequency is ≥ 15 dB over both the silence and the bins ±150 Hz away. The gaps drop ≥ 10 dB. The level is above a calibrated floor. |
+| hardware | fingerprint | The helper calls `isHardwareDetected()`. The harness checks that the HAL process is alive and unchanged (PID and start time) and that `HAL deaths since last reboot: 0`. | All three |
+| hardware | sensors | The helper is in front and the screen is on. It reads for 3 s. | The accelerometer gives ≥ 20 samples, with a median magnitude of 9.81 ± 1.5. Light gives ≥ 1 finite value ≥ 0. Proximity gives ≥ 1 value in [0, maxRange]. |
+| hardware | vibration | The helper is in front and plays a `createWaveform` of 3 pulses. | `dumpsys vibrator_manager` has a `river-qa` entry newer than the request, with status finished. |
+| hardware | screen | Wake the screen and bring the rotatable helper activity to the front. **Brightness:** mode 0, values 40 and 200, 1.5 s apart. **Extra dim:** set `reduce_bright_colors_activated` to 0, then 1. **Rotation:** `cmd window user-rotation lock 1`, then `lock 0`. Everything is recorded in the journal. | **Brightness:** the `lcd-backlight` sysfs value follows the setting's direction. **Extra dim:** `dumpsys color_display` reads `Reduce bright colors:` / `Activated:` as false, then true. SurfaceFlinger's `colorTransformMatrix` diagonal drops by at least 30% between off and on. This was seen on the phone: about 1.08 to 0.56. If the matrix can't be found, UNVERIFIED. **Rotation:** `mCurrentRotation=ROTATION_90`, then `ROTATION_0`, and the helper receives the matching configuration changes. |
+| hardware | battery | `dumpsys battery` and `/sys/class/power_supply/battery/` | `present`. The level is 1–100 and within 1 of `capacity`. Status is 2, 5, or 4 when a power source is present. At least one source is powered. Voltage is 3,400–4,500 mV. |
+| hardware | usb | Find the phone by `serial` under `/sys/bus/usb/devices/`. Push a marker with a token to `/sdcard/Download/`, then index it with `content call --uri content://media/external/file --method scan_file`. Save the current functions with `svc usb getFunctions`. It prints to stderr, and prints an empty line when only charging is on; empty means restore with no argument. **Watchdog:** `setsid nohup sh -c 'sleep 180; svc usb setFunctions <saved>' </dev/null >/dev/null 2>&1 & echo $!`, recorded in the journal. The harness checks the PID is alive. Then run `svc usb setFunctions mtp`, which keeps adb. Wait, under a deadline, for the device with this serial to reappear. **Listing:** if gvfs is running, wait up to 10 s for its mount and list through `gio` at the `mtp://` URI that contains this serial. Without gvfs, use `mtp-files` only if this phone is the only USB device with an MTP interface under `/sys/bus/usb/devices` (checked by serial). Otherwise the check is UNVERIFIED. Then restore the saved functions, confirm adb, kill the watchdog by PID, delete the marker and set up `adb reverse` again. | The marker is listed over MTP from this phone, and adb is back within 30 s. If adb is still missing after 240 s (past the watchdog), the run halts with "phone unreachable", the pipeline stops, and Zak is told. |
+| system | gestures | `dumpsys activity service SystemUI` shows the overview proxy enabled and bound to `app.zak.perch`. HOME resolves to Perch. Press HOME: the top is Perch's `MainActivity`. Start DeskClock: the top is DeskClock. Swipe up from the bottom edge, using calibrated coordinates. **Back:** helper activity A starts child B, and B is on top. Then a left-edge back swipe. | After HOME and after the swipe up, the top is exactly Perch. After Back, the top is exactly A. |
+| system | alarms | The helper reads the phone's local time. It sends `ACTION_SET_ALARM` with `EXTRA_SKIP_UI`, `EXTRA_RINGTONE=VALUE_RINGTONE_SILENT`, `EXTRA_VIBRATE=false`, a unique `EXTRA_MESSAGE` label recorded in the journal, and the next minute boundary at least 45 s away. The harness turns the screen off. Afterwards: `ACTION_DISMISS_ALARM` with `EXTRA_ALARM_SEARCH_MODE=ALARM_SEARCH_MODE_LABEL` and the label. Check the alarm is gone, then force-stop DeskClock. | Only evidence that the alarm is **firing** counts: a DeskClock notification on the firing channel, with `fullScreenIntent` and this label, read with `dumpsys notification --noredact`. `AlarmActivity` being resumed is supporting evidence; its intent carries the instance URI, not the label. The "upcoming alarm" notification doesn't count, because it already shows the label. That evidence must be **absent** at target − 10 s and present by target + 10 s. The alarm is deleted afterwards. |
+| system | keyboard | Before the `EditText` takes focus, the helper sets `FLAG_RETRIEVE_INTERACTIVE_WINDOWS` through `UiAutomation.getServiceInfo()` and `setServiceInfo()`. The `EditText` uses an `InputConnection` wrapper that logs `commitText` and `setComposingText`. Once the LatinIME window is shown, the harness taps a fixed word at calibrated key coordinates (`input tap`). `input text` is never used. | `dumpsys input_method` shows LatinIME with `mInputShown=true`. The field holds the word, and the wrapper logged IME commits for it. |
+| system | sideload | `pm install` the helper and each app. Launch each. Uninstall them at cleanup. | Every step succeeds and is verified. |
+| system | webview | The helper's WebView has JavaScript on and loads the page with the WebView token. The page script sets `document.title` to the token and sends a beacon. | The title is the token within 15 s, and the host log has the beacon with the token. |
+| system | video | The decoder is the first AVC decoder with `isHardwareAccelerated()`, not an alias, and not requiring `FEATURE_SecurePlayback`. Decode into an `ImageReader` surface, and compare sampled frames on the host. | The frame count matches. Sampled frames have PSNR ≥ 30 dB against the ffmpeg reference. The decoder name is reported. |
+| system | time | `auto_time=1`. Wi-Fi is the active default network. Record `elapsedRealtime` (`E0`), then run `cmd network_time_update_service force_refresh`. | The stdout is `true`. Polling `dumpsys time_detector` for up to 5 s finds a network suggestion with an elapsed timestamp ≥ `E0`. The phone and host clocks agree within 2 s. |
+| apps | brave | Install the pinned APK. Send a VIEW intent for the Brave-token page to `com.brave.browser`. Get through first-run using the steps calibration recorded for the pinned version. | Brave's activity is in front. The host log has the page GET and the page-script beacon for the Brave token. A uiautomator dump shows the token text on screen. |
+| apps | tailscale | Install the pinned APK and launch `com.tailscale.ipn/.MainActivity`. | The activity is resumed, then 10 s go by with no crash or ANR for the package. Tailscale's VPN consent dialog counts as opened. It is dismissed and never accepted. |
+| apps | t3code | Install the pinned APK and launch `com.t3tools.t3code/.MainActivity`. | The activity is resumed, then 10 s go by with no crash or ANR for the package. |
+
+Not checked, by charter: the headphone jack and deep sleep. Auto-rotate (the
+sensor path) isn't tested, only user rotation, and the report says so.
+
+## Calibration and bootstrap
+
+The known-good build on `river-22.2` still runs Trebuchet, and the gestures
+check requires Perch. The steps run in this order, and each one finishes
+before the next starts:
+
+1. **Boot-timing calibration, with no flash.** On the build running now, do
+   planned reboots on each path that matters: a plain `adb reboot`, and a
+   reboot through fastboot with no writes. The clock for each starts at the
+   first USB disconnect after the harness's command. For flashing, the clock
+   starts at the disconnect after the final `fastboot reboot`, so the time
+   spent writing images is never counted. From these reboots, set the
+   bootloader allowance A for each path, using the rule in the uptime signal.
+   For each path, show two things. A normal boot must pass. An injected extra
+   bootloader pass must be rejected **by the uptime check itself**: for the
+   control, the clock starts at the disconnect that begins the injected pass
+   and runs through the final reboot. Expected fastboot enumerations from the
+   control are marked as planned, so the "unplanned enumeration" rule can't
+   fail the run first and hide a broken uptime check. A path with no workable
+   A, or without that proof, is UNVERIFIED from then on.
+2. **Baseline.** Seed `known-good.json` from the build that is already
+   known-good, not from the Perch candidate. Otherwise Perch would become its
+   own baseline.
+   - Use the `--baseline` mode, starting with the first-run transition. It is
+     never eligible. It uses the same slot pair and rescue as any flash. It
+     doesn't run the functional checks, so it works on the Trebuchet build.
+     It writes `known-good.json` only if every boot's health evidence is
+     clean and bound to the right `boot_id`.
+   - Build `river-22.2` HEAD, stage it, and flash it with a wipe. Check its
+     identity: its build IDs if it has them, otherwise its dates, slot and
+     boot hash. Record 3 `device-bench` boots with the setup wizard
+     untouched, plus per-boot health evidence for the first boot after the
+     wipe and for each measured boot.
+   - Existing `device.csv` rows can be reused only if they have the same
+     identity and health evidence. Today's rows don't, so the baseline is
+     measured fresh.
+   - `latest` gets that build's sizes, `host_boot_seconds` and camera set.
+   - `ram_reference` gets its 3-boot median, marked `seed: calibration`.
+   - **Closing the pair.** A passing baseline closes its own pair, and its
+     slot becomes `known_good_slot`. An interrupted or failed baseline has no
+     PRs or tags to look up, so it always rolls back to the provisional slot,
+     and the baseline is run again.
+3. **Perch calibration.** This step starts only after the baseline's pair is
+   closed.
+   - Build the Perch candidate (the `perch-launcher` branches, with Perch
+     160d58f) and flash it through the staged-batch path, with
+     `experiment: false` and no merge.
+   - Run `phone-qa --calibrate` on it 5 times, all on one flash. The phone
+     rolls back once, at the end. Calibrate mode runs every check, but it is
+     never eligible.
+   - Its regression check only records: the 3 boots, the sizes and the
+     camera set. The camera set must match both `getCameraIdList()` and the
+     device repo's switch values.
+   - Every other check must pass in all 5 runs.
+4. **Thresholds.** Set the thresholds from the Perch calibration data. Each
+   threshold has a hard floor in the code:
+   - audio ≥ 15 dB
+   - PSNR ≥ 30 dB
+   - luma standard deviation ≥ 4
+   - camera frame difference > 0
+   - Extra dim matrix drop ≥ 30%
+
+   Calibration can never lower a threshold below its floor. The Perch runs
+   set only the functional thresholds.
+5. **Controls before any merge.** The deliberately broken runs below must
+   all give their expected results before any run can be merge-eligible.
+   Until they do, the harness writes `eligible: false` with the reason
+   "controls not qualified". The control results are stored with the
+   harness version, and changing the harness or the thresholds clears them.
+   Only then do Perch's council review and the first real batch happen. That
+   batch is compared with the baseline seed. Every
+   batch measures 3 boots while the seed is in place. When the batch is
+   clean, the tester tags it, and it becomes the first real known-good.
+6. Show that each check can fail. Each of these deliberately broken runs must
+   end in FAIL or UNVERIFIED. This list is the step-5 control set:
+
+   | What is broken | Expected result |
+   | --- | --- |
+   | Audio volume 0 | FAIL |
+   | Location off | FAIL (GPS) |
+   | Software decoder forced | FAIL (video) |
+   | `input text` instead of taps | FAIL (keyboard) |
+   | Torch LED disabled below the HAL for the whole capture, even though the request still asks for the torch. Use `led:switch_*`, or `led:flash_*`/`led:torch_*` brightness 0 if the HAL doesn't rewrite it. | FAIL, because the two stills show no difference |
+   | Bad NTP server, set **after** a successful sync, then reset with `reset_server_config_for_tests` | FAIL (time) |
+   | Wi-Fi off | FAIL |
+   | Host Bluetooth adapter rfkilled; the harness never powers the adapter itself | UNVERIFIED, because it's a fixture problem and not the batch's fault |
+   | Wrong `batch.json` | FAIL |
+   | Stale `device.csv` row | FAIL |
+   | Wrong `ro.river.build_id`, or a boot hash mismatch | FAIL |
+   | `ro.config.low_ram=true` with `experiment: false` | FAIL |
+   | A crash planted in the evidence for an earlier measured boot | FAIL |
+   | Wi-Fi page fetched over USB instead of Wi-Fi (socket not bound) | FAIL |
+   | Missing 3-boot median when one is required | UNVERIFIED |
+   | Beacon blocked | FAIL (webview) |
+   | Extra dim matrix check run against a stub | FAIL |
+   | Run killed mid-check, then run again | The journal restores the phone, and the next run is clean |
+   | `boot_id` changed | FAIL |
+   | Alarm checked 1 minute early | FAIL |
+   | `navigation_mode` 0, or HOME pointed elsewhere | FAIL (gestures) |
+   | Camera set changed in `batch.json` | UNVERIFIED |
+   | An extra reboot planted before boot completes (first boot and a bench boot) | FAIL |
+   | An extra bootloader pass with no kernel session (`fastboot reboot bootloader`, then `fastboot reboot` straight away), inside a planned reboot. The clock starts at the disconnect that begins the injected pass, and those enumerations are marked planned. | FAIL, through the uptime check itself |
+   | Tag pushed, then the host killed before `slot-state.json` was updated | Recovery promotes the batch and does not roll back |
+
+   The calibration report lists each result.
+
+## Runtime
+
+About 13 minutes: alarms up to 2, GPS up to 4, USB about 1, apps about 2, and
+the rest about 4. The extra RAM boots are part of `device-bench`.
+
+## Safety
+
+- The harness only ever uses `-s $BENCH_DEVICE`, checks the `river` guard
+  before every group, and runs under the shared lock token.
+- On the host, it uses Bluetooth only with the phone's address. It never
+  replaces the default agent. Only the `Discoverable` setting is changed, and
+  it is restored from a snapshot.
+- Before the USB switch, a detached on-phone watchdog with a known PID is
+  armed. adb is never dropped on purpose. If adb is lost, the run halts and
+  Zak is told.
+- Alarms are silent with no vibration, and the audio bursts are short and
+  moderate, because Zak works at that desk.
+- Network traffic: the LAN test listener on forge (one fixed port, open only to the phone's address through ufw), the `generate_204` fetches, NTP, and whatever the three apps
+  fetch on first launch. Brave's first-run screens and the Tailscale and T3
+  Code start screens make requests to their own services. The helper builds
+  offline.
+
+## Round-2 findings and how revision 3 handles them
+
+| Finding (who raised it) | Disposition |
+| --- | --- |
+| The boot gate measures the wrong boot (Sol), and the "first boot" wording (Opus) | The charter now says the first `device-bench` boot after the flash. The first post-wipe boot is recorded as information. Every adb wait has a deadline. |
+| Exact batch identity: image hashes and the CSV batch field (Sol). Vendor and boot dates (Opus, Gemini) | Staged and hashed images, which `flash` checks. The `batch`, date and slot columns must all match. The vendor and bootimage dates are matched too. |
+| USB watchdog detach, saved functions, MTP scoping (Sol, Gemini) | `setsid nohup` with closed streams and a verified PID. `getFunctions` is saved and restored. `gio` uses the serial URI, or `mtp-detect` confirms the serial. MediaStore scan, a gvfs settle time, the marker deleted, deadlines. |
+| Final checks ran before cleanup; journal generations; a shared lock (Sol) | Cleanup comes first, then the final checks, then `eligible`. Journal entries are tagged by batch, boot and host. One lock token across the batch. |
+| A low-RAM experiment could be eligible (Sol) | `experiment: true` means never eligible, and the tester enforces it. |
+| Dead torch in a bright room; front and depth JPEG failures; who defines the camera set (Sol, Opus, Gemini) | `FLASH_STATE_FIRED` is required, and the torch-disabled control must FAIL. Front and depth JPEGs are INFO. The camera set comes from `batch.json`, `known-good.json` and the phone property together, and any mismatch is UNVERIFIED for Zak. |
+| Bluetooth: consent can't complete unattended; `removeBond` is hidden; address read too early; no getter for the default agent (all three) | Pairing starts from the host with the session's own non-default agent. The phone confirms with shell `BLUETOOTH_PRIVILEGED`, only for forge. `removeBond` by reflection with the policy recorded in the journal. The address is read after `STATE_ON`. Only `Discoverable` is snapshotted. |
+| Extra dim can pass without the transform (Sol, Opus) | SurfaceFlinger `colorTransformMatrix` must drop ≥ 30%, as seen on the phone. UNVERIFIED if it can't be read. |
+| Time evidence from before the refresh; exit code always 0 (Sol, Opus, Gemini) | Stdout must be `true`, the suggestion must be newer than `E0`, and Wi-Fi must be the default network. The bad-server control runs after a sync. |
+| Wrong API for `FLAG_RETRIEVE_INTERACTIVE_WINDOWS` (Sol) | Set through `getServiceInfo()` and `setServiceInfo()`. |
+| Perch HOME not checked; Brave proof weak (Sol) | Pressing HOME must bring Perch to the front. Brave needs its own token, a page-script beacon and the token on screen. A User-Agent alone isn't enough. |
+| `--quick` exit contract (Sol) | Exits 0 when its checks pass, and is always `eligible: false`. |
+| RAM 3-boot timing and reference bootstrap; size baseline (Opus, Gemini) | Step 4 runs before `phone-setup`, with all four triggers. No reference means UNVERIFIED. The reference is seeded at calibration. Size is compared against the latest known-good. MB is defined. |
+| Crashes from earlier boots since the wipe aren't seen (Opus) | `dumpsys dropbox` since the wipe, pstore at baseline, and a streamed logcat. |
+| Calibration can't pass on a Trebuchet known-good (Opus) | Calibrate on the Perch candidate, then seed `known-good.json`, and the first clean batch becomes the first tag. |
+| Restart counters that don't exist (Gemini) | PIDs and start times of the key processes. |
+| Helper permissions (Gemini, Opus) | Normal and runtime permissions are listed separately. |
+| NFC `installed-files` paths (Gemini) | The exact paths from `out-stripped`. |
+| Camera exposure could hang; `MANUAL_SENSOR` fallback (Opus, Gemini) | Exposure capped at 150 ms, with an auto exposure fallback and the YUV format the camera offers. |
+| Alarm dismiss needs a search mode; vibration; redacted notification text (Gemini) | `ALARM_SEARCH_MODE_LABEL`, `EXTRA_VIBRATE=false`, and `--noredact` or uiautomator. |
+| Audio source and route timing (Opus, Gemini) | `UNPROCESSED`, falling back to `VOICE_RECOGNITION`. Routes are checked after the streams start. |
+| Exit precedence, a canonical required-check list, one UiAutomation at a time, network list (Opus, Gemini) | All adopted |
+| Brave Origin replaced (Zak) | The charter now lists Brave, Tailscale and T3 Code. All three APKs are pinned and were tested on the phone. |
+
+## Round-3 notes to apply during implementation
+
+From Opus round 3:
+
+- Disable the torch for its control below the HAL, using the flash LED sysfs as root. Add a check that luma differs with and without the torch.
+- Use the camera's real maximum exposure, under a deadline. The maximums are 270–487 ms. Drop the 150 ms cap.
+- Never power the host Bluetooth adapter on or off.
+- In token mode, child scripts skip `flock` and refuse to run unless the token matches.
+- Store `ram_reference` as a running minimum. Store all three boot rows.
+- Count every dropbox entry, with no wall-clock filter.
+- Put the boot reason and pstore in the report.
+- Accept battery status 4 when a power source is present.
+
+From Sol and Gemini round 3, also to apply during implementation:
+
+- Migrate the `device.csv` header to the new columns, including
+  `bootimage_date_utc`.
+- The watchdog's ready signal includes `boot_id`, the PID and the process
+  start time.
+- `--quick` keeps `phone-check`'s `--wait` behaviour and loads no fixtures.
+
+## Round-3 findings and how revision 4 handles them
+
+| Finding (who raised it) | Disposition |
+| --- | --- |
+| Calibration can't produce its first baseline (Sol) | A `--calibrate` mode that records the 3 boots, the sizes and the camera set, and is never eligible |
+| `known-good.json` mixes up the latest tag with the lowest RAM median (Gemini, Sol, Opus) | Separate `latest` and `ram_reference` records. `ram_reference` is a running minimum. |
+| BlueZ can't pair with a phone it hasn't discovered (Sol, Gemini) | The phone is made discoverable for 120 s with `setScanMode` under shell permission. The host runs `scan bredr` until it sees the phone, then pairs. The scan mode is restored. A high-priority pairing receiver calls `abortBroadcast`. |
+| The screen-off wait expects `Asleep`, but river dozes (Gemini) | Wait for `Dozing` or `Asleep`, and `Display State=OFF` |
+| Wi-Fi never loads an actual page (Sol) | A page from forge's LAN address with a fresh token, over the bound Wi-Fi network, before and after the screen cycle |
+| Torch evidence could be faked; the 150 ms cap; approved camera-set changes; camera 0 being optional (Sol, Opus, Gemini) | An optical torch-off/on difference at locked exposure, with the torch control disabled below the HAL. Real maximum exposure under a deadline. Zak-approved `camera_set_change`. The torch photo runs only when camera 0 is enabled. |
+| The alarm could pass on the "upcoming" notification (Opus, Sol) | Only firing evidence counts: absent at target − 10 s, present by target + 10 s. Applied after Opus's round-3 review. |
+| Dates can repeat between builds; low-RAM could slip through (Sol) | `ro.river.build_id` stamped into the build, the boot partition hash read on the phone, and a `ro.config.low_ram` veto |
+| Recovery handoff, MTP scope, journal invalidation (Sol) | Slot rescue when fastboot answers, otherwise halt and notify. MTP limited to the gio serial URI or a single matching device, otherwise UNVERIFIED. Journal entries dropped only after a recorded successful wipe, and recovered only once the lock is held and the phone is confirmed. |
+| Health evidence from each measured boot (Sol) | `device-bench` saves health evidence for each boot before it reboots again. QA fails on any of it. Dropbox has no time filter. |
+| Minors: staged `installed-files`, `getFunctions` on stderr, `time_detector` delay, a hidden constant, the CSV migration, alarm recovery, gesture and alarm controls, battery status 4 (Gemini, Opus, Sol) | All adopted |
+
+## Round-4 notes from Opus (now in the design text above)
+
+- **Boot hash.** Hash only the first `size(boot.img)` bytes of the partition. The partition is 33,554,432 bytes and the image is 29,327,360.
+- **Wi-Fi LAN fetch.**
+  - Add forge's LAN address to the helper's cleartext allowlist.
+  - Use a fixed listener port.
+  - forge has ufw enabled, so the port needs a rule allowing only the phone's address. Adding the rule needs sudo. It is a one-time setup step through `request_secret`.
+  - List the listener in the Safety section.
+- **Slot rescue.** When adb answers but boot never completes, run `adb reboot bootloader` and then rescue. If the bootloader falls back to the old slot by itself, report the batch as failed.
+- **RAM reference.** While `seed: calibration` is in place, every batch measures 3 boots.
+- **Camera set change.** Use `gh` to confirm that the `camera_set_change` approval was written by `zrm625`.
+- **Bluetooth state.** Restore the scan mode and Bluetooth on/off to the journal snapshot.
+- **Torch.** Run the torch check at its own locked exposure, separate from the liveness check's maximum exposure. If the HAL rewrites `led:flash_*`, the calibration control can use `led:switch_*` instead.
+- **First-boot evidence.** The flash step saves `dmesg` and `logcat -b crash` from the first boot after the wipe, before the reboot for boot 1.
+
+## Round-4 findings and how revision 5 handles them
+
+| Finding (who raised it) | Disposition |
+| --- | --- |
+| The boot hash covered the whole partition (all three) | Hash only the image's size, and FAIL on a short read |
+| One shared property can't prove both partitions, and the stamps came too late (Sol, Gemini) | `ro.river.build_id` in `/system/build.prop` and `ro.vendor.river.build_id` in `/vendor/build.prop`, each read directly. The stamping ships with the harness, before calibration. |
+| Perch would become its own baseline (Sol) | The seed comes from a 3-boot `--calibrate` measurement of `river-22.2` HEAD. Perch calibration sets only the functional thresholds. |
+| Slot rescue missed the case where adb answers but boot never completes (Sol, Opus, Gemini) | `adb reboot bootloader`, then rescue. The previous slot is recorded and kept across retries. A bootloader fallback is reported as a failed batch. |
+| Torch evidence and the photo were separate images (Sol) | Matched torch-off and torch-on stills at locked exposure. `FLASH_STATE_FIRED` comes from the torch-on still's own result. The LED stays disabled for the whole control capture. |
+| The Wi-Fi LAN fetch was blocked by the cleartext policy (Gemini, Opus) | The cleartext allowlist covers exactly `127.0.0.1` and forge's LAN address. A one-time ufw rule is set up through `request_secret`. |
+| Minors: the seed trigger, the `setScanMode` signature and hidden API, variant 3 only, alarm evidence through the notification, `pm clear` in cleanup, `adb root` in `device-bench`, cleanup order, battery status 4, `camera_set_change` checks, Bluetooth snapshot restore, first-boot evidence (all three) | All written into the design text |
+
+## Round-5 findings and how revision 6 handles them
+
+| Finding (who raised it) | Disposition |
+| --- | --- |
+| A retry could overwrite the fallback slot (Sol) | The target and fallback slots, plus the fallback's boot hash, are saved before any write. Retries enforce them and never work the target out from `current-slot`. Rescue runs on a failed boot during the flash or the bench. An unstamped fallback is checked by slot and the boot hash saved before the flash. |
+| The baseline couldn't be measured on the Trebuchet build (Sol) | A `--baseline` mode: identity check, wipe, 3 bench boots with the wizard untouched, and health evidence for every boot. No functional checks. Reused rows need the same evidence. |
+| Retiring the calibration seed could raise the RAM reference (Sol) | Retiring the seed keeps the lower of the seed's median and the tag's median, with its provenance |
+| Evidence from the first boot after the wipe wasn't gated (Sol) | It is the same evidence as for the measured boots, and gated the same way. Missing evidence is UNVERIFIED. |
+| Firewall rule and port in the body, hidden API list, status line, flicker-safe exposure, a stamped fallback, returning to the known-good slot after a FAIL (Opus) | The first three are written into the text. The others are implementation notes: exposure in multiples of 10 ms, and after a FAIL the batch tools switch back to the known-good slot. |
+
+## Round-6 findings and how revision 7 handles them
+
+| Finding (who raised it) | Disposition |
+| --- | --- |
+| The slot record could be cleared before the candidate became known-good (Sol). Raised as notes by Opus and Gemini. | `known_good_slot` is kept for good. A pair is resolved only by a verified rollback to `known_good_slot` (after a FAIL, an UNVERIFIED, an experiment, calibration, baseline or an interruption) or by a durable merge and tag. Before every flash the runner checks that no pair is unresolved, that the running slot is `known_good_slot`, and that the write target isn't. If a pair is abandoned, the runner rolls back, or halts and notifies Zak. |
+| A replacement boot could supply clean first-boot evidence (Sol) | `flash` records `boot_id` when it sees boot completed. The evidence must carry the same `boot_id` and flash attempt, and the same applies to each bench boot. A mismatch or missing evidence is UNVERIFIED. |
+| Minors: rescue wording, clearing the seed flag, `--baseline` never eligible with the same slot rules, first-boot crash allowlist only in writing and from calibration (Opus, Gemini) | Written into the text. Any first-boot allowlist that calibration needs is written down in the harness, never applied quietly. |
+
+## Round-7 findings and how revision 8 handles them
+
+| Finding (who raised it) | Disposition |
+| --- | --- |
+| A leftover sentence still released the pair when QA finished (Sol, Gemini, Opus) | Removed. Only a verified rollback, including a completed rescue, or a durable promotion releases the pair. |
+| The retry rule was ambiguous (Gemini, Sol) | One rule: a retry that writes images first completes a verified rollback, then reuses its own `target`. The "no unresolved pair" check covers other batches' pairs. |
+| A crash after tagging could roll back over the new tagged build (Sol) | Recovery checks the exact batch's merge and tag state with `gh` and `git ls-remote` before deciding. Fully merged and tagged means promote; nothing merged means roll back; partly done means halt. The pair stays reserved until the decision is recorded. This applies to every unresolved pair. |
+| A reset before boot completes could pass as a clean boot (Sol, Opus) | Three signals: the kernel-log marker chain through pstore, uptime against host elapsed time, and the dropbox `SYSTEM_BOOT` count since the wipe. Any sign of an extra boot is a FAIL. Unreadable pstore is UNVERIFIED. The boot reason isn't trusted, because ordinary flashes report `hardware_reset`. Calibration plants extra reboots to prove this. |
+| Minors: setting `known_good_slot` the first time, rolling back onto the candidate's `/data`, a single command for `boot_id` and `boot_completed`, any unresolved pair (Opus) | All written into the text: it is set when `--baseline` passes, together with the boot hash; rollback runs `fastboot -w` and records the wipe; one shell command reads both; every unresolved pair is reconciled. |
+
+## Round-8 findings and how revision 9 handles them
+
+| Finding (who raised it) | Disposition |
+| --- | --- |
+| The first baseline couldn't meet the flash precondition (Sol, Opus) | First-run transition: the running slot becomes a provisional `known_good_slot`, checked live by its boot hash. The baseline is flashed to the other slot, and a passing baseline closes its own pair at once. Perch calibration runs only after that. |
+| Rollback used `fastboot -w`, which river rejects, and rescue skipped the wipe (Sol, Gemini, Opus) | One rollback procedure for rescue, failures and detected fallbacks: `--set-active`, then `fastboot erase userdata` (must succeed and is recorded), then reboot and check the slot and build. Only then is the pair released. |
+| A reset too early for ramoops or dropbox to record (Sol) | The uptime clock starts at USB disconnect. The allowance must be smaller than the shortest bootloader pass calibration measured, so every reset makes the uptime come up short. If calibration can't separate the two, that path is UNVERIFIED. New control: an extra bootloader pass with no kernel session must FAIL. |
+| Minors: pstore bit flips, a failed lookup halts, checks before promotion, interrupted runs follow the recovery rule, dropbox counts settled and compared by name, wording, the boot-reason sentence (Opus) | All written into the text. Rerunning once on a spurious extra-boot FAIL belongs to `change batch`. |
+
+## Round-9 findings and how revision 10 handles them
+
+| Finding (who raised it) | Disposition |
+| --- | --- |
+| The uptime allowance formula was backwards, so every normal boot would fail (Opus, Sol) | A is at least the longest normal bootloader pass, and less than the shortest normal pass plus one more pass. If no such A exists, that path is UNVERIFIED. The clock starts at the first USB disconnect after the command. Any fastboot enumeration the harness didn't plan counts as an extra boot. |
+| The bootstrap order still flashed Perch before the baseline (Sol) | New order: (1) boot-timing calibration on the running build, with no flash; (2) the baseline, whose pair is closed, or rolled back and run again if interrupted; (3) Perch calibration, only after that; (4) thresholds. |
+| Time spent flashing counted against boot timing (Sol) | For the flash path, the clock starts at the disconnect after the final `fastboot reboot` |
+| Minors: pairs with no PRs always roll back, the calibration flash count, starting the control at once (Opus) | Written into the text |
+
+## Round-10 findings and how revision 11 handles them
+
+| Finding (who raised it) | Disposition |
+| --- | --- |
+| The extra-pass control fell outside the uptime clock, and an unplanned-enumeration FAIL could hide it (Sol) | For the control, the clock starts at the disconnect that begins the injected pass. Its enumerations are marked planned. The uptime check itself has to reject it on each path, or that path is UNVERIFIED. |
+| The first Perch batch could merge before the controls had qualified the gate (Sol) | New step 5: every control must give its expected result before any run is merge-eligible. Until then, `eligible: false` with the reason "controls not qualified". The results are tied to the harness version and the thresholds. |
+
+Round-10 notes from Opus, to apply during implementation:
+
+- Measure "one more bootloader pass" as reset to kernel start only, using
+  the flash path's normal pass. The injected control's fastboot wait would
+  make it look longer than it is.
+- Record B on the baseline flash. If it is more than A, stop and
+  recalibrate. Don't loop.
+- Gate Perch calibration on a baseline-closed record in `slot-state.json`.
+  A baseline rerun overwrites the seed.
+- Store the pair kind (batch, baseline, calibration, experiment) as a field
+  in `slot-state.json` and `batch.json`. Recovery must not work it out from
+  branches.
+- The "tag pushed, then host killed" control uses stubbed `gh` and
+  `git ls-remote`, never real tags.
