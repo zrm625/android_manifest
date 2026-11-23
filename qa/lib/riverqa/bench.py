@@ -263,6 +263,8 @@ def run(a) -> int:
                              context={"run_id": run_id, "boot": i, "batch": a.batch, "kind": "bench"})
             write_json(ev_dir / "signals.json", signals)
             verdict = reboots.combined_verdict(signals, "adb", timing)
+            if i == 1 and done_before == 0:
+                record_first_tail(rec, count, expected, a.batch, props[4].strip())
             row["signals"] = verdict[0]
             row["evidence"] = str(ev_dir.relative_to(BENCH_HOME))
         else:
@@ -273,6 +275,26 @@ def run(a) -> int:
             f"signals {row['signals']}")
     log(f"Results: {csv_path()}")
     return 0
+
+
+def record_first_tail(rec, count: tuple, expected: int, batch_id: str, build: str) -> bool:
+    """The first bench boot of a flash with a wipe is the first adb reboot
+    after that wipe: add its shutdown tail to the samples that set
+    max_shutdown_tail (amendment A1′ rule 4). Only when the flash record
+    and dropbox prove it (calibrate.first_after_wipe): it rebooted from the
+    wipe's recorded first boot, and dropbox holds exactly that boot and this
+    one."""
+    from .calibrate import first_after_wipe
+    from .journal import last_wipe
+    from .results import PASS
+    wipe = last_wipe(flashing.qa_home())
+    boots_before = expected - 1 if count[0] == PASS else None
+    ok, why = first_after_wipe("adb", 0, rec.boot_id_before, boots_before, wipe)
+    added = ok and reboots.add_tail_sample(rec.to_json(), wipe, f"bench:{batch_id}", build)
+    if ok:
+        log(f"  first adb reboot after wipe #{wipe['seq']}: shutdown tail {rec.reset_tail_s} s "
+            f"{'recorded' if added else 'not recorded (no anchor, or the wipe has a sample)'}")
+    return bool(added)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # Design: `phone-qa`, the QA harness for river batches (revision 11)
 
-Status: **approved by the council in round 11** (Opus 9, Sol 9, Gemini 9). This is revision 11, plus [amendment A1](#amendment-a1-the-adb-path-uptime-clock), which the council approved with conditions in code review round 1 and made strict in code review round 3. The implementation notes from each round are at the end and must be applied during the build.
+Status: **approved by the council in round 11** (Opus 9, Sol 9, Gemini 9). This is revision 11, plus [amendment A1](#amendment-a1-the-adb-path-uptime-clock), which the council approved with conditions in code review round 1 and made strict in code review round 3, and [amendment A1′](#amendment-a1-reconcile-the-strict-anchor-with-the-phone-data), which replaces the round-3 anchor rule where the two conflict. The implementation notes from each round are at the end and must be applied during the build.
 
 ## Council review
 
@@ -879,7 +879,10 @@ reset, mapped onto host time:
    write can be bracketed and read back, the boot has no pairing and its
    uptime signal is UNVERIFIED.
 2. **Strict anchor: any ambiguity is UNVERIFIED** (code review round 3,
-   replacing the "last corroborated run" heuristic). At the next boot
+   replacing the "last corroborated run" heuristic). **Superseded in part
+   by [amendment A1′](#amendment-a1-reconcile-the-strict-anchor-with-the-phone-data):**
+   the marker is found tolerantly and proven by its stamp, the reset comes
+   from the final 5 lines only, and there is no `max_stamp_gap`. At the next boot
    completion the previous kernel's log in pstore gives the reset time:
    - **One exact record.** The marker record is the last intact copy of this
      boot's exact marker: a strictly parsed stamp, the full marker straight
@@ -939,7 +942,9 @@ reset, mapped onto host time:
 5. **Fastboot path.** Unchanged: its clock starts at the disconnect after the
    final `fastboot reboot`, which is stable (10.01-10.08 s).
 
-**Calibration.** Step 1 (`phone-qa boot-timing`) sets A on the adb path only
+**Calibration.** (Amendment A1′ rule 4 replaces the bound below: the
+largest of at least 3 first-after-wipe tails plus 1.0 s, and no
+`max_stamp_gap`.) Step 1 (`phone-qa boot-timing`) sets A on the adb path only
 from reboots that got an anchor, and records their shutdown tails
 (disconnect to reset); the largest is the bound in rule 2. While it
 measures, the gap between consecutive stamps is capped at 5 s; the largest
@@ -1058,3 +1063,82 @@ tail, otherwise UNVERIFIED; the silent tail) and these:
   activity (Tailscale, T3 Code, Brave, Perch, DeskClock, the helper) needs
   the **resumed** activity of the **exact** package; a prefix match or an
   activity on top that isn't resumed never counts.
+
+## Amendment A1′: reconcile the strict anchor with the phone data
+
+Status: specified 2026-11-23 from the on-phone validation run. It replaces
+rule 2 of amendment A1 (the code review round 3 wording) wherever the two
+conflict, and the calibration of the shutdown-tail bound. Rule 1 (the
+pairing), rule 3 (only with a passing chain), rule 4 and rule 5 stand.
+
+**Data from the phone.**
+- The ramoops log has no ECC, so the marker copies arrive damaged. On one
+  real dump, the 4 copies had 2, 1, 2 and 4 wrong bytes.
+- Under the round-3 rule (exact copies only, and a fully clean tail from the
+  marker to the end of the log) essentially no adb reboot gets an anchor. In
+  three `baseline-1` captures there were 1, 4 and 68 damaged lines after the
+  marker.
+- Under commit `1faf721` (copies within 3 bit flips, the stamp read next to
+  the marker, a 50 ms live/pstore check) about 18 of 20 adb reboots got an
+  anchor. Both failures fell back to UNVERIFIED.
+- The round-2 tail bound came from one first-boot-after-wipe sample with no
+  margin. Measured first-after-wipe tails: Perch 8.52 s and 8.04 s; stock
+  build 9.08 s, 9.17 s and 9.02 s.
+
+**The rule.**
+1. **Find the marker tolerantly.** A copy matches if it is within 3 bit
+   flips of this attempt's full marker line (`bootsig.marker_offsets`).
+2. **Prove the record by its stamp, not its text.** The strictly parsed
+   printk stamp straight before a matched copy (`bootsig.stamp_before`; an
+   earlier stamp on a merged line never counts) must equal, to the
+   microsecond, one of the stamps read back live for this attempt's write.
+   A copy from another write, a nonce off by a character or a damaged stamp
+   can't do that, so it is never used. If no copy passes, the result is
+   UNVERIFIED. The marker's pstore stamp, its live pairing and its place in
+   the log all come from the last proven copy (`bootsig.proven_marker`).
+   The chain verdict uses the same proof: PASS needs an exact copy or a
+   proven one, with no new kernel session after it.
+3. **The reset comes only from the final lines** (`bootsig.final_lines`).
+   Take the last 5 strictly parsed stamps after the proven copy, skipping
+   lines that don't parse. They must not decrease, the 5 must span at most
+   1.5 s and the last 3 at most 50 ms. The reset is the final stamp minus
+   the span of the last 3. Damaged lines before the final 5 are ignored,
+   because they can't move the estimate. The final stamps must not be
+   earlier than the marker's stamp. Anything else is UNVERIFIED. There is
+   no consecutive-gap rule, so `max_stamp_gap` is gone.
+4. **The shutdown-tail bound needs at least 3 samples and a margin.**
+   `max_shutdown_tail` is the largest tail from at least 3 first adb
+   reboots after a wipe, plus 1.0 s. Each wipe gives at most one sample:
+   step 1's first adb reboot (`calibrate.first_after_wipe`), or the first
+   bench boot of a baseline or batch flash, proven the same way from the
+   flash record and dropbox. The tail is taken from an anchor judged with
+   no bound, so an out-of-bound boot still adds its sample. Samples live in
+   `$BENCH_HOME/qa/shutdown-tails.jsonl` and accumulate across runs. Step 1
+   and `phone-qa controls --boot-timing` set the bound from them. With
+   fewer than 3 samples the adb path is UNVERIFIED. The bound only rejects
+   anchors that arrive too late. Anchors now come only from proven records
+   and the final lines, so a margin can't hide an extra boot; the uptime
+   check against A still decides.
+5. **The silent tail.** Rule 2's argument in A1 still applies: a silent
+   period after the last line can only make the measured pass longer.
+
+**Tests.** Every round-3 counterexample still gives UNVERIFIED or FAIL,
+never PASS: `104.250000` → `104.050000` (both final-line sets fail rule 3),
+a nonce one character off (its stamps belong to another write), copy mixing
+(the stamp and the text of different copies never combine; every value
+comes from one copy), and every single bit flip from the marker to the end
+(the anchor is never later, and an extra-pass boot never passes). New: a
+real-style dump with all 4 copies damaged and one intact live stamp is
+anchored; a stamp 1 µs off every live stamp is rejected; damaged lines
+before the final 5 are ignored; a flip that pushes one of the final 3 lines
+more than 50 ms later is UNVERIFIED; fewer than 3 tail samples is
+UNVERIFIED.
+
+**Diagnosis.** Step 1 saves the raw pstore of every adb reboot that got no
+anchor in `$BENCH_HOME/qa/pstore-noanchor/`, with the pairing and the reason.
+
+**Phone runs still needed.** `flash --rollback` and `phone-qa boot-timing`
+straight after, repeated until there are 3 tail samples; then the anchor
+rate on the adb path and both proofs per path. If the anchor rate is below
+about 90%, the rule is not loosened; the failing pstore dumps go to the
+council.

@@ -6,7 +6,7 @@ Every planned reboot:
    fastboot path the uptime clock starts at the disconnect after the final
    ``fastboot reboot``, so time spent writing images never counts. On the adb
    path it starts at the old kernel's reset, mapped onto host time through
-   the marker's own printk timestamp (amendment A1, judge_record);
+   the marker's own printk timestamp (amendment A1′, judge_record);
 3. at boot completion reads boot_id, sys.boot_completed and /proc/uptime in
    one shell command, then judges the kernel-log chain and the uptime.
 
@@ -21,11 +21,12 @@ import time
 from dataclasses import asdict, dataclass, field
 
 from . import bootsig
-from .core import bench_path, read_json, write_json
+from .core import append_jsonl, bench_path, now_iso, read_json, read_jsonl, write_json
 from .device import Device, UsbWatcher, fastboot_ids_seen
 from .results import FAIL, PASS, UNVERIFIED, worst
 
 TIMING_FILE = "qa/boot-timing.json"
+TAIL_SAMPLES_FILE = "qa/shutdown-tails.jsonl"
 PATHS = ("adb", "fastboot")
 
 
@@ -45,6 +46,37 @@ def allowance_for(path: str, timing: dict | None = None) -> float | None:
     if p.get("A") is None or not p.get("proof_normal_pass") or not p.get("proof_control_rejected"):
         return None
     return float(p["A"])
+
+
+def load_tail_samples() -> list[dict]:
+    """The first-adb-reboot-after-wipe shutdown tails (amendment A1′ rule
+    4), one per wipe (the first recorded for a wipe wins), in the order
+    they were recorded. They accumulate across `phone-qa boot-timing` runs
+    and the first bench boot of baseline and batch flashes."""
+    out, seen = [], set()
+    for r in read_jsonl(bench_path(TAIL_SAMPLES_FILE)):
+        if r.get("wipe_seq") in seen or r.get("tail_s") is None:
+            continue
+        seen.add(r.get("wipe_seq"))
+        out.append(r)
+    return out
+
+
+def add_tail_sample(rec: dict, wipe: dict, source: str, build: str = "") -> bool:
+    """Record a boot's shutdown tail as wipe ``wipe``'s sample, if the boot
+    (``rec``, BootRecord.to_json()) got a reset anchor ignoring any bound
+    and the wipe has no sample yet. The caller has proven the boot is the
+    first adb reboot after that wipe (calibrate.first_after_wipe). True if
+    a sample was added."""
+    if rec.get("reset_tail_s") is None or rec.get("path") != "adb":
+        return False
+    if any(r.get("wipe_seq") == wipe["seq"] for r in load_tail_samples()):
+        return False
+    append_jsonl(bench_path(TAIL_SAMPLES_FILE), {
+        "wipe_seq": wipe["seq"], "wipe_how": wipe.get("how"), "tail_s": rec["reset_tail_s"],
+        "source": source, "build": build, "boot_id_before": rec.get("boot_id_before"),
+        "marker": rec.get("marker"), "at": now_iso()})
+    return True
 
 
 def chain_survives(path: str, timing: dict | None = None) -> bool | None:
@@ -80,6 +112,7 @@ class BootRecord:
     elapsed_disconnect: float = 0.0
     anchor: dict | None = None
     anchor_note: str = ""
+    reset_tail_s: float | None = None   # disconnect to reset, from an anchor judged with no bound (A1′ rule 4)
     pstore_read_error: str = ""         # non-empty: the checked pstore read failed (review round 2)
 
     def to_json(self):
@@ -272,17 +305,11 @@ def inject_reboot_before_completion(dev: Device, seconds: float, watcher: UsbWat
 
 
 def tail_bound(rec: BootRecord, timing: dict) -> tuple[float, float] | None:
-    """(disconnect, disconnect + the largest calibrated shutdown tail) for
-    the adb path, or None if calibration recorded no tail."""
+    """(disconnect, disconnect + max_shutdown_tail) for the adb path, or
+    None if calibration recorded no bound (fewer than
+    bootsig.MIN_TAIL_SAMPLES first-after-wipe tails)."""
     tail = ((timing.get("paths") or {}).get(rec.path) or {}).get("max_shutdown_tail")
     return None if tail is None else (rec.disconnect_mono, rec.disconnect_mono + float(tail))
-
-
-def stamp_gap_bound(rec: BootRecord, timing: dict) -> float | None:
-    """The calibrated largest gap between consecutive stamps in a clean
-    shutdown tail (review round 3), or None if calibration recorded none."""
-    g = ((timing.get("paths") or {}).get(rec.path) or {}).get("max_stamp_gap")
-    return None if g is None else float(g)
 
 
 def judge_signals(dev: Device, rec: BootRecord, timing: dict | None = None, *, measuring: bool = False) -> None:
@@ -302,15 +329,16 @@ def judge_record(rec: BootRecord, log: bytes | None, timing: dict, *, measuring:
     """The verdicts for one boot from its pstore log. Pure.
 
     The fastboot path keeps the disconnect clock. The adb path starts the
-    clock at the old kernel's reset (amendment A1): only if this boot's chain
-    is PASS, the marker write was paired with its printk timestamp, the
-    tail after the one intact marker record is clean (bootsig.clean_tail,
-    with the calibrated stamp-gap bound) and the anchor falls inside the
-    calibrated shutdown tail. Otherwise its uptime signal is UNVERIFIED; it
-    never falls back to the disconnect.
-    ``measuring``: step 1 before anything is calibrated (no tail bound, the
-    gap ceiling bootsig.MEASURE_MAX_GAP_S)."""
-    rec.chain = bootsig.chain_verdict(log, rec.marker)
+    clock at the old kernel's reset (amendment A1′): only if this boot's
+    chain is PASS, the marker write was paired with its printk stamps, a
+    marker copy is proven by its stamp and the log's final lines give a
+    reset (bootsig.reset_anchor), and the anchor falls inside the
+    calibrated shutdown-tail bound. Otherwise its uptime signal is
+    UNVERIFIED; it never falls back to the disconnect.
+    rec.reset_tail_s records the tail of an anchor judged with no bound, so
+    a first-after-wipe boot can add its sample even when it is out of bound.
+    ``measuring``: step 1 before anything is calibrated (no tail bound)."""
+    rec.chain = bootsig.chain_verdict(log, rec.marker, rec.marker_pair)
     if rec.pstore_read_error:
         rec.chain = (UNVERIFIED, f"pstore read failed: {rec.pstore_read_error}")
     allowance = allowance_for(rec.path, timing)
@@ -320,19 +348,24 @@ def judge_record(rec: BootRecord, log: bytes | None, timing: dict, *, measuring:
                                                   rec.unplanned_fastboot)
         return
     anchor, why = None, ""
+    rec.reset_tail_s = None
     if rec.chain[0] != PASS:
         why = f"chain is {rec.chain[0]}, so there is no reset anchor"
     elif not rec.marker_pair:
         why = "the leaving marker was not paired with its printk timestamp"
     else:
-        bound = None if measuring else tail_bound(rec, timing)
-        gap = bootsig.MEASURE_MAX_GAP_S if measuring else stamp_gap_bound(rec, timing)
-        if bound is None and not measuring:
-            why = "no calibrated shutdown tail for the adb path"
-        elif gap is None:
-            why = "no calibrated stamp-gap bound for the adb path"
-        else:
-            anchor, why = bootsig.reset_anchor(log, rec.marker, rec.marker_pair, bound, gap)
+        anchor, why = bootsig.reset_anchor(log, rec.marker, rec.marker_pair)
+        if anchor is not None:
+            rec.reset_tail_s = round(anchor["host_mono"] - rec.disconnect_mono, 3)
+            if not measuring:
+                bound = tail_bound(rec, timing)
+                if bound is None:
+                    anchor, why = None, ("no calibrated shutdown-tail bound for the adb path (needs "
+                                         f"{bootsig.MIN_TAIL_SAMPLES} first-adb-reboot-after-wipe samples)")
+                else:
+                    out = bootsig.check_tail_bound(anchor, bound)
+                    if out:
+                        anchor, why = None, out
     rec.anchor_note = why
     if anchor is None:
         rec.clock_source = "none"
@@ -341,7 +374,7 @@ def judge_record(rec: BootRecord, log: bytes | None, timing: dict, *, measuring:
                             if rec.unplanned_fastboot else (UNVERIFIED, f"adb path: {why}"))
         return
     rec.clock_source = "reset-anchor"
-    anchor["tail_s"] = round(anchor["host_mono"] - rec.disconnect_mono, 3)
+    anchor["tail_s"] = rec.reset_tail_s
     rec.anchor = anchor
     rec.elapsed = rec.completed_mono - anchor["host_mono"]
     rec.bootloader_pass = round(rec.elapsed - rec.uptime, 3)

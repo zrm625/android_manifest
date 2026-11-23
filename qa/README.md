@@ -92,19 +92,21 @@ Groups: `preflight`, `identity`, `health`, `radios`, `hardware`, `system`,
 
 The steps run in this order (DESIGN.md, "Calibration and bootstrap"):
 
-1. `flash --wipe` the known-good build, then run `phone-qa boot-timing`
-   straight away, before any other adb reboot. It flashes nothing itself and
-   writes `$BENCH_HOME/qa/boot-timing.json`. Until both proofs pass for a
-   reboot path, the uptime signal on that path is UNVERIFIED. On the adb path
-   the clock starts at the old kernel's reset ([amendment
-   A1](DESIGN.md#amendment-a1-the-adb-path-uptime-clock)); only reboots that
-   got a reset anchor set A, and their largest shutdown tail becomes the bound
-   for every later anchor. The first adb reboot after a wipe (every batch's
-   first bench boot) has the longest tail, so the bound is set only if that
-   reboot, step 1's first adb reboot, got an anchor; otherwise the adb path
-   has no bound and its uptime signal stays UNVERIFIED. A later boot with a
-   slower tail than the bound is UNVERIFIED, never PASS. Changing this file
-   changes the harness version.
+1. `flash --rollback` (a wipe of the known-good build), then run `phone-qa
+   boot-timing` straight away, before any other adb reboot. It flashes
+   nothing itself and writes `$BENCH_HOME/qa/boot-timing.json`. Until both
+   proofs pass for a reboot path, the uptime signal on that path is
+   UNVERIFIED. On the adb path the clock starts at the old kernel's reset
+   ([amendment A1](DESIGN.md#amendment-a1-the-adb-path-uptime-clock), read as
+   amendment A1′ says); only reboots that got a reset anchor set A. The
+   first adb reboot after a wipe (every batch's first bench boot) has the
+   longest shutdown tail, so each run records that reboot's tail as the
+   wipe's sample. The bound for every later anchor is the largest of at
+   least 3 such samples plus 1.0 s, so repeat the wipe and `boot-timing`
+   until there are 3; until then the adb path has no bound and its uptime
+   signal stays UNVERIFIED. A later boot with a slower tail than the bound
+   is UNVERIFIED, never PASS. Changing `boot-timing.json` changes the
+   harness version.
 2. The baseline: build `river-22.2` HEAD with `scripts/build`, then:
 
    ```sh
@@ -167,7 +169,10 @@ order, and start again from the step that changed if anything in that list
 changes:
 
 1. Freeze the harness: no more commits to `qa/` or `scripts/phone-qa`.
-2. `flash --wipe` the known-good build, then `phone-qa boot-timing` (step 1).
+2. `flash --rollback` (it wipes the known-good build without writing the
+   other slot), then `phone-qa boot-timing` (step 1) straight away. Repeat
+   until step 1 has at least 3 first-adb-reboot-after-wipe tail samples
+   (amendment A1′); its summary prints how many it has.
 3. The baseline (step 2). It writes `calibration_seed`.
 4. Perch calibration and thresholds (steps 3 and 4). Writing
    `thresholds.json` is the last change to a version input.
@@ -203,57 +208,63 @@ changes:
 9. Check that `phone-qa version` still prints the version from step 6 and
    that `phone-qa controls` exits 0.
 
-Step 2 is needed again after any change to the A1 anchor code (code review
-round 3 made it strict and added the calibrated `max_stamp_gap`): a
-`boot-timing.json` from older code has no `max_stamp_gap`, so the adb path
-stays UNVERIFIED until step 1 runs again straight after `flash --wipe`.
-Step 1 now takes "the first adb reboot after a wipe" from the flash record:
-`flash` records the boot_id of the first boot after every wipe in
-`wipes.jsonl`, and step 1's first adb reboot counts only if it rebooted from
-that boot and dropbox holds exactly one `SYSTEM_BOOT`.
+Step 2 is needed again after any change to the A1′ anchor code. Its tail
+samples are kept in `$BENCH_HOME/qa/shutdown-tails.jsonl`, one per wipe, and
+carry over between runs; delete the file if a change to the anchor rule makes
+the old tails wrong. Samples judged before A1′ (in old `boot-timing.json`
+files) are not read. Step 1 takes "the first adb reboot after a wipe" from
+the flash record: `flash` and `flash --rollback` record the boot_id of the
+first boot after every wipe in `wipes.jsonl`, and step 1's first adb reboot
+counts only if it rebooted from that boot and dropbox holds exactly one
+`SYSTEM_BOOT`. The first bench boot of a baseline or batch flash adds a
+sample the same way; `phone-qa controls --boot-timing` renews the bound from
+the samples before it proves.
 
-## The uptime clock on the adb reboot path (amendment A1)
+## The uptime clock on the adb reboot path (amendments A1 and A1′)
 
 The first baseline (`baseline-1`, 2026-11-23) showed that the USB gadget
 drops several seconds before the kernel resets, so a clock that starts at the
 USB disconnect includes a variable shutdown tail, and no allowance A could
 separate a normal boot from one with an extra bootloader pass. Amendment A1
-(DESIGN.md) starts the adb-path clock at the old kernel's reset instead:
+(DESIGN.md) starts the adb-path clock at the old kernel's reset instead.
+Amendment A1′ sets how the reset is read from pstore, which ramoops damages:
 
 - the leaving marker's host write time is paired with its own printk
-  timestamp, read back from `dmesg`;
-- the marker is found in pstore by an exact match only: the last intact copy
-  (strict stamp, full marker, end of line). Its stamp must equal one of the
-  readback's copy stamps to the microsecond, and the gap to the reset is
-  measured inside pstore from it;
-- the reset is the stamp of the log's final line, and only if the tail after
-  that record is clean: every line's stamp parses strictly, stamps never
-  decrease, no gap exceeds the calibrated `max_stamp_gap`, the last 5 lines
-  span at most 1.5 s and the last 3 at most 50 ms. Anything else is
-  UNVERIFIED, so ramoops corruption means a rerun, never a different anchor;
-- it must fall between the USB disconnect and the disconnect plus the largest
-  calibrated shutdown tail;
-- it is used only when that boot's chain is PASS. Otherwise the adb-path
-  uptime signal is UNVERIFIED; it never falls back to the disconnect.
+  stamps (one per copy), read back from `dmesg`;
+- a copy of the marker in pstore is found tolerantly (within 3 bit flips),
+  but counts only if the strictly parsed stamp next to it equals one of
+  those live stamps to the microsecond. A copy from another write, a nonce
+  off by a character or a damaged stamp can't do that. The marker's pstore
+  stamp, its pairing and its place in the log all come from the last such
+  copy; with none, the boot is UNVERIFIED;
+- the reset comes only from the log's final 5 strictly parsed stamps after
+  that copy. They must not decrease, must span at most 1.5 s, and the last
+  3 at most 50 ms. Damaged lines before them are ignored. The reset is the
+  final stamp less the span of the last 3;
+- it must fall between the USB disconnect and the disconnect plus
+  `max_shutdown_tail`: the largest of at least 3 first-adb-reboot-after-wipe
+  tails plus 1.0 s. With fewer than 3 samples the adb path is UNVERIFIED;
+- it is used only when that boot's chain is PASS (an exact copy, or a copy
+  proven by its stamp). Otherwise the adb-path uptime signal is UNVERIFIED;
+  it never falls back to the disconnect.
 
 The fastboot path keeps the disconnect clock (10.01-10.08 s, stable). The
-measurements behind the change are in `$BENCH_HOME/qa/anchor-experiment.json`.
-`boot-timing` has to be re-run on the phone before the new clock is usable.
+measurements behind A1 are in `$BENCH_HOME/qa/anchor-experiment.json`.
+`boot-timing` saves the raw pstore of every adb reboot that got no anchor in
+`$BENCH_HOME/qa/pstore-noanchor/`.
 
 ## Known issues
 
-- **Damaged pstore stamps make adb boots UNVERIFIED.** ramoops has no ECC.
-  On the three `baseline-1` adb captures, 1, 4 and 68 lines after the marker
-  had a damaged stamp, so none would get an anchor under the strict
-  clean-tail rule. Expect adb-path uptime signals to be UNVERIFIED often,
-  and reruns. See DESIGN.md, amendment A1, rule 2.
-
-- **The shutdown-tail bound comes from step 1 only.** The bound is the
-  largest tail among step 1's normal adb reboots, which must include the
-  first adb reboot after a wipe (F1). A later build with a longer shutdown
-  would make its anchors out of bounds, and its bench boots UNVERIFIED
-  (never PASS). If that happens, `flash --wipe` and re-run `boot-timing`,
-  with more normal reboots if needed (`--normal N`).
+- **Some adb boots get no anchor.** ramoops has no ECC. If every copy of the
+  marker has a damaged stamp, or one of the final 5 lines is damaged in a
+  way that breaks the rule, the boot is UNVERIFIED and is rerun. Under the
+  rule A1′ is based on, about 18 of 20 adb reboots got an anchor. See
+  DESIGN.md, amendment A1′.
+- **The shutdown-tail bound needs 3 wipes.** Each wipe gives one sample
+  (the first adb reboot after it). A later build with a longer shutdown
+  makes its anchors out of bounds and its bench boots UNVERIFIED (never
+  PASS); its own first bench boot adds a sample, and `phone-qa controls
+  --boot-timing` renews the bound.
 - **Camera-set approvals and the gh account.** The approval must be a
   comment or review by `zrm625` on one of the batch's own PRs, naming the new
   set on a line `approve camera set: 0,1,2`. `gh` on forge is logged in as
@@ -300,7 +311,7 @@ measurements behind the change are in `$BENCH_HOME/qa/anchor-experiment.json`.
 | `qa/tests/` | Host-side unit tests (`unittest`) |
 | `$BENCH_HOME/batches/<id>/` | `batch.json`, staged images, `flash.json`, per-boot evidence under `boots/` |
 | `$BENCH_HOME/slot-state.json` | The slot pair and `known_good_slot` |
-| `$BENCH_HOME/qa/` | `known-good.json`, `boot-timing.json`, `controls.json`, `calibration.json`, `journal.json`, `wipes.jsonl`, `history.jsonl`, `runs/` |
+| `$BENCH_HOME/qa/` | `known-good.json`, `boot-timing.json`, `shutdown-tails.jsonl`, `pstore-noanchor/`, `controls.json`, `calibration.json`, `journal.json`, `wipes.jsonl`, `history.jsonl`, `runs/` |
 
 ## Interfaces for the batch runner
 

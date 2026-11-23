@@ -140,13 +140,21 @@ def record(**kw):
 
 
 TIMING = {"paths": {"adb": {"A": 12.0, "proof_normal_pass": True, "proof_control_rejected": True,
-                            "max_shutdown_tail": 6.5, "max_stamp_gap": 1.5}}}
+                            "max_shutdown_tail": 6.5}}}
 # 100.5 ... 109.5 every 0.5 s, then the three reset lines within a millisecond
 # (river: "SMP: failed to stop", "Going down for restart now", "configuring PO").
 END = [110.0, 110.0003, 110.0006]
 NORMAL = [100.5 + i * 0.5 for i in range(19)] + END
 # The reset is the final line: host 1000 + 10.0006 - 0.05 (half-width) - 0.0006 (last-3 span).
 NORMAL_ANCHOR = 1009.95
+
+
+def flip_bytes(text: bytes, positions) -> bytes:
+    """``text`` with one bit flipped in each byte at ``positions``."""
+    out = bytearray(text)
+    for p in positions:
+        out[p] ^= 0x04
+    return bytes(out)
 
 
 class StrictParse(unittest.TestCase):
@@ -168,55 +176,89 @@ class StrictParse(unittest.TestCase):
                          [192.533183, 192.534649])
         self.assertEqual(b.line_stamps(b"[  100.000000] x\x8a[  100.500000] y"), [100.0, 100.5])
 
-    def test_marker_record_is_an_exact_whole_line(self):
+
+class ProvenMarker(unittest.TestCase):
+    """A1′ rules 1-2: find copies tolerantly, prove one by its stamp."""
+
+    def test_last_proven_copy(self):
         log = shutdown_log(NORMAL, copies=4)
-        off, ts = b.marker_record(log, MARKER)
-        self.assertAlmostEqual(ts, 100.0 + 3 * COPY_STEP)          # the last intact copy
-        self.assertTrue(log[off:].startswith(b"[  100.000090] " + MARKER.encode() + b"\n"))
-        # A copy whose stamp or text is damaged is not a record.
-        self.assertIsNone(b.marker_record(log.replace(MARKER.encode(), b"RQM:11111111:aaaaaaab"), MARKER))
-        one = shutdown_log(NORMAL).replace(b"[  100.000000] RQM", b"[  100/000000] RQM")
-        self.assertIsNone(b.marker_record(one, MARKER))
+        (off, ts), _ = b.proven_marker(log, MARKER, copies_at(100.0, 4))
+        self.assertAlmostEqual(ts, 100.0 + 3 * COPY_STEP)          # the last proven copy
+        self.assertTrue(log[off:].startswith(MARKER.encode()))
+        self.assertEqual(log[off - 15:off], b"[  100.000090] ")
+
+    def test_damaged_text_within_three_flips_is_found(self):
+        for n in (1, 2, 3):
+            log = shutdown_log(NORMAL).replace(MARKER.encode(), flip_bytes(MARKER.encode(), range(4, 4 + n)))
+            rec, why = b.proven_marker(log, MARKER, [100.0])
+            self.assertIsNotNone(rec, (n, why))
+        log = shutdown_log(NORMAL).replace(MARKER.encode(), flip_bytes(MARKER.encode(), range(4, 8)))
+        self.assertIsNone(b.proven_marker(log, MARKER, [100.0])[0])     # 4 flips: not a copy
+
+    def test_damaged_stamp_is_not_proof(self):
+        for bad in (b"[  100/000000] RQM", b"[ 0100.000000] RQM", b"[  100.000000]\xa0RQM"):
+            log = shutdown_log(NORMAL).replace(b"[  100.000000] RQM", bad)
+            rec, why = b.proven_marker(log, MARKER, [100.0])
+            self.assertIsNone(rec, bad)
+            self.assertIn("not proven the same write", why)
+
+    def test_stamp_off_by_one_microsecond_is_rejected(self):
+        log = shutdown_log(NORMAL, marker_ts=100.000001)
+        rec, why = b.proven_marker(log, MARKER, [100.0, 100.000002])
+        self.assertIsNone(rec)
+        self.assertIn("100.000001", why)
+
+    def test_merged_line_uses_the_stamp_next_to_the_marker(self):
+        # The newline before the marker flipped, so its line starts with an
+        # earlier message: only the stamp next to the marker counts.
+        for joined in (b"init[  100.000000]", b"init\x8a[  100.000000]"):
+            log = shutdown_log(NORMAL).replace(b"init\n[  100.000000]", joined)
+            self.assertEqual(b.proven_marker(log, MARKER, [100.0])[0][1], 100.0)
+        # An earlier stamp on the line is never used in place of a damaged one.
+        log = shutdown_log(NORMAL).replace(b"init\n[  100.000000] RQM", b"init [    1.000000]\x8a  RQM")
+        self.assertIsNone(b.proven_marker(log, MARKER, [1.0, 100.0])[0])
 
 
-class CleanTail(unittest.TestCase):
-    def tail(self, stamps, gap=1.5):
-        log = shutdown_log(stamps)
-        return b.clean_tail(log, b.marker_record(log, MARKER)[0], gap)
+class FinalLines(unittest.TestCase):
+    """A1′ rule 3: the reset comes only from the final lines."""
+
+    def final(self, log):
+        (off, _ts), _ = b.proven_marker(log, MARKER, [100.0])
+        return b.final_lines(log, off + len(MARKER))
 
     def test_clean(self):
-        ts, why = self.tail(NORMAL)
-        self.assertEqual(ts[-1], 110.0006, why)
+        ts, why = self.final(shutdown_log(NORMAL))
+        self.assertEqual(ts, [109.0, 109.5, 110.0, 110.0003, 110.0006], why)
 
     def test_each_rule(self):
         cases = {
-            "decrease": NORMAL[:10] + [NORMAL[9] - 0.1] + NORMAL[10:],
-            "gap": [100.5, 103.0] + [103.0 + i * 0.5 for i in range(1, 12)] + [109.0, 109.0003, 109.0006],
+            "decrease": NORMAL[:-2] + [109.9, 110.0006],
             "end window": NORMAL[:-3] + [111.2, 111.2003, 111.2006],     # last 5 span 2.2 s
             "final window": NORMAL[:-1] + [110.07],                     # last 3 span 70 ms
             "too short": [100.5, 100.5003, 100.5006],
         }
         for name, stamps in cases.items():
-            ts, why = self.tail(stamps)
+            ts, why = self.final(shutdown_log(stamps))
             self.assertIsNone(ts, name)
             self.assertTrue(why, name)
 
-    def test_any_damaged_line_is_unclean(self):
+    def test_damaged_lines_before_the_final_5_are_ignored(self):
         log = shutdown_log(NORMAL)
-        start = b.marker_record(log, MARKER)[0]
-        for old, new in ((b"[  105.000000]", b"[  105\xae000000]"),       # mid-tail stamp damaged
+        for old, new in ((b"[  105.000000]", b"[  105\xae000000]"),
                          (b"[  105.000000]", b"[ 0105.000000]"),
                          (b"[  105.000000]", b"K  105.000000]"),
-                         (b"step\n[  105.000000]", b"step\x8a[ 0105.000000]")):
-            bad = log.replace(old, new)
-            self.assertIsNone(b.clean_tail(bad, start, 1.5)[0], new)
-        # A missing or flipped newline alone is not a damaged stamp.
-        for new in (b"step[  105.000000]", b"step\x8a[  105.000000]"):
-            ts, why = b.clean_tail(log.replace(b"step\n[  105.000000]", new), start, 1.5)
-            self.assertEqual(ts[-1], 110.0006, why)
-        # The marker record may itself follow a record with no newline.
-        joined = log.replace(b"init\n[  100.000000]", b"init[  100.000000]")
-        self.assertEqual(b.marker_record(joined, MARKER)[1], 100.0)
+                         (b"[  105.000000]", b"[  145.000000]"),        # still parses, out of order
+                         (b"step\n[  105.000000]", b"step\x8a[ 0105.000000]"),
+                         (b"step\n[  105.000000]", b"step[  105.000000]"),
+                         (b"[  108.500000]", b"[  108.5\x80\x80\x80\x80\x80]")):
+            ts, why = self.final(log.replace(old, new))
+            self.assertEqual(ts, [109.0, 109.5, 110.0, 110.0003, 110.0006], (new, why))
+
+    def test_a_long_quiet_stretch_before_the_final_lines_is_fine(self):
+        # No consecutive-gap rule (R3-1's max_stamp_gap is gone): only the
+        # final lines decide.
+        ts, why = self.final(shutdown_log([100.5, 107.0, 109.0, 109.5] + END))
+        self.assertEqual(ts[-1], 110.0006, why)
 
 
 class Anchor(unittest.TestCase):
@@ -231,6 +273,7 @@ class Anchor(unittest.TestCase):
         self.assertAlmostEqual(rec.anchor["host_mono"], NORMAL_ANCHOR)
         self.assertAlmostEqual(rec.bootloader_pass, 10.05, places=2)
         self.assertEqual(rec.uptime_check[0], PASS)
+        self.assertAlmostEqual(rec.reset_tail_s, NORMAL_ANCHOR - 1005.0, places=3)
 
     def test_four_copies_pair_by_the_microsecond(self):
         rec = self.judge(record(marker_pair=pair_for(copies=4)), shutdown_log(NORMAL, copies=4))
@@ -241,89 +284,145 @@ class Anchor(unittest.TestCase):
         rec = self.judge(record(uptime=26.0), shutdown_log(NORMAL))
         self.assertEqual(rec.uptime_check[0], FAIL)
 
-    def test_sol_104_25_to_104_05(self):
-        # Sol's round-3 counterexample. The true tail is unclean (104.25 then
-        # 104.1); the old rule anchored at 100.1. Flipping 104.250000 to
-        # 104.050000 made a later run qualify, moved the anchor to 103.1 and
-        # turned FAIL into PASS. Now both are UNVERIFIED with no anchor.
-        true = [100.1, 100.2, 100.3, 103.1, 104.25, 104.1]
-        flipped = [100.1, 100.2, 100.3, 103.1, 104.05, 104.1]
-        timing = {"paths": {"adb": dict(TIMING["paths"]["adb"], max_shutdown_tail=10.0, max_stamp_gap=5.0)}}
-        for tail in (true, flipped):
-            for measuring in (False, True):
-                rec = self.judge(record(uptime=36.0), shutdown_log(tail), timing, measuring)
-                self.assertEqual(rec.uptime_check[0], UNVERIFIED, (tail, measuring))
-                self.assertIsNone(rec.anchor)
-                self.assertIn("not clean", rec.anchor_note)
-
-    def test_nonce_one_character_off_is_unverified(self):
-        # The log holds a marker one nonce character away from this boot's
-        # (another write). Fuzzy matching used to take it and PASS.
-        other = "RQM:11111112:aaaaaaaa"
-        log = shutdown_log(NORMAL, copies=4, marker=other)
+    def test_real_style_dump_all_copies_damaged(self):
+        # A1′ data: on a real dump the 4 copies had 2, 1, 2 and 4 wrong
+        # bytes. The 4-byte one is not a copy; the stamps of copies 1 and 3
+        # are damaged; copy 2 keeps a stamp equal to a live one: it is used.
+        m = MARKER.encode()
+        log = line(0.0, b"Linux version 4.9.337") + line(1.0, b"init")
+        log += b"[  100.00\xb0000] " + flip_bytes(m, (5, 17)) + b"\n"
+        log += b"[  100.000030] " + flip_bytes(m, (9,)) + b"\n"
+        log += b"[\xa0 100.000060] " + flip_bytes(m, (4, 20)) + b"\n"
+        log += b"[  100.000090] " + flip_bytes(m, (4, 8, 12, 16)) + b"\n"
+        log += b"".join(line(t, b"shutdown step") for t in NORMAL)
+        self.assertEqual(log.count(m), 0)
         rec = self.judge(record(marker_pair=pair_for(copies=4)), log)
-        self.assertEqual(rec.chain[0], UNVERIFIED)
-        self.assertEqual(rec.uptime_check[0], UNVERIFIED)
-        self.assertIsNone(rec.anchor)
-        anchor, why = b.reset_anchor(log, MARKER, pair_for(copies=4), None, 1.5)
-        self.assertIsNone(anchor)
-        self.assertIn("no intact exact copy", why)
+        self.assertEqual(rec.chain[0], PASS, rec.chain)
+        self.assertEqual(rec.clock_source, "reset-anchor", rec.anchor_note)
+        self.assertAlmostEqual(rec.anchor["marker_ts"], 100.00003)
+        self.assertEqual(rec.uptime_check[0], PASS)
+        # Without the live readback the damaged copies prove nothing.
+        self.assertEqual(b.chain_verdict(log, MARKER)[0], UNVERIFIED)
 
-    def test_river_step1_flips_are_unverified_not_fuzzy(self):
-        # The 2026-11-23 step-1 log (qa-harness-r1 1faf721): the only exact
-        # copy has a damaged stamp; the other copies keep their stamps but
-        # have flipped marker bytes. Round 3 forbids taking a stamp from a
-        # fuzzy copy, so this boot is UNVERIFIED and is rerun.
+    def test_river_step1_dump(self):
+        # The 2026-11-23 step-1 log behind 1faf721: the only exact copy has a
+        # damaged stamp; a fuzzy copy's stamp is 1 us off every live stamp
+        # (rejected, where 1faf721's 50 ms check took it); the third copy's
+        # stamp equals a live one, so it is the record.
         log = line(0.0, b"Linux version 4.9.337") + line(1.0, b"init")
         log += b"[\xa0 100.00\xb3000] " + MARKER.encode() + b"\n"
         log += line(100.000031, MARKER.replace(":1111", ":1i11").encode())
         log += line(100.00006, MARKER.replace(":", "\xaa", 1).encode("latin-1"))
         log += b"".join(line(t, b"shutdown step") for t in NORMAL)
         pair = pair_for(copies=3)
-        anchor, why = b.reset_anchor(log, MARKER, pair, None, 1.5)
-        self.assertIsNone(anchor)
-        self.assertIn("no intact exact copy", why)
+        anchor, why = b.reset_anchor(log, MARKER, pair)
+        self.assertAlmostEqual(anchor["marker_ts"], 100.00006, msg=why)
         rec = self.judge(record(marker_pair=pair), log)
+        self.assertEqual(rec.uptime_check[0], PASS, rec.anchor_note)
+        # Only the 1-us-off copy left: rejected.
+        log2 = log.replace(MARKER.replace(":", "\xaa", 1).encode("latin-1"), b"other message here...")
+        anchor, why = b.reset_anchor(log2, MARKER, pair)
+        self.assertIsNone(anchor)
+        self.assertIn("not proven the same write", why)
+
+    def test_sol_104_25_to_104_05(self):
+        # Sol's round-3 counterexample. The true tail is unclean (104.25 then
+        # 104.1); the old rule anchored at 100.1. Flipping 104.250000 to
+        # 104.050000 made a later run qualify, moved the anchor to 103.1 and
+        # turned FAIL into PASS. Under A1′ both final-line sets fail rule 3.
+        true = [100.1, 100.2, 100.3, 103.1, 104.25, 104.1]
+        flipped = [100.1, 100.2, 100.3, 103.1, 104.05, 104.1]
+        timing = {"paths": {"adb": dict(TIMING["paths"]["adb"], max_shutdown_tail=10.0)}}
+        for tail in (true, flipped):
+            for measuring in (False, True):
+                rec = self.judge(record(uptime=36.0), shutdown_log(tail), timing, measuring)
+                self.assertEqual(rec.uptime_check[0], UNVERIFIED, (tail, measuring))
+                self.assertIsNone(rec.anchor)
+                self.assertIn("final lines give no reset", rec.anchor_note)
+
+    def test_nonce_one_character_off_is_unverified(self):
+        # The log holds only another write's marker, one nonce character
+        # away from this boot's. Its copies are found (1 flip) but their
+        # stamps belong to that write, not this one: never used.
+        other = "RQM:11111112:aaaaaaaa"
+        log = shutdown_log(NORMAL, marker_ts=99.0, copies=4, marker=other)
+        rec = self.judge(record(marker_pair=pair_for(copies=4)), log)
+        self.assertEqual(rec.chain[0], UNVERIFIED)
         self.assertEqual(rec.uptime_check[0], UNVERIFIED)
+        self.assertIsNone(rec.anchor)
+        anchor, why = b.reset_anchor(log, MARKER, pair_for(copies=4))
+        self.assertIsNone(anchor)
+        self.assertIn("not proven the same write", why)
+        # Both writes in the log: only this write's copy is the record.
+        both = shutdown_log(NORMAL, copies=1).replace(
+            b"[  100.000000] ", b"[   99.000000] " + other.encode() + b"\n[  100.000000] ")
+        anchor, why = b.reset_anchor(both, MARKER, pair_for())
+        self.assertEqual(anchor["marker_ts"], 100.0, why)
 
     def test_copy_mixing(self):
-        # Copy 1 has a good stamp but a damaged nonce; copy 2 has the exact
-        # text but a damaged stamp. Nothing may combine the two.
-        log = shutdown_log(NORMAL, copies=2, marker=MARKER)
-        log = log.replace(b"[  100.000000] " + MARKER.encode(), b"[  100.000000] RQM:11111311:aaaaaaaa")
-        log = log.replace(b"[  100.000030] ", b"[  100.0\xb00030] ")
-        anchor, why = b.reset_anchor(log, MARKER, pair_for(copies=2), None, 1.5)
+        # Copy 1 has the exact text but a damaged stamp; copy 2 has its live
+        # stamp but text 4 flips away (not a copy). Nothing may combine the
+        # stamp of one with the text of the other.
+        m = MARKER.encode()
+        log = shutdown_log(NORMAL, copies=2)
+        log = log.replace(b"[  100.000000] " + m, b"[  100.0\xb00000] " + m)
+        log = log.replace(b"[  100.000030] " + m, b"[  100.000030] " + flip_bytes(m, (4, 8, 12, 16)))
+        anchor, why = b.reset_anchor(log, MARKER, pair_for(copies=2))
         self.assertIsNone(anchor)
-        self.assertIn("no intact exact copy", why)
-        # The exact copy's stamp is strict but flipped (30 -> 70 us): it is
-        # not one of the live stamps, so it is not the same write.
-        log2 = shutdown_log(NORMAL, copies=2).replace(b"[  100.000030] ", b"[  100.000070] ")
-        anchor, why = b.reset_anchor(log2, MARKER, pair_for(copies=2), None, 1.5)
+        self.assertIn("not proven the same write", why)
+        # Copy 1: live stamp, one flipped nonce byte. Copy 2: exact text, a
+        # strict stamp that is not live (30 -> 70 us). Every value comes from
+        # copy 1, including its place in the log.
+        log2 = shutdown_log(NORMAL, copies=2)
+        log2 = log2.replace(b"[  100.000000] " + m, b"[  100.000000] RQM:11111311:aaaaaaaa")
+        log2 = log2.replace(b"[  100.000030] ", b"[  100.000070] ")
+        anchor, why = b.reset_anchor(log2, MARKER, pair_for(copies=2))
+        self.assertEqual(anchor["marker_ts"], 100.0, why)
+        self.assertEqual(log2[anchor["marker_offset"] - 15:anchor["marker_offset"]], b"[  100.000000] ")
+        # A single exact copy whose stamp is not live: not the same write.
+        log3 = shutdown_log(NORMAL).replace(b"[  100.000000] ", b"[  100.000040] ")
+        anchor, why = b.reset_anchor(log3, MARKER, pair_for())
         self.assertIsNone(anchor)
-        self.assertIn("not the same write", why)
+        self.assertIn("not proven the same write", why)
+
+    def flips(self, log, start):
+        for i in range(start, len(log)):
+            for bit in range(8):
+                bad = bytearray(log)
+                bad[i] ^= 1 << bit
+                yield i, bit, bytes(bad)
 
     def test_every_single_bit_flip_never_moves_the_anchor_later(self):
         # Flip each bit of each byte from the marker copies to the end, one
         # at a time. A flip may make the boot UNVERIFIED, never give a later
-        # anchor. Any intact copy gives a valid earliest time (every copy was
+        # anchor. Any proven copy gives a valid earliest time (every copy was
         # written inside the paired bracket), so the oracle is the true
         # final stamp mapped through the earliest copy.
         pair = pair_for(copies=4)
         log = shutdown_log(NORMAL, copies=4)
         start = log.index(b"[  100.000000]")
         oracle = pair["host_mono"] - pair["half_width"] + (NORMAL[-1] - min(pair["printk_ts_all"]))
-        clean, _ = b.reset_anchor(log, MARKER, pair, None, 1.5)
+        clean, _ = b.reset_anchor(log, MARKER, pair)
         self.assertLessEqual(clean["host_mono"], oracle + 1e-9)
         anchored = 0
-        for i in range(start, len(log)):
-            for bit in range(8):
-                bad = bytearray(log)
-                bad[i] ^= 1 << bit
-                got, _ = b.reset_anchor(bytes(bad), MARKER, pair, None, 1.5)
-                if got is not None:
-                    anchored += 1
-                    self.assertLessEqual(got["host_mono"], oracle + 1e-9, (i, bit, bytes(bad[i - 8:i + 8])))
+        for i, bit, bad in self.flips(log, start):
+            got, _ = b.reset_anchor(bad, MARKER, pair)
+            if got is not None:
+                anchored += 1
+                self.assertLessEqual(got["host_mono"], oracle + 1e-9, (i, bit, bad[i - 8:i + 8]))
         self.assertGreater(anchored, 0)        # flips in message text leave the anchor alone
+
+    def test_every_single_bit_flip_never_passes_an_extra_pass(self):
+        # The same sweep on a boot with an extra bootloader pass (FAIL when
+        # clean): no single flip from the marker to the end gives PASS.
+        pair = pair_for(copies=4)
+        log = shutdown_log(NORMAL, copies=4)
+        start = log.index(b"[  100.000000]")
+        self.assertEqual(self.judge(record(marker_pair=pair, uptime=26.0), log).uptime_check[0], FAIL)
+        for i, bit, bad in self.flips(log, start):
+            for measuring in (False, True):
+                rec = self.judge(record(marker_pair=pair, uptime=26.0), bad, TIMING, measuring)
+                self.assertNotEqual(rec.uptime_check[0], PASS, (i, bit, bad[i - 8:i + 8]))
 
     def test_flips_that_still_parse_do_not_pass(self):
         # 110.000600 read back as 118.000600, and 41.1 as 45.1: never PASS.
@@ -341,18 +440,28 @@ class Anchor(unittest.TestCase):
         self.assertNotEqual(r2.uptime_check[0], PASS)
 
     def test_flip_inside_the_final_window_cannot_move_it_later(self):
-        # 110.000600 -> 110.040600 ('0' -> '4'): still clean, but the last-3
-        # span is taken off, so the anchor is no later than the true one.
+        # 110.000600 -> 110.040600 ('0' -> '4'): still within 50 ms, but the
+        # last-3 span is taken off, so the anchor is no later than the true one.
         rec = self.judge(record(), shutdown_log(NORMAL[:-1] + [110.0406]))
         self.assertEqual(rec.clock_source, "reset-anchor")
         self.assertLessEqual(rec.anchor["host_mono"], NORMAL_ANCHOR + 1e-9)
+
+    def test_flip_in_the_final_3_past_50ms_is_unverified(self):
+        # A flip that pushes one of the final 3 lines more than 50 ms later.
+        for stamps in (NORMAL[:-1] + [110.1006],                 # the final line: last 3 span 100 ms
+                       NORMAL[:-2] + [110.1003, 110.0006],       # the middle one: the stamps decrease
+                       NORMAL[:-3] + [110.08, 110.0003, 110.0006]):
+            for measuring in (False, True):
+                rec = self.judge(record(), shutdown_log(stamps), TIMING, measuring)
+                self.assertEqual(rec.uptime_check[0], UNVERIFIED, stamps)
+                self.assertIsNone(rec.anchor)
 
     def test_silent_tail_only_makes_it_stricter(self):
         # A quiet stretch S between the last printk line and the real reset
         # (a slower shutdown that logs nothing) shifts the new kernel's start
         # later by S, so uptime is S smaller while the anchor stays at the
         # last line: the measured pass grows by S. It can turn PASS into
-        # FAIL, never FAIL into PASS (DESIGN.md, A1 rule 2).
+        # FAIL, never FAIL into PASS (DESIGN.md, A1 rule 2, A1′ rule 5).
         last = None
         for s in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 8.0):
             rec = self.judge(record(uptime=30.0 - s), shutdown_log(NORMAL))
@@ -379,25 +488,21 @@ class Anchor(unittest.TestCase):
         timing = {"paths": {"adb": dict(TIMING["paths"]["adb"], max_shutdown_tail=3.0)}}
         rec = self.judge(record(), shutdown_log(NORMAL), timing)    # tail 4.95 s > 3 s
         self.assertEqual(rec.uptime_check[0], UNVERIFIED)
+        self.assertAlmostEqual(rec.reset_tail_s, 4.95, places=2)    # still recorded for the samples
         rec = self.judge(record(disconnect_mono=1011.0), shutdown_log(NORMAL))   # reset before the disconnect
         self.assertEqual(rec.uptime_check[0], UNVERIFIED)
 
-    def test_no_calibrated_tail_or_gap_is_unverified(self):
-        for key in ("max_shutdown_tail", "max_stamp_gap"):
-            timing = {"paths": {"adb": {k: v for k, v in TIMING["paths"]["adb"].items() if k != key}}}
-            rec = self.judge(record(), shutdown_log(NORMAL), timing)
-            self.assertEqual(rec.uptime_check[0], UNVERIFIED, key)
-
-    def test_gap_over_the_calibrated_bound_is_unverified(self):
-        timing = {"paths": {"adb": dict(TIMING["paths"]["adb"], max_stamp_gap=0.4)}}
-        rec = self.judge(record(), shutdown_log(NORMAL), timing)         # gaps are 0.5 s
+    def test_no_calibrated_tail_is_unverified(self):
+        timing = {"paths": {"adb": {k: v for k, v in TIMING["paths"]["adb"].items() if k != "max_shutdown_tail"}}}
+        rec = self.judge(record(), shutdown_log(NORMAL), timing)
         self.assertEqual(rec.uptime_check[0], UNVERIFIED)
-        self.assertIn("exceeds", rec.anchor_note)
+        self.assertIn("no calibrated shutdown-tail bound", rec.anchor_note)
 
     def test_anchor_before_marker_is_refused(self):
         anchor, why = b.reset_anchor(shutdown_log([99.0, 99.1, 99.2, 99.3, 99.3001, 99.3002]), MARKER,
-                                     pair_for(host=0.0, hw=0.0), None, 1.5)
+                                     pair_for(host=0.0, hw=0.0))
         self.assertIsNone(anchor)
+        self.assertIn("before the marker", why)
 
     def test_fastboot_path_keeps_the_disconnect_clock(self):
         t = {"paths": {"fastboot": {"A": 12.0, "proof_normal_pass": True, "proof_control_rejected": True}}}
@@ -408,14 +513,21 @@ class Anchor(unittest.TestCase):
         self.assertEqual(rec.uptime_check[0], FAIL)       # 30 < 45 - 12
 
 
-class ChainExact(unittest.TestCase):
-    def test_exact_copy_needed_for_pass(self):
+class Chain(unittest.TestCase):
+    def test_exact_copy_or_a_proven_copy_needed_for_pass(self):
         log = shutdown_log(NORMAL)
         self.assertEqual(b.chain_verdict(log, MARKER)[0], PASS)
         flipped = log.replace(MARKER.encode(), b"RQM:11111111:aaaaaaab")
         self.assertEqual(b.chain_verdict(flipped, MARKER)[0], UNVERIFIED)
-        # A new session after a damaged copy is still a FAIL.
-        self.assertEqual(b.chain_verdict(flipped + line(0.0, b"Linux version 4.9.337"), MARKER)[0], FAIL)
+        # A1′: the damaged copy's stamp equals a live stamp of this write.
+        self.assertEqual(b.chain_verdict(flipped, MARKER, pair_for())[0], PASS)
+        self.assertEqual(b.chain_verdict(flipped, MARKER, pair_for(marker_ts=100.000001))[0], UNVERIFIED)
+        self.assertEqual(b.chain_verdict(flipped, MARKER, pair_for(marker="RQM:11111111:aaaaaaab"))[0],
+                         UNVERIFIED)
+        # A new session after a damaged copy, proven or not, is a FAIL.
+        new = flipped + line(0.0, b"Linux version 4.9.337")
+        self.assertEqual(b.chain_verdict(new, MARKER)[0], FAIL)
+        self.assertEqual(b.chain_verdict(new, MARKER, pair_for())[0], FAIL)
 
 
 def raw(path, bootloader_pass, tail=None, first_after_wipe=False, anchored=True):
@@ -423,9 +535,14 @@ def raw(path, bootloader_pass, tail=None, first_after_wipe=False, anchored=True)
          "marker_found_fuzzy": True, "first_after_wipe": first_after_wipe}
     if path == "adb":
         r["clock_source"] = "reset-anchor" if anchored else "none"
-        r["anchor"] = {"tail_s": tail, "max_gap": 1.1} if anchored else None
+        r["anchor"] = {"tail_s": tail} if anchored else None
+        r["reset_tail_s"] = tail if anchored else None
         r["anchor_note"] = "" if anchored else "chain is UNVERIFIED, so there is no reset anchor"
     return r
+
+
+def samples(*tails):
+    return [{"wipe_seq": i + 1, "tail_s": t} for i, t in enumerate(tails)]
 
 
 DROPBOX0 = "Drop box contents: 0 entries\n"
@@ -433,41 +550,51 @@ DROPBOX1 = "Drop box contents: 1 entries\n\n2026-11-22 18:44:04 SYSTEM_BOOT (tex
 
 
 class Calibration(unittest.TestCase):
-    """compute_paths and the report (R2-7)."""
+    """compute_paths and the report (R2-7, A1′ rule 4)."""
 
-    def data(self, adb, inj_adb=None, fastboot=None):
+    def data(self, adb, inj_adb=None, fastboot=None, tails=(8.52, 9.08, 9.17)):
         return {"raw": {"adb": adb, "fastboot": fastboot if fastboot is not None else
                         [raw("fastboot", 10.02), raw("fastboot", 10.05)]},
                 "inject_measure": {"adb": inj_adb or raw("adb", 13.8, 4.0), "fastboot": raw("fastboot", 14.0)},
-                "paths": {}, "chain": {}, "controls": {}}
+                "paths": {}, "chain": {}, "controls": {}, "tail_samples": samples(*tails)}
 
-    def test_tail_bound_includes_the_first_reboot_after_a_wipe(self):
+    def test_tail_bound_is_the_largest_of_3_samples_plus_a_margin(self):
         from riverqa import calibrate
-        d = self.data([raw("adb", 10.0, 6.4, first_after_wipe=True), raw("adb", 10.01, 4.1),
+        d = self.data([raw("adb", 10.0, 9.0, first_after_wipe=True), raw("adb", 10.01, 4.1),
                        raw("adb", 10.01, 4.0)])
         calibrate.compute_paths(d)
-        self.assertEqual(d["paths"]["adb"]["max_shutdown_tail"], 6.4)
-        self.assertEqual(d["paths"]["adb"]["first_after_wipe_tails"], [6.4])
-        self.assertEqual(d["paths"]["adb"]["max_stamp_gap"], 2.1)     # largest gap + 1 s margin
+        self.assertEqual(d["paths"]["adb"]["max_shutdown_tail"], 10.17)       # 9.17 + 1.0
+        self.assertEqual(d["paths"]["adb"]["first_after_wipe_tails"], [8.52, 9.08, 9.17])
+        self.assertNotIn("max_stamp_gap", d["paths"]["adb"])
+        self.assertTrue(any("shutdown-tail bound 10.17 s from 3" in line for line in calibrate.summary(d)))
 
-    def test_no_first_reboot_after_a_wipe_means_no_bound(self):
+    def test_fewer_than_3_samples_means_no_bound(self):
         from riverqa import calibrate
-        for adb in ([raw("adb", 10.0, 4.1), raw("adb", 10.01, 4.0)],
-                    [raw("adb", 10.0, first_after_wipe=True, anchored=False), raw("adb", 10.01, 4.0),
-                     raw("adb", 10.02, 4.1)]):
-            d = self.data(adb)
+        for tails in ((), (9.17,), (8.52, 9.17)):
+            d = self.data([raw("adb", 10.0, 9.0, first_after_wipe=True), raw("adb", 10.01, 4.0)], tails=tails)
             calibrate.compute_paths(d)
             self.assertIsNone(d["paths"]["adb"]["max_shutdown_tail"])
-            self.assertIn("flash --wipe", d["paths"]["adb"]["tail_why"])
+            self.assertIn(f"{len(tails)} of 3", d["paths"]["adb"]["tail_why"])
+            self.assertIn("flash --rollback", d["paths"]["adb"]["tail_why"])
             self.assertTrue(any("no shutdown-tail bound" in line for line in calibrate.summary(d)))
+
+    def test_fewer_than_3_samples_is_unverified(self):
+        # The adb path stays UNVERIFIED until the third sample exists.
+        from riverqa import calibrate
+        for tails, want in (((9.17,), UNVERIFIED), ((8.52, 9.17), UNVERIFIED), ((8.52, 9.08, 9.17), PASS)):
+            p = dict(TIMING["paths"]["adb"])
+            calibrate.set_tail_bound(p, samples(*tails))
+            rec = record()
+            reboots.judge_record(rec, shutdown_log(NORMAL), {"paths": {"adb": p}})
+            self.assertEqual(rec.uptime_check[0], want, (tails, rec.anchor_note))
 
     def test_slower_tail_than_calibrated_is_unverified(self):
         # Calibrated bound 6.5 s; this boot's reset came 7.45 s after the
-        # disconnect (a slower first-after-wipe shutdown): UNVERIFIED, never PASS.
+        # disconnect (a slower shutdown): UNVERIFIED, never PASS.
         rec = record(disconnect_mono=1002.0)
         reboots.judge_record(rec, shutdown_log(NORMAL), TIMING)
         self.assertEqual(rec.uptime_check[0], UNVERIFIED)
-        self.assertIn("shutdown tail", rec.anchor_note)
+        self.assertIn("shutdown-tail bound", rec.anchor_note)
 
     def test_no_usable_anchors_reports_the_reason(self):
         from riverqa import calibrate
@@ -486,6 +613,32 @@ class Calibration(unittest.TestCase):
         calibrate.compute_paths(empty)
         calibrate.summary(empty)
         self.assertFalse(calibrate.qualified(empty))
+
+    def test_samples_accumulate_one_per_wipe(self):
+        import benchhome
+        with benchhome.bench_home():
+            first = raw("adb", 10.0, 9.08) | {"path": "adb", "boot_id_before": "B1", "marker": MARKER}
+            self.assertTrue(reboots.add_tail_sample(first, {"seq": 3, "how": "rollback"}, "boot-timing", "b"))
+            # A second sample for the same wipe is not added.
+            self.assertFalse(reboots.add_tail_sample(dict(first, reset_tail_s=12.0), {"seq": 3}, "bench:x"))
+            # No anchor: nothing to add.
+            self.assertFalse(reboots.add_tail_sample(dict(first, reset_tail_s=None), {"seq": 4}, "bench:x"))
+            self.assertTrue(reboots.add_tail_sample(dict(first, reset_tail_s=8.52), {"seq": 4}, "bench:x"))
+            got = reboots.load_tail_samples()
+            self.assertEqual([(s["wipe_seq"], s["tail_s"], s["source"]) for s in got],
+                             [(3, 9.08, "boot-timing"), (4, 8.52, "bench:x")])
+
+    def test_bench_first_boot_adds_a_sample_only_when_proven(self):
+        import benchhome
+        from riverqa import bench
+        wipe = {"seq": 7, "how": "flash", "first_boot_id": "first"}
+        rec = record(boot_id_before="first", reset_tail_s=8.9)
+        with benchhome.bench_home(), mock.patch("riverqa.journal.last_wipe", return_value=wipe):
+            self.assertFalse(bench.record_first_tail(rec, (UNVERIFIED, "x"), 2, "b1", "build"))   # dropbox unproven
+            self.assertFalse(bench.record_first_tail(record(boot_id_before="other", reset_tail_s=8.9),
+                                                     (PASS, "x"), 2, "b1", "build"))             # another boot between
+            self.assertTrue(bench.record_first_tail(rec, (PASS, "x"), 2, "b1", "build"))
+            self.assertEqual([s["tail_s"] for s in reboots.load_tail_samples()], [8.9])
 
     def test_first_after_wipe_is_tied_to_the_flash_record(self):
         from riverqa import calibrate
