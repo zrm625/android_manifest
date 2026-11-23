@@ -138,5 +138,120 @@ class BatchRefusesControls(unittest.TestCase):
             self.assertEqual(qa.check_controls(run).state, FAIL)
 
 
+class Attribution(unittest.TestCase):
+    """Controls are credited only for their own fault (review round 2)."""
+
+    def run_with(self, injections, sig_states, attempt="att-1"):
+        from pathlib import Path
+        import tempfile
+        tmp = Path(tempfile.mkdtemp())
+        dirs = []
+        for label, first, st, bid in sig_states:
+            d = tmp / label.replace(" ", "_").replace("#", "_")
+            d.mkdir()
+            verdict = [st, "x"]
+            core.write_json(d / "signals.json", {"chain": verdict, "uptime": verdict, "boot_count": verdict,
+                                                 "reboot": {"boot_id": bid}})
+            dirs.append((label, d, "adb" if not first else "fastboot", first))
+        run = mock.Mock()
+        run.batch = {"control_injections": injections}
+        run.attempt_id.return_value = attempt
+        run.control_injected = None
+        with mock.patch.object(qa, "evidence_dirs", lambda r: dirs), \
+                mock.patch.object(reboots, "load_timing", lambda: {}):
+            r = qa.check_boot_signals(run)
+        return r, run.control_injected
+
+    INJ = {"control": "extra-reboot-bench", "injected": True, "flash_attempt": "att-1", "where": "bench boot",
+           "run_id": "dev-1", "boot": 1, "boot_id": "B1"}
+
+    def test_injected_boots_own_record_must_be_rejected(self):
+        with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-bench"}):
+            # The injected boot passes; another boot fails. The aggregate is
+            # FAIL but the control does not qualify.
+            r, marked = self.run_with([self.INJ], [("first boot", True, FAIL, "B0"),
+                                                   ("bench dev-1#1", False, PASS, "B1")])
+            self.assertEqual(r.state, FAIL)
+            self.assertIsNone(marked)
+            r, marked = self.run_with([self.INJ], [("first boot", True, PASS, "B0"),
+                                                   ("bench dev-1#1", False, FAIL, "B1")])
+            self.assertEqual(marked, "extra-reboot-bench")
+
+    def test_boot_id_must_match(self):
+        with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-bench"}):
+            _, marked = self.run_with([self.INJ], [("first boot", True, PASS, "B0"),
+                                                   ("bench dev-1#1", False, FAIL, "OTHER")])
+            self.assertIsNone(marked)
+
+    def test_first_boot_injection(self):
+        inj = dict(self.INJ, control="extra-reboot-first-boot", where="first boot", boot_id="B0")
+        with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-first-boot"}):
+            _, marked = self.run_with([inj], [("first boot", True, FAIL, "B0"), ("bench dev-1#1", False, PASS, "B1")])
+            self.assertEqual(marked, "extra-reboot-first-boot")
+
+    def test_missed_injection_never_matches(self):
+        missed = {k: v for k, v in self.INJ.items() if k != "flash_attempt"}
+        missed["injected"] = False
+        rows = [("first boot", True, PASS, "B0"), ("bench dev-1#1", False, FAIL, "B1")]
+        with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-bench"}):
+            self.assertIsNone(self.run_with([missed], rows)[1])
+            # No attempt ID on the run: a record without one must not match.
+            self.assertIsNone(self.run_with([missed], rows, attempt=None)[1])
+            self.assertIsNone(self.run_with([dict(self.INJ, flash_attempt=None)], rows, attempt=None)[1])
+            self.assertIsNone(self.run_with([dict(self.INJ, injected="yes")], rows)[1])
+            self.assertIsNone(self.run_with([dict(self.INJ, flash_attempt="att-0")], rows)[1])
+
+    def test_bt_rfkill_needs_a_valid_powered_report(self):
+        from riverqa import features
+        real = "Controller AA:BB:CC:DD:EE:FF forge [default]\n\tPowered: yes\n\tPowerState: on\n"
+        stub = real.replace("Powered: yes", "Powered: no")
+        self.assertTrue(features.bt_rfkill_stub_took(real, stub))
+        self.assertFalse(features.bt_rfkill_stub_took("", ""))
+        self.assertFalse(features.bt_rfkill_stub_took("No default controller available\n", ""))
+        off = real.replace("Powered: yes", "Powered: no")
+        self.assertFalse(features.bt_rfkill_stub_took(off, off))
+
+    def test_torch_must_stay_capped_through_the_capture(self):
+        from fakes import FakeShell
+        from riverqa import features
+        state = {"/sys/class/leds/led:torch_0/max_brightness": "200", "/sys/class/leds/led:torch_0/brightness": "0",
+                 "/sys/class/leds/led:switch_0/brightness": "0"}
+
+        def cat(cmd):
+            return 0, state[cmd.split()[1]] + "\n"
+
+        def echo(cmd):
+            val, f = cmd.split()[1], cmd.split()[3]
+            state[f] = val
+            return 0, ""
+        dev = FakeShell({r"^ls -d": (0, "/sys/class/leds/led:switch_0\n/sys/class/leds/led:torch_0\n"),
+                         r"^cat ": cat, r"^echo ": echo})
+        run = mock.Mock(dev=dev)
+        run.attempt_id.return_value = "a"
+        took, note, nodes = features.disable_torch(run)
+        self.assertTrue(took, note)
+        self.assertEqual(state["/sys/class/leds/led:torch_0/max_brightness"], "0")
+        self.assertTrue(features.torch_still_held(run, nodes)[0])
+        # The torch request got through during the capture: not held.
+        state["/sys/class/leds/led:torch_0/brightness"] = "100"
+        self.assertFalse(features.torch_still_held(run, nodes)[0])
+        state["/sys/class/leds/led:torch_0/brightness"] = "0"
+        state["/sys/class/leds/led:torch_0/max_brightness"] = "200"
+        self.assertFalse(features.torch_still_held(run, nodes)[0])
+        # Only a switch node: the request could re-enable it, so no control.
+        dev2 = FakeShell({r"^ls -d": (0, "/sys/class/leds/led:switch_0\n"), r"^cat ": cat, r"^echo ": echo})
+        self.assertFalse(features.disable_torch(mock.Mock(dev=dev2))[0])
+
+
+class CalibrationRefusesControls(unittest.TestCase):
+    def test_every_mode_but_control_fails_on_an_override(self):
+        with bench_home(), mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "wifi-off"}):
+            core.write_json(core.batch_dir("b1") / "batch.json", {"batch": "b1", "kind": "calibration"})
+            for mode in ("calibrate", "batch", "baseline"):
+                run = qa.Run(mode, "b1", [], [])
+                self.assertEqual(qa.check_controls(run).state, FAIL, mode)
+            self.assertEqual(qa.check_controls(qa.Run("control", "b1", [], [])).state, PASS)
+
+
 if __name__ == "__main__":
     unittest.main()

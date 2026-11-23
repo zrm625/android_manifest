@@ -217,7 +217,7 @@ def run(a) -> int:
         if rec.control in ("early-reboot", "early-reboot-missed"):
             b = stage.load(a.batch)
             inj = {"control": control, "run_id": run_id, "boot": i, "where": "bench boot", "at": now_iso(),
-                   "injected": rec.control == "early-reboot"}
+                   "injected": rec.control == "early-reboot", "boot_id": rec.boot_id}
             if rec.control == "early-reboot":
                 inj["flash_attempt"] = attempt["attempt_id"]
             b.setdefault("control_injections", []).append(inj)

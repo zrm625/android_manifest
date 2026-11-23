@@ -344,7 +344,7 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
     if rec.control in ("early-reboot", "early-reboot-missed"):
         batch.setdefault("control_injections", []).append(
             {"control": control, "flash_attempt": attempt_id, "where": "first boot", "at": now_iso(),
-             "injected": rec.control == "early-reboot"})
+             "injected": rec.control == "early-reboot", "boot_id": rec.boot_id})
         if rec.control != "early-reboot":
             batch["control_injections"][-1].pop("flash_attempt")   # missed: nothing for QA to find
     stage.save(batch)

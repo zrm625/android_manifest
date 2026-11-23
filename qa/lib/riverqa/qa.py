@@ -204,7 +204,7 @@ def check_fixtures(run: Run) -> Result:
 
 def check_controls(run: Run) -> Result:
     found = control_overrides()
-    if run.mode in ("batch", "baseline") and found:
+    if run.mode != "control" and found:
         return Result("preflight.controls", FAIL, "control override present in a " + run.mode + " run: " +
                       ", ".join(found))
     if run.mode == "control":
@@ -683,28 +683,60 @@ def plant_crash(run: Run, dirs: list) -> list:
     return dirs
 
 
+def injection_for(run: Run, name: str) -> dict | None:
+    """The batch.json record of a control fault that really went in during
+    this flash attempt: ``injected`` is True, the run has an attempt ID and
+    the record names that same attempt. A missed injection never matches."""
+    aid = run.attempt_id()
+    if not aid:
+        return None
+    for i in (run.batch or {}).get("control_injections") or []:
+        if i.get("control") == name and i.get("injected") is True and i.get("flash_attempt") == aid:
+            return i
+    return None
+
+
+def injected_boot_label(inj: dict, dirs: list) -> str | None:
+    """The evidence row of the boot an extra-reboot fault went into: the
+    first boot, or the bench row with the recorded run ID and boot number."""
+    if inj.get("where") == "first boot":
+        return next((label for label, _d, _p, first in dirs if first), None)
+    want = f"bench {inj.get('run_id')}#{inj.get('boot')}"
+    return next((label for label, _d, _p, first in dirs if not first and label == want), None)
+
+
 def check_boot_signals(run: Run) -> Result:
     if run.batch is None:
         return Result("health.boot_signals", UNVERIFIED, NO_BATCH)
     timing = reboots.load_timing()
     name = control_active()
-    if name in ("extra-reboot-first-boot", "extra-reboot-bench"):
-        # The fault went in during flash or device-bench; batch.json records
-        # it against this flash attempt.
-        if any(i.get("control") == name and i.get("flash_attempt") == run.attempt_id()
-               for i in run.batch.get("control_injections") or []):
-            run.control_injected = name
-    states, notes = [], []
-    for label, d, path, _first in evidence_dirs(run):
+    dirs = evidence_dirs(run)
+    states, notes, per = [], [], {}
+    for label, d, path, _first in dirs:
         sig = read_json(d / "signals.json")
         if sig is None:
             states.append(UNVERIFIED)
             notes.append(f"{label}: no signals recorded")
+            per[label] = (UNVERIFIED, None)
             continue
         st, msg = reboots.combined_verdict(sig, path, timing)
         states.append(st)
         notes.append(f"{label}: {st} ({msg})")
-    return Result("health.boot_signals", worst(states), " | ".join(notes))
+        per[label] = (st, (sig.get("reboot") or {}).get("boot_id"))
+    details: dict = {}
+    if name in ("extra-reboot-first-boot", "extra-reboot-bench"):
+        # The fault went in during flash or device-bench; batch.json records
+        # it against this flash attempt. It qualifies only if the injected
+        # boot's own signal record is rejected, matched by row key and
+        # boot_id, never by the aggregate (review round 2).
+        inj = injection_for(run, name)
+        label = injected_boot_label(inj, dirs) if inj else None
+        st, bid = per.get(label, (None, None)) if label else (None, None)
+        bid_ok = not inj or not inj.get("boot_id") or inj.get("boot_id") == bid
+        details["injected_boot"] = {"record": inj, "row": label, "state": st, "boot_id_matches": bid_ok}
+        if inj and label and bid_ok and st == FAIL:
+            run.control_injected = name
+    return Result("health.boot_signals", worst(states), " | ".join(notes), details)
 
 
 def check_dropbox(run: Run, since: list[str] | None = None) -> Result:

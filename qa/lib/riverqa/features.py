@@ -215,6 +215,13 @@ class BtSession:
             self.p.kill()
 
 
+def bt_rfkill_stub_took(real: str, stubbed: str) -> bool:
+    """The real `bluetoothctl show` was a valid report of a powered adapter
+    and the stub removed "Powered: yes"."""
+    return (bool(re.search(r"Controller [0-9A-Fa-f:]{17}", real)) and "Powered: yes" in real
+            and "Powered: yes" not in stubbed)
+
+
 def check_bluetooth(run) -> list[Result]:
     cid = "radios.bluetooth"
     dev, cfg = run.dev, server_cfg(run)
@@ -222,10 +229,14 @@ def check_bluetooth(run) -> list[Result]:
     show = bt_host("show")
     if control_active() == "bt-rfkill":
         # Control: only the adapter report is stubbed, as an rfkilled adapter
-        # prints it; the parsing below is the real check.
+        # prints it; the parsing below is the real check. It counts as
+        # injected only if the stub replaced a valid report of a powered
+        # adapter; empty or missing output proves nothing (review round 2).
+        real = show
         show = re.sub(r"Powered: yes", "Powered: no", show)
         show = re.sub(r"PowerState: on", "PowerState: off-blocked", show)
-        injected(run, "bt-rfkill")
+        if bt_rfkill_stub_took(real, show):
+            injected(run, "bt-rfkill")
     if "Powered: yes" not in show:
         # The harness never powers the host adapter itself.
         return [Result(cid, UNVERIFIED, "host Bluetooth adapter is not powered (fixture problem)")]
@@ -505,14 +516,21 @@ def check_cameras(run) -> list[Result]:
     if 0 in expected:
         iso = param(run, "camera0_photo_iso", 100)
         exp = param(run, "camera0_photo_exposure_ns", 20_000_000)
-        led_note = None
+        led_note, held_nodes, took = None, [], False
         if control_active() == "torch-disabled":
-            took, led_note = disable_torch(run)
-            if took:
-                injected(run, "torch-disabled")
-        r = helper.instrument(run, "camera_photo", {"id": 0, "torch": 1, "iso": iso, "exposure_ns": exp}, timeout=60)
-        if control_active() == "torch-disabled":
-            restore_led(run)
+            took, led_note, held_nodes = disable_torch(run)
+        try:
+            r = helper.instrument(run, "camera_photo", {"id": 0, "torch": 1, "iso": iso, "exposure_ns": exp},
+                                  timeout=60)
+        finally:
+            if control_active() == "torch-disabled":
+                # Read back straight after the capture, before restoring:
+                # the cap must still be in place (review round 2).
+                held, hold_note = torch_still_held(run, held_nodes)
+                restore_led(run)
+                led_note = f"{led_note}; after the capture: {hold_note}"
+                if took and held:
+                    injected(run, "torch-disabled")
         early = helper_result(cid, r)
         if early:
             return [early]
@@ -552,23 +570,54 @@ def torch_leds(run) -> list[str]:
                                   "/sys/class/leds/led:flash_* 2>/dev/null").split() if p]
 
 
-def disable_torch(run) -> tuple[bool, str]:
-    """Control only: hold the torch dark below the HAL through the LED
-    switch (led:switch_*/brightness). max_brightness is never written. True
-    only if every switch now reads 0."""
-    notes, took = [], True
-    switches = [led for led in torch_leds(run) if "/led:switch_" in led]
-    if not switches:
-        return False, "no led:switch_* node"
-    for led in switches:
+def disable_torch(run) -> tuple[bool, str, list[str]]:
+    """Control only: hold the torch dark below the HAL for the whole
+    capture: (took, note, capped nodes).
+
+    A switch write alone doesn't hold: on this driver the next positive
+    brightness write, which the torch request makes, re-enables the switch
+    (leds-qpnp-flash-v2.c:1753). So every led:torch_*/led:flash_* node also
+    gets max_brightness 0. The LED core clamps every brightness write to
+    max_brightness, the camera's trigger writes included (led-core.c), and
+    only a sysfs write changes it. Each original value is journaled first.
+    True only if every capped node reads max_brightness 0 and brightness 0."""
+    notes = []
+    leds = torch_leds(run)
+    nodes = [led for led in leds if "/led:torch_" in led or "/led:flash_" in led]
+    if not nodes:
+        return False, "no led:torch_* or led:flash_* node", []
+    for led in nodes:
+        f = f"{led}/max_brightness"
+        r = run.dev.read(f"cat {f}")
+        if not r.ok or not r.out.strip().isdigit():
+            return False, f"cannot read {f}", nodes
+        run.journal.record(PHONE, "sysfs", f, r.out.strip(), attempt_id=run.attempt_id(), run_id=run.run_id)
+        run.dev.sh(f"echo 0 > {f}")
+        notes.append(f"{f}: {r.out.strip()} -> 0")
+    for led in leds:
+        if "/led:switch_" not in led:
+            continue
         f = f"{led}/brightness"
         cur = run.dev.sh(f"cat {f}").strip()
         run.journal.record(PHONE, "sysfs", f, cur, attempt_id=run.attempt_id(), run_id=run.run_id)
         run.dev.sh(f"echo 0 > {f}")
-        now = run.dev.sh(f"cat {f}").strip()
-        took = took and now == "0"
-        notes.append(f"{f}: {cur} -> {now}")
-    return took, "; ".join(notes)
+        notes.append(f"{f}: {cur} -> 0")
+    held, why = torch_still_held(run, nodes)
+    return held, "; ".join(notes) + f"; {why}", nodes
+
+
+def torch_still_held(run, nodes: list[str]) -> tuple[bool, str]:
+    """Is every capped node still at max_brightness 0 and brightness 0? A
+    failed read is not proof (False)."""
+    if not nodes:
+        return False, "no capped torch nodes"
+    bad = []
+    for led in nodes:
+        for attr in ("max_brightness", "brightness"):
+            r = run.dev.read(f"cat {led}/{attr}")
+            if not r.ok or r.out.strip() != "0":
+                bad.append(f"{led}/{attr}={r.out.strip() if r.ok else 'unreadable'}")
+    return (not bad), ("held at 0" if not bad else "not held: " + ", ".join(bad))
 
 
 def restore_led(run):
