@@ -308,7 +308,10 @@ def prove(dev: Device, w: UsbWatcher, data: dict) -> None:
         p = data["paths"].get(path) or {}
         if p.get("A") is None:
             continue
-        proof_timing = {"paths": {path: dict(p, **{k: True for k in reboots.PROOFS})}}
+        # Judged as under the current rules: these proofs are measured now,
+        # by this code (allowance_for refuses other records, R7-6).
+        proof_timing = {"paths": {path: dict(p, **{k: True for k in reboots.PROOFS})},
+                        "rules_version": CALIBRATION_RULES}
         normal = one(dev, w, path, proof_timing)
         p["proof_normal"] = normal
         p["proof_normal_pass"] = normal["uptime_check"][0] == PASS

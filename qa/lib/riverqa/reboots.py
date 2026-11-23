@@ -61,10 +61,16 @@ def save_timing(data: dict) -> None:
 def allowance_for(path: str, timing: dict | None = None) -> float | None:
     """A for a path, only if calibration proved it: a normal boot passed, the
     injected extra pass was rejected by the uptime check itself, and the
-    unmarked one by the enumeration rule (review round 4)."""
+    unmarked one by the enumeration rule (review round 4). A record
+    measured under other calibration rules, or with any A-setting sample
+    without the current rules stamp, has no A (R7-6), so the uptime check
+    is UNVERIFIED."""
+    from . import calibrate     # calibrate imports this module
     timing = load_timing() if timing is None else timing
     p = (timing.get("paths") or {}).get(path) or {}
     if p.get("A") is None or not all(p.get(k) for k in PROOFS):
+        return None
+    if timing.get("rules_version") != calibrate.CALIBRATION_RULES or calibrate.unstamped_samples(timing):
         return None
     return float(p["A"])
 

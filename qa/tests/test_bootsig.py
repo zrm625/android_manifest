@@ -269,7 +269,7 @@ Usage: dumpsys dropbox [--print|--file] [YYYY-mm-dd] [HH:MM:SS] [tag]
 
 
 GATED = {"A": 12.0, "proof_normal_pass": True, "proof_control_rejected": True, "proof_unmarked_rejected": True}
-TIMING = {"paths": {"sysrq": dict(GATED), "fastboot": dict(GATED)}}
+TIMING = {"paths": {"sysrq": dict(GATED), "fastboot": dict(GATED)}, "rules_version": 3}
 
 
 def record(path="sysrq", **kw):
@@ -342,13 +342,37 @@ class Judge(unittest.TestCase):
         self.assertEqual(reboots.combined_verdict(sig, "sysrq", d)[0], UNVERIFIED)
 
     def test_allowance_needs_proofs(self):
-        t = {"paths": {"sysrq": {"A": 12.3, "proof_normal_pass": True, "proof_control_rejected": False}}}
+        t = {"paths": {"sysrq": {"A": 12.3, "proof_normal_pass": True, "proof_control_rejected": False}},
+             "rules_version": 3}
         self.assertIsNone(reboots.allowance_for("sysrq", t))
         t["paths"]["sysrq"]["proof_control_rejected"] = True
         # Review round 4 (Gemini 1): the unmarked proof is needed too.
         self.assertIsNone(reboots.allowance_for("sysrq", t))
         t["paths"]["sysrq"]["proof_unmarked_rejected"] = True
         self.assertEqual(reboots.allowance_for("sysrq", t), 12.3)
+
+    def test_allowance_needs_current_rules_and_stamps(self):
+        """R7-6 (Opus 1): a proved A from a record under other calibration
+        rules, or with an unstamped A-setting sample, is no A, so a boot it
+        would pass is UNVERIFIED. At 62f73de both gave A = 12.3."""
+        from riverqa import calibrate
+        proved = {"A": 12.3, "proof_normal_pass": True, "proof_control_rejected": True,
+                  "proof_unmarked_rejected": True}
+        stamped = raw(10.0)
+        good = {"paths": {"sysrq": dict(proved)}, "rules_version": calibrate.CALIBRATION_RULES,
+                "raw": {"sysrq": [dict(stamped)] * 3}, "inject_measure": {"sysrq": dict(stamped)}}
+        self.assertEqual(reboots.allowance_for("sysrq", good), 12.3)
+        old_rules = dict(good, rules_version=2)
+        no_rules = {k: v for k, v in good.items() if k != "rules_version"}
+        unstamped_normal = dict(good, raw={"sysrq": [dict(stamped), dict(stamped), raw(10.0, rules_version=None)]})
+        unstamped_inject = dict(good, inject_measure={"sysrq": raw(14.4, rules_version=None)})
+        for name, t in (("old rules", old_rules), ("no rules", no_rules), ("unstamped normal", unstamped_normal),
+                        ("unstamped inject", unstamped_inject)):
+            with self.subTest(name):
+                self.assertIsNone(reboots.allowance_for("sysrq", t))
+                # 13 s elapsed, 12 s uptime: within A = 12.3, but UNVERIFIED without it.
+                self.assertEqual(b.uptime_verdict(12.0, 13.0, reboots.allowance_for("sysrq", t), 0,
+                                                        disconnect_gap_s=0.1, status_read_s=0.1)[0], UNVERIFIED)
 
     def test_chain_survives_only_on_gated_paths(self):
         """Review round 4 (Gemini 4): only the gated paths have a record;
@@ -665,6 +689,21 @@ class CalibrationProvenance(unittest.TestCase):
         self.assertLess(a, 14.2, "the 0.500 s-gap sample from an unstamped record set A")
         self.assertEqual(len(normals), 8, "fresh normals were not measured")
         self.assertFalse(saved.get("reused_normals_from"))
+
+    def test_proofs_are_judged_with_the_recorded_a(self):
+        """R7-6: prove() judges its fresh reboots under the current rules,
+        so allowance_for gives them the recorded A (no stored samples)."""
+        from riverqa import calibrate
+        seen = []
+
+        def one(dev, w, path, timing, **kw):
+            seen.append(reboots.allowance_for(path, timing))
+            return dict(raw(10.0), uptime_check=[PASS, ""])
+        data = {"paths": {p: {"A": 12.0} for p in reboots.GATED_PATHS}, "controls": {}}
+        with bench_home(), mock.patch.object(calibrate, "one", side_effect=one), \
+                mock.patch.object(calibrate, "prove_adb_chain"):
+            calibrate.prove(None, None, data)
+        self.assertEqual(seen, [12.0] * 6)
 
     def test_stamped_normals_are_reused(self):
         with bench_home():

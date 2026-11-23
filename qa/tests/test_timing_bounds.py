@@ -13,7 +13,8 @@ from riverqa.results import FAIL, PASS, UNVERIFIED
 
 MARKER = "RQM:0123456789abcdef:aaaaaaaa"
 TIMING = {"paths": {p: {"A": 12.09, "proof_normal_pass": True, "proof_control_rejected": True,
-                        "proof_unmarked_rejected": True} for p in reboots.GATED_PATHS}}
+                        "proof_unmarked_rejected": True} for p in reboots.GATED_PATHS},
+          "rules_version": 3}
 
 
 class W:
