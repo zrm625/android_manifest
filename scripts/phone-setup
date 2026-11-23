@@ -141,6 +141,9 @@ setup_done || { echo "error: setup wizard not finished after 60 steps" >&2; exit
 a shell rm -f /sdcard/phone-setup.xml >/dev/null 2>&1 || true
 
 # --- Settings the image can't default ---------------------------------------
+# No lock screen (the image defaults to this too, via
+# config_disableLockscreenByDefault). Has no effect if a PIN was set.
+a shell cmd lock_settings set-disabled true >/dev/null 2>&1 || true
 if (( extra_dim )); then
   a shell settings put secure reduce_bright_colors_activated 1
 fi
