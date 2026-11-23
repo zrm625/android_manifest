@@ -213,7 +213,7 @@ class Round9Majors(unittest.TestCase):
                 rc2 = calibrate.prove_main()
             self.assertEqual((rc1, rc2), (1, 1), err.getvalue())
             self.assertEqual(err.getvalue().count(
-                "running build is unstamped; dev-flash a build from this tree first (`flash stripped`)"), 2)
+                "running build is unstamped; dev-flash a build from this tree first (`flash stripped --wipe`"), 2)
             self.assertEqual((one.call_count, p.calls, p.boots), (0, [], []))
 
     # R9-4 (Gemini 3): the slot is read before the clear

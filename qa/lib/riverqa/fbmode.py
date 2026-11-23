@@ -113,7 +113,8 @@ class Unstamped(RuntimeError):
     """The running build has no River build-ID stamps (R9-3)."""
 
     def __init__(self):
-        super().__init__("running build is unstamped; dev-flash a build from this tree first (`flash stripped`)")
+        super().__init__("running build is unstamped; dev-flash a build from this tree first (`flash stripped --wipe` if "
+                         "the phone runs a build with other keys, such as an official nightly)")
 
 
 def running_identity(dev) -> tuple[str, tuple[str, str]]:

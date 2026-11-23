@@ -116,7 +116,8 @@ The steps run in this order (DESIGN.md, "Calibration and bootstrap" and
      --boot-timing` and the first `--baseline` flash refuse an unstamped
      one (exit 1) before any calibration reboot or write: "running build
      is unstamped; dev-flash a build from this tree first (`flash
-     stripped`)". adb answers in the setup wizard, so step 1 needs no
+     stripped --wipe` if the phone runs a build with other keys, such as
+     an official nightly)". adb answers in the setup wizard, so step 1 needs no
      `phone-setup`.
    - The dev flash also settles a leftover fb_mode obligation (including
      one from before round 8) once it has verified the boot of the slot it

@@ -2455,8 +2455,12 @@ stand).**
       3 with an entry pending, else exit 1.
    8. History and log. Nothing is read from the phone.
 
-   Before the first baseline, every halt with an entry pending gives the
-   R10-3 advice.
+   Before the first baseline, the armed-slot refusal and every halt after
+   the first write, with an entry pending, give the R10-3 advice. Halts
+   before any write (a failed slot read, an unreadable slot, a failed
+   clear) give `recovery_halt`'s default advice or `ClearFailed`'s
+   manual-clear advice: nothing was written, so the armed slot is intact
+   (round 11, Gemini m3).
 
    States left:
    - Die before the first write: entry pending, active slot unchanged.
@@ -2517,3 +2521,7 @@ Regressions: `test_round9.test_legacy_obligation_in_fastboot_writes_nothing`
 and `test_round10.R11_2WriteTimeouts` (8 subcases). At `0fb68fa` the first
 wrote `boot_a` and the rest; the second exited 1 in every subcase.
 
+
+Gemini's round-11 minors: the `Unstamped` message names `flash stripped
+--wipe` for a phone running a build with other keys (m1); the erase
+timeout (m2) is R11-2; row 3's advice wording is corrected (m3).
