@@ -118,7 +118,7 @@ class OnlyRuns(unittest.TestCase):
         def cleanup(run):
             ran.append("cleanup")
         fns = {n: ok("preflight." + n[6:]) for n in Preflight.PATCHES}
-        with bench_home() as h, mock.patch.multiple(qa, identity=identity, health=lambda run: ran.append("health"),
+        with bench_home(), mock.patch.multiple(qa, identity=identity, health=lambda run: ran.append("health"),
                                                     **fns), \
                 mock.patch("riverqa.features.run_features", features), \
                 mock.patch("riverqa.features.cleanup_and_final", cleanup), redirect_stdout(io.StringIO()):

@@ -300,10 +300,12 @@ def diagnostic_reads(dev: Device) -> dict[str, tuple[bool, object, str]]:
 # file. A stream found dead at any other point was not restarted, and the
 # final health check is then UNVERIFIED.
 
-def phone_epoch(dev: Device) -> str | None:
-    r = dev.read("date +%s.%N")
+def logcat_since(dev: Device) -> str | None:
+    """The phone's local time in logcat -T's 'MM-DD hh:mm:ss.mmm' form,
+    rounded down to the second (an overlap only repeats lines)."""
+    r = dev.read("date +'%m-%d %H:%M:%S'")
     t = r.out.strip()
-    return t[:t.index(".") + 4] if r.ok and re.match(r"^\d+\.\d+$", t) else None
+    return t + ".000" if r.ok and re.match(r"^\d\d-\d\d \d\d:\d\d:\d\d$", t) else None
 
 
 def start_logcat(run: Run, since: str | None = None) -> None:

@@ -917,8 +917,9 @@ def check_usb(run) -> Result:
         ok_mk, _ = restore_now(run, RES, "marker_file", marker)
         for e in [e for e in run.journal.entries if e["kind"] == "gvfs_mount"]:
             restore_now(run, HOST, "gvfs_mount", e["key"])
-        dev.adb("reverse", f"tcp:{server_cfg(run)['local_port']}", f"tcp:{server_cfg(run)['local_port']}",
-                timeout=20)
+        if adb_back:
+            dev.adb("reverse", f"tcp:{server_cfg(run)['local_port']}", f"tcp:{server_cfg(run)['local_port']}",
+                    timeout=20)
     d = {"how": how, "functions_restored": fmsg, "adb_back_s": round(adb_s, 1), "watchdog_killed": ok_wd,
          "marker_removed": ok_mk, "mtp_error": mtp_error}
     if run.halted:
@@ -1500,7 +1501,7 @@ def run_features(run) -> None:
     if not ok:
         run.add(Result("system.sideload", FAIL, f"helper install failed: {msg}"))
         return
-    from .qa import logcat_check, logcat_restart, phone_epoch
+    from .qa import logcat_check, logcat_restart, logcat_since
     for cid, fn in FEATURES:
         if run.halted:
             break
@@ -1508,7 +1509,7 @@ def run_features(run) -> None:
             continue
         run.guard()
         logcat_check(run, cid)
-        since = phone_epoch(run.dev) if cid == "hardware.usb" else None
+        since = logcat_since(run.dev) if cid == "hardware.usb" else None
         run_check(run, cid, fn)
         if cid == "hardware.usb":
             logcat_restart(run, since, cid)

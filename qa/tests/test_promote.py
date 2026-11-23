@@ -111,7 +111,7 @@ class PromoteCommand(unittest.TestCase):
 
 class Checkpoint(unittest.TestCase):
     def test_recover_finishes_an_interrupted_baseline_checkpoint(self):
-        with bench_home() as h:
+        with bench_home():
             st = slots.first_run("a", "f" * 64, "t0")
             slots.reserve(st, "base", "baseline", "f" * 64, "t1")
             slots.close_baseline(st, "base", "id-1", BOOT, "t2", seed={"calibration_seed": {"median_mb": 900.0}})
