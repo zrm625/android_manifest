@@ -198,6 +198,20 @@ class Callers(unittest.TestCase):
                 self.assertIsNone(fbmode.pending())
                 self.assertFalse(p.fb)
 
+    def test_phone_qa_recover_reports_once(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from riverqa import qa
+        with bench_home():
+            p = Phone("fastboot")
+            fbmode.arm(p)
+            out = io.StringIO()
+            with mock.patch.object(qa, "Device", lambda *a: p), redirect_stderr(out), redirect_stdout(out):
+                self.assertEqual(qa.main(["recover"]), 0)
+            self.assertEqual(out.getvalue().count("cleared a pending fb_mode obligation"), 1, out.getvalue())
+            self.assertIsNone(fbmode.pending())
+            self.assertEqual(p.where, "android")
+
     def test_restore_handler(self):
         from riverqa import restore
         with bench_home():

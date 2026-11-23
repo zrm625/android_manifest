@@ -1508,3 +1508,27 @@ enqueued never counts.
   `bluetoothctl show` and matches the whole `Discoverable:` line.
 - **Log format (Gemini 7).** The app-launch PASS summary prints the top
   activity with `helper.fmt_top`.
+
+**Phone notes (2026-11-23, after R4, build 22-20261123-UNOFFICIAL-river, no
+wipe).**
+- `phone-qa boot-timing` qualified every path. Across its 17 reboots the
+  disconnect gap (`first_gone − last_present`) was 0.110-0.158 s (mean
+  0.128 s), and the status read took 0.069-0.184 s, well inside the 0.5 s
+  and 1 s bounds. No sample was excluded; all 8 normal boot counts and all
+  chains passed.
+- With the bracketed clock the passes read about 0.15-0.2 s longer than
+  before (the clock starts at the last-present poll and stops at the end of
+  the read): fastboot 10.21-10.29 s, `sysrq` 10.08-10.12 s. The injected
+  increments are unchanged (4.43 s and 4.35 s). A is 12.46 s (fastboot) and
+  12.27 s (`sysrq`).
+- fb_mode recovery: armed as the control does, then the process was killed
+  with SIGKILL. The journal kept the obligation; a reboot stopped in
+  fastboot (fb_mode really set); `phone-qa recover` cleared it, resolved the
+  entry and booted Android in 41 s; the next reboot went straight to
+  Android.
+- adb vs `sysrq` RAM, once, alternating, 120 s settle with the screen off,
+  on a set-up phone (not freshly wiped): adb 1,257.5 and 1,301.0 MB, `sysrq`
+  1,287.5 and 1,256.8 MB used. The spread within one path (about 43 MB) is
+  larger than any difference between the paths, so no path effect shows.
+  The same spread is larger than the charter's 5 and 10 MB margins on a
+  used phone; RAM rows for verdicts come from freshly wiped phones.

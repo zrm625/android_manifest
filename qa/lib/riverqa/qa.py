@@ -1255,7 +1255,8 @@ def cmd_recover(argv: list[str]) -> int:
     except (LockError, GuardError, RuntimeError, TimeoutError) as e:
         log(f"error: {e}")
         return 1
-    log(what or "Nothing to recover: no fb_mode obligation and the phone is not in fastboot.")
+    if what is None:     # fbmode.recover logs what it did
+        log("Nothing to recover: no fb_mode obligation and the phone is not in fastboot.")
     return 0
 
 
