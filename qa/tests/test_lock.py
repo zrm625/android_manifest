@@ -86,5 +86,36 @@ class DurableWrite(unittest.TestCase):
         self.assertEqual(kinds, ["fsync-file", "replace", "fsync-dir"])
 
 
+class BuildLock(unittest.TestCase):
+    def test_no_device_job_while_a_build_runs(self):
+        """R5-13: a build holding $BENCH_HOME/.lock stops a device job from
+        starting, in owned and token mode."""
+        import subprocess
+        import sys
+        from riverqa import lock
+        with bench_home() as h:
+            owner = DeviceLock().acquire()                       # the runner, before the build
+            child = subprocess.Popen([sys.executable, "-I", "-c",
+                                      "import fcntl, sys, time; f = open(sys.argv[1], 'w'); "
+                                      "fcntl.flock(f, fcntl.LOCK_EX); print('held', flush=True); time.sleep(30)",
+                                      str(h / ".lock")], stdout=subprocess.PIPE, text=True)
+            try:
+                self.assertEqual(child.stdout.readline().strip(), "held")
+                self.assertTrue(lock.build_running())
+                with self.assertRaises(LockError) as cm:
+                    DeviceLock().acquire()                       # token mode: a child of the runner
+                self.assertIn("a build holds", str(cm.exception))
+                os.environ.pop("BENCH_LOCK_TOKEN")
+                owner.release()
+                with self.assertRaises(LockError):
+                    DeviceLock().acquire()                       # owned mode
+            finally:
+                child.kill()
+                child.wait()
+                os.environ.pop("BENCH_LOCK_TOKEN", None)
+            self.assertFalse(lock.build_running())
+            DeviceLock().acquire().release()                    # the build finished
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,11 @@ device-bench, phone-setup and phone-qa then run in token mode: they skip flock
 and refuse to run unless the token in the environment equals the token in the
 file and someone really holds the lock. With no token in the environment, a
 tool takes the lock itself for its own run.
+
+Either way, no device job starts while a build holds the build lock,
+$BENCH_HOME/.lock (scripts/bench/lib.sh): a build loads the host enough to
+eat the timing brackets' headroom (review round 5, R5-13). The runner builds
+first and then runs the device jobs, in sequence.
 """
 
 from __future__ import annotations
@@ -23,6 +28,36 @@ class LockError(RuntimeError):
 
 def _path():
     return bench_path(".device-lock")
+
+
+def build_running() -> bool | None:
+    """True if a build holds $BENCH_HOME/.lock, False if not (or there is no
+    lock file), None if the lock file can't be opened."""
+    p = bench_path(".lock")
+    if not p.exists():
+        return False
+    try:
+        fd = os.open(p, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def _refuse_during_build() -> None:
+    b = build_running()
+    if b is None:
+        raise LockError("can't read the build lock $BENCH_HOME/.lock; refusing to run a device job")
+    if b:
+        raise LockError("a build holds $BENCH_HOME/.lock; device jobs wait until it finishes (timing needs an "
+                        "idle host)")
 
 
 def _held_by_someone() -> bool:
@@ -47,6 +82,7 @@ class DeviceLock:
     def acquire(self) -> "DeviceLock":
         path = _path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        _refuse_during_build()
         env_token = os.environ.get("BENCH_LOCK_TOKEN")
         if env_token:
             try:
