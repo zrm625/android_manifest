@@ -78,7 +78,7 @@ with `flash --rollback`. Rollback wipes data, so run `phone-setup` after it.
 | `phone-qa --control NAME --batch ID` | One deliberately broken run from the control set | never |
 | `phone-qa boot-timing` | Calibration step 1: the bootloader allowance A for the fastboot and sysrq paths, and the adb chain control | n/a |
 | `phone-qa controls` | Which controls are qualified for this harness version | n/a |
-| `phone-qa controls --boot-timing` | The step-1 proofs again, under the current harness version | n/a |
+| `phone-qa controls --boot-timing` | The step-1 proofs again, under the current harness version. Refuses a `boot-timing.json` measured under older calibration rules, or whose samples don't give the stored A | n/a |
 | `phone-qa stage ID` | Copy a build's images into `$BENCH_HOME/batches/ID` | n/a |
 | `phone-qa helper` | Build or verify the helper APK | n/a |
 | `phone-qa recover` | Clear a leftover `fastboot oem fb_mode` (a journaled obligation, or the phone sitting in fastboot) and boot Android | n/a |
@@ -252,12 +252,21 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   journals the obligation (`$BENCH_HOME/qa/journal.json`, a host entry of
   kind `fb_mode`) before it sets it. If the harness was killed in between,
   the phone stops in fastboot on every boot until the obligation is
-  cleared. The next `phone-qa`, `flash` or `phone-qa boot-timing` run clears
-  it under the device lock and boots Android; `phone-qa recover` does only
-  that. A full `phone-qa` run that had to do this stops with
-  `preflight.journal` FAIL, because the phone rebooted outside the plan.
-  `flash`, rescue and rollback also run `fastboot oem fb_mode_clear` any
-  time they find the phone in fastboot.
+  cleared. The next `phone-qa`, `device-bench`, `flash --batch` or
+  `phone-qa boot-timing` run clears it under the device lock and boots the
+  active slot; `phone-qa recover` does only that. A full `phone-qa` run that
+  had to do this stops with `preflight.journal` FAIL, because the phone
+  rebooted outside the plan. The obligation is resolved only once Android
+  booted, so a run killed in between leaves it for the next one.
+  `flash --rollback`, `flash --recover` and rescue never boot the active
+  slot (it may be the failed candidate): in fastboot they clear fb_mode, set
+  the fallback active, then reboot, and resolve the obligation once the
+  fallback is verified. A dev flash clears it and stays in fastboot. If the
+  clear fails with an obligation pending, rollback still sets the fallback
+  active, then halts (exit 3).
+- **No device job during a build.** `flash`, `device-bench`, `phone-qa` and
+  calibration refuse to start while a build holds `$BENCH_HOME/.lock`: a
+  build eats the timing brackets' headroom.
 - **Bench rows from before A2** have no `reboot_path`, so
   `health.boot_signals` is UNVERIFIED for them; bench the batch again.
 - **Camera-set approvals and the gh account.** The approval must be a
@@ -332,7 +341,9 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   `bench_runs` to `prior_bench_runs` at every new attempt. `device-bench`
   appends to `bench_runs`. Control runs add `control_injections`.
 - **`slot-state.json`.** `flash` owns it (schema in `lib/riverqa/slots.py`).
-  The runner uses `flash --recover` at the start of every batch, then
+  The runner uses `flash --recover` at the start of every batch (with no
+  pair it only clears a leftover fb_mode and returns to `known_good_slot`
+  without a wipe, and only if that slot is active), then
   `flash --rollback` after a FAIL, UNVERIFIED, experiment or calibration run,
   and `flash --promote <id>` after it has durably merged and tagged a batch.
   `--promote` itself looks the batch up the way `--recover` does and releases
@@ -348,7 +359,7 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   same write as the slot change; if `known-good.json` didn't follow, no batch
   may flash until `flash --recover` finishes it. `flash` exits 3 when the
   pipeline must halt for Zak (including a guard failure during rescue or
-  rollback), and 4 when a boot failed and the phone was rescued back to the
+  rollback, and a failed fb_mode recovery), and 4 when a boot failed and the phone was rescued back to the
   known-good slot.
 - **`known-good.json`.** `phone-qa --baseline` seeds it, including the
   immutable `calibration_seed` that the harness version hashes. After a

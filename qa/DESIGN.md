@@ -1299,6 +1299,7 @@ random nonce does that by itself.
    path fails that only if pstore does not reach the next boot with the
    marker on it, which is what the round-11 design meant by it. On such a
    path a chain UNVERIFIED still does not count, and a chain FAIL still does.
+   (Superseded by round 5, R5-12: the chain counts on every path.)
 4. **Deleted:** `proven_marker`, `stamp_before`, `_same_us`,
    `STRICT_STAMP_RE`, `_strict_at`, `TS_RE`, `marker_printk_stamps`, the live
    readback in `reboots.leave_marker`, `BootRecord.marker_stamps`,
@@ -1411,7 +1412,9 @@ have no bracket and are all excluded.
   `phone-qa recover`.
 - `flash`, rescue and rollback also send `fastboot oem fb_mode_clear` any
   time they are in fastboot (`flashing.to_fastboot`, `write_images`). It is
-  harmless when nothing is set.
+  harmless when nothing is set. (Changed in round 5, R5-1: slot recovery
+  never runs `fbmode.recover`; it clears in fastboot, sets the fallback
+  active, then reboots, and `to_fastboot` no longer clears.)
 - Unit tests now run with `$BENCH_HOME` pointed at a throwaway directory
   (`qa/tests/_path.py`), so no test can write the real journal.
 
@@ -1454,7 +1457,7 @@ the next section, `mMaxPackageEnqueueRate=`, `hideSilentStatusBar=`,
 enqueued never counts.
 
 **R4-7. Smaller changes.**
-- **The banner within 3 flips (Opus 2).** The new-session check now matches
+- **The banner within 3 flips (Opus 2; 2 flips at a line start since R5-10).** The new-session check now matches
   `Linux version ` within 3 wrong characters (`bootsig.banner_offsets`,
   through `bootsig.fuzzy_offsets`, which splits the pattern into 4 disjoint
   pieces so every copy within 3 flips keeps one intact). On river every
@@ -1474,7 +1477,9 @@ enqueued never counts.
   plans them, and `health.boot_signals` is UNVERIFIED with fewer. A batch
   counts as a kernel batch when, compared with `known-good.json`'s latest
   build, the `kernel/motorola/sdm632` commit, the `dtbo.img` hash or the boot
-  image's command line differs, or when any of these can't be compared. The
+  image's command line differs, or when any of these can't be compared
+  (round 5, R5-6, adds the board configs, toolchain pins, header version
+  and IKCONFIG). The
   boot image's own hash can't be the test: it changes on every build (the
   ramdisk carries the build date and the kernel image its build timestamp).
   baseline-1 and baseline-2 have the same kernel commit but different boot,
@@ -1492,13 +1497,15 @@ enqueued never counts.
   read never counts as zero entries.
 - **The sysrq guard (Opus 6).** `Device.adb` refuses an argument that names
   `/proc/sysrq-trigger`, which only takes writes, and allows other uses of
-  "sysrq", such as reading `/proc/sys/kernel/sysrq`.
+  "sysrq", such as reading `/proc/sys/kernel/sysrq`. (Round 5, R5-9: only
+  writes to it are refused.)
 - **`allowance_for` (Gemini 1)** needs all three proofs, including
   `proof_unmarked_rejected`.
 - **No `console-ramoops*` (Gemini 2).** On a gated path whose chain step 1
   showed does not survive, a pstore with no `console-ramoops*` file is not a
   read error (the chain is UNVERIFIED and doesn't count there). Everywhere
-  else it still is.
+  else it still is. (Removed in round 5, R5-12: missing is a read error on
+  every path.)
 - **`leave_marker` (Gemini 3)** reads `boot_id` with a checked read and
   writes no marker if the read failed or came back empty.
 - **`chain_survives` (Gemini 4)** answers only for the gated paths. On the
@@ -1532,3 +1539,144 @@ wipe).**
   larger than any difference between the paths, so no path effect shows.
   The same spread is larger than the charter's 5 and 10 MB margins on a
   used phone; RAM rows for verdicts come from freshly wiped phones.
+
+## Code review round 5: changes to R4
+
+Status: specified 2026-11-23 from the round-5 code review of `ee53080`.
+Everything in round 4 stands except as changed here. Where this section and
+an earlier one disagree, this one wins.
+
+**R5-1. Slot recovery clears fb_mode on the way to the fallback.** Round 4
+ran the generic `fbmode.recover` as a preflight of every `flash` mode. With
+an obligation pending and the failed candidate active in fastboot, it
+cleared fb_mode, resolved the entry and booted the candidate; a candidate
+that never booted timed out and `flash` exited before rollback. Now:
+- `flash --rollback`, `flash --recover` and rescue never call
+  `fbmode.recover`. They get to fastboot (`flashing.to_fastboot`, which
+  never clears or boots anything), clear fb_mode
+  (`fbmode.clear_in_fastboot`), set the fallback active, erase userdata (the
+  rollback procedure), reboot, verify slot and build, and only then resolve
+  the entry (`fbmode.settle`). The active slot is never booted first.
+- A host that dies between the clear and the reboot leaves the entry
+  pending; the next `flash --rollback` or `flash --recover` finds the phone
+  in fastboot and goes on from there.
+- `fbmode.recover`, for callers that want Android (calibration, `phone-qa`,
+  `device-bench`, journal recovery, `phone-qa recover`), resolves the entry
+  only after the boot completed, so it too resumes after a kill between the
+  clear and the boot. With `boot=False` it never boots, even after taking
+  the phone out of Android, and resolves right after the clear.
+- A failed `fb_mode_clear` with nothing pending is logged and the rescue or
+  rollback goes on. With an obligation pending, the fallback is still set
+  active, then the run halts (exit 3) and the entry stays.
+- `flash --recover` with no pair and an obligation pending (or the phone
+  found in fastboot): if `known_good_slot` is the active slot, clear, set it
+  active, reboot, verify slot and build, resolve, and record
+  `fb-mode-recovered` in `slot-state.json`. If another slot is active (a
+  dev flash), clear, resolve, leave the phone in fastboot and exit 1 with
+  the two ways on (`flash --rollback`, which wipes, or `fastboot reboot`).
+  It never switches slots without the rollback's wipe. Before the first
+  baseline (no `slot-state.json`) it falls back to `fbmode.recover`.
+- `flash --recover` that decides promote boots the candidate with
+  `fbmode.recover` first (the candidate is the slot to keep). One that
+  decides halt leaves fb_mode alone.
+- Dev flashes (`flash <env|dir>`, with or without `--no-reboot`) recover
+  with `boot=False` (R5-16): they only need fastboot. Batch and dev flashes
+  refuse an unresolved pair before they touch the phone. `--batch` and
+  `--promote` still recover with a boot, since they need Android.
+- The `sysrq` extra-pass control clears fb_mode in fastboot and resolves
+  the entry only once Android booted.
+- `fbmode.clear_in_fastboot` is used by rollback, rescue, `write_images`
+  and the control (R5-18).
+
+**R5-2. The boot time is the first completion seen.** `completed_status`
+returns the first status read that saw boot completed and, separately, the
+read whose uptime is used. `host_boot_seconds` (the charter's 55 s) comes
+from the first; a fast re-read after a slow one only supplies uptime
+evidence and makes `elapsed` longer. `BootRecord.status_reads` lists every
+read after completion (`at_s` from the reboot command, `read_s`, `used`),
+and calibration prints them when a retry happened.
+
+**R5-3. Renewed proofs need a clean, current record.** `boot-timing.json`
+records `rules_version` (`calibrate.CALIBRATION_RULES`, 2 for round 4's
+bracketed clock and clean-sample rules; bump it when those rules change).
+`phone-qa controls --boot-timing` refuses, before it touches the phone, a
+record with another `rules_version` or none, or whose own samples, run
+through `compute_paths` again, don't give every gated path the stored A (3
+clean bracketed normals and a clean injected sample). A legacy record
+never qualifies; run `phone-qa boot-timing`. The rules version is used
+instead of the harness version: `controls --boot-timing` exists to renew
+the proofs after a harness change, so it can't require the harness that
+measured A.
+
+**R5-4. The RAM reference follows the verdict.** `regression.ram_decision`
+is the one RAM schedule decision, used by `evaluate` and `update_on_tag`.
+The reference moves only on a 3-boot median the verdict itself used. When
+the verdict judged bench boot 1 alone, the other rows never move it.
+Before, a 1,230 MB reference with rows 1,200 / 1,150 / 1,150 on a one-boot
+verdict became 1,150 MB.
+
+**R5-5. Only a complete torch capture can qualify the control.**
+`torch_capture` sets `complete` only with exactly two frames, both with a
+real `FLASH_STATE` (0-4), and a finite luma pair. `torch_rejections`
+returns nothing for an incomplete capture, even when its luma pair fails
+the delta. The normal check is unchanged.
+
+**R5-6. Kernel batches cover every boot input (R5-17).** A batch also
+counts as a kernel batch, compared with the latest known-good build, when:
+- `device/motorola/river/BoardConfig*.mk`,
+  `device/motorola/sdm632-common/BoardConfigCommon.mk`,
+  `vendor/lineage/config/BoardConfigKernel.mk` or
+  `vendor/lineage/build/tasks/kernel.mk` changed (`git diff --name-only`
+  between the two commit sets' commits);
+- a kernel toolchain pin in `default.xml` changed (projects under
+  `prebuilts/clang/`, `prebuilts/gcc/`, `prebuilts/kernel-build-tools`,
+  `prebuilts/build-tools`, `prebuilts/tools-lineage`, `prebuilts/misc`);
+- the boot image header version differs, or either image's header version
+  is above 2 (the command line offsets are only known for v0-v2);
+- the kernel's embedded config (`IKCONFIG`, gzip between `IKCFG_ST` and
+  `IKCFG_ED` in the decompressed kernel) differs, or only one image has
+  one. river's kernel has `CONFIG_IKCONFIG=y`; baseline-1 and baseline-2
+  carry the same config.
+- or anything above can't be compared (a missing commit set entry, a commit
+  git doesn't have, an unreadable image).
+The defconfig and every fragment named by `TARGET_KERNEL_CONFIG` resolve
+inside the kernel source (`arch/<arch>/configs`), so the kernel commit and
+IKCONFIG cover them; the `TARGET_KERNEL_CONFIG` line itself is in
+`BoardConfig.mk`.
+
+**Smaller changes.**
+- **R5-7, R5-19. Tests.** `qa/tests/_path.py` always makes a fresh
+  temporary `$BENCH_HOME`, ignores an inherited `QA_TESTS_BENCH_HOME` or
+  `BENCH_HOME`, and removes it at exit. `tests/benchhome.bench_home`
+  redirects every module-level path under `$BENCH_HOME` in every `riverqa`
+  module (found by scanning them, so a new copy is covered too).
+- **R5-8.** `disconnect_gap` and `status_read_s` keep full precision; the
+  0.5 s and 1 s bounds apply to them unrounded.
+- **R5-9.** The sysrq guard refuses only writes to `/proc/sysrq-trigger`
+  (a redirection, `tee`, `dd of=`, or `cp`/`mv`/`ln`/`install` onto it).
+  Read-only mentions (`ls`, `stat`, `test -e`, `grep`) are allowed.
+- **R5-10.** The session banner matches within 2 flips
+  (`bootsig.BANNER_FLIPS`), and only at a printk line start: at most 24
+  bytes of prefix after the line start, with at most 2 ASCII letters in it
+  (the prefix can be damaged too: river's real banner line reads
+  `[    0.\xb000000] Linu\xf8 ver\xf3ion`). `minor version ` (3 flips) and
+  message text no longer match. All 12 saved river pstore logs still show
+  exactly one banner, at the head.
+- **R5-11, R5-15.** `device-bench` halts (exit 3) when `fbmode.recover`
+  fails; `phone-qa boot-timing` and `controls --boot-timing` exit 1 with
+  `error:`; the `flash` preflight turns a recovery `TimeoutError` into a
+  HALT. The obligation stays pending in each case.
+- **R5-12. The chain counts on every path.** `chain_survives` is a record
+  only. A path whose chain doesn't survive can never qualify (a clean
+  sample needs a chain PASS, so it gets no A), and a path with 3 clean
+  samples plus one that wasn't, which round 4 marked `survives: false`,
+  must not lose its chain. A missing `console-ramoops*` is a read error on
+  every path. This replaces A2.1 item 3's "a chain UNVERIFIED does not
+  count" and round 4's Gemini 2 exception.
+- **R5-13.** No device job (`flash`, `device-bench`, `phone-qa`,
+  calibration) starts while a build holds `$BENCH_HOME/.lock`; an
+  unreadable build lock also refuses. A build that starts after a device job
+  is not blocked by this; the runner builds first and then runs the device
+  jobs in sequence.
+- **R5-14.** `boot_count_now` returns None (no count, so the sample is not
+  clean) when its last read failed, never an older count.
