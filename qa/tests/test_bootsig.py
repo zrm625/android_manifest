@@ -269,6 +269,23 @@ class Anchor(unittest.TestCase):
         self.assertIsNone(anchor)
         self.assertIn("no intact exact copy", why)
 
+    def test_river_step1_flips_are_unverified_not_fuzzy(self):
+        # The 2026-11-23 step-1 log (qa-harness-r1 1faf721): the only exact
+        # copy has a damaged stamp; the other copies keep their stamps but
+        # have flipped marker bytes. Round 3 forbids taking a stamp from a
+        # fuzzy copy, so this boot is UNVERIFIED and is rerun.
+        log = line(0.0, b"Linux version 4.9.337") + line(1.0, b"init")
+        log += b"[\xa0 100.00\xb3000] " + MARKER.encode() + b"\n"
+        log += line(100.000031, MARKER.replace(":1111", ":1i11").encode())
+        log += line(100.00006, MARKER.replace(":", "\xaa", 1).encode("latin-1"))
+        log += b"".join(line(t, b"shutdown step") for t in NORMAL)
+        pair = pair_for(copies=3)
+        anchor, why = b.reset_anchor(log, MARKER, pair, None, 1.5)
+        self.assertIsNone(anchor)
+        self.assertIn("no intact exact copy", why)
+        rec = self.judge(record(marker_pair=pair), log)
+        self.assertEqual(rec.uptime_check[0], UNVERIFIED)
+
     def test_copy_mixing(self):
         # Copy 1 has a good stamp but a damaged nonce; copy 2 has the exact
         # text but a damaged stamp. Nothing may combine the two.
