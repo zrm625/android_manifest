@@ -9,8 +9,9 @@
    since the clock start, minus a bootloader allowance A set by calibration.
    On the fastboot path the clock starts at the USB disconnect after the
    final ``fastboot reboot``. On the adb path it starts at the old kernel's
-   reset (amendment A1, reset_anchor), because river's USB gadget drops
-   seconds before the reset. Any unplanned fastboot enumeration counts as an
+   reset (amendment A1, reset_anchor: one exact marker record and a clean
+   tail, otherwise UNVERIFIED), because river's USB gadget drops seconds
+   before the reset. Any unplanned fastboot enumeration counts as an
    extra boot.
 3. Boot count: dropbox SYSTEM_BOOT entries since the wipe equal the boots
    expected since the wipe.
@@ -71,13 +72,9 @@ def stamps(log: bytes) -> list[float]:
 
 def corroborated_last(ts: list[float], run: int = 3, window_s: float = 1.0) -> float | None:
     """The earliest stamp of the last run of ``run`` consecutive
-    non-decreasing stamps spanning at most ``window_s`` (amendment A1, D2;
-    review round 2). ramoops flips bits. A flipped stamp that leaves the
-    window (120 -> 128, 41.1 -> 45.1) breaks the run. One that stays inside
-    it (110.0 -> 110.4 after 109.7, 109.9) can end a run, but the run's
-    first stamp is either a true stamp or, if it is the flipped one, no
-    later than the true stamp after it. So one flip can never move the
-    result past the true last stamp. None if there is no such run."""
+    non-decreasing stamps spanning at most ``window_s``. Used only by the
+    chain to spot a log that ends seconds into a boot (a FAIL signal); the
+    A1 reset anchor uses the strict rule in clean_tail instead."""
     for i in range(len(ts) - 1, run - 2, -1):
         seq = ts[i - run + 1:i + 1]
         if all(x <= y for x, y in zip(seq, seq[1:])) and seq[-1] - seq[0] <= window_s:
@@ -86,114 +83,199 @@ def corroborated_last(ts: list[float], run: int = 3, window_s: float = 1.0) -> f
 
 
 def last_timestamp(log: bytes) -> float | None:
-    """A trustworthy timestamp near the end of the previous kernel's log
-    (see corroborated_last), or None. Used to spot a log that ends seconds into a
-    boot; never the maximum of the last few stamps."""
+    """A timestamp near the end of the previous kernel's log (see
+    corroborated_last), or None. Chain only."""
     return corroborated_last(stamps(log[-8192:]))
 
 
-MARKER_TS_TOL_S = 0.05   # live readback vs pstore: the same write, allowing for a flipped low digit
-LOOSE_TS_RE = re.compile(rb"(\d{1,6})[^\d\n](\d{6})")
+# --- amendment A1: the strict reset anchor (code review round 3) -------------
+#
+# Any ambiguity is UNVERIFIED. The marker is found by an exact match, every
+# number comes from that one record, and the reset is the stamp of the log's
+# final line only if the whole tail after the record is clean. Corruption
+# turns into an UNVERIFIED boot and a rerun, never a different anchor.
+
+STRICT_STAMP_RE = re.compile(rb"\[( *)(\d{1,6})\.(\d{6})\] ")
+END_K = 5               # the last END_K lines must agree within END_WINDOW_S
+END_WINDOW_S = 1.5      # river's last 5 shutdown lines span 1.12 s ("SMP: failed to stop" waits 1.1 s)
+FINAL_K = 3             # the last FINAL_K lines must agree within FINAL_WINDOW_S
+FINAL_WINDOW_S = 0.05   # river's last 3 lines ("Going down for restart now", ...) span under 1 ms
+MEASURE_MAX_GAP_S = 5.0  # the consecutive-stamp ceiling while step 1 measures (no calibration yet)
+GAP_MARGIN_S = 1.0      # calibrated max_stamp_gap = the largest gap step 1 saw + this
 
 
-def marker_stamps_in_log(log: bytes, marker: str, max_flips: int = 3) -> list[float]:
-    """The printk timestamps of the copies of ``marker`` in a pstore log.
-    Exact copies if there are any, otherwise copies within ``max_flips``
-    wrong characters. The stamp is read from the start of the copy's own
-    line with a tolerant parse (any one byte between the seconds and the
-    microseconds, brackets ignored), because ramoops flips bits there too."""
-    m = marker.encode()
-    offs, start = [], 0
-    while True:
-        i = log.find(m, start)
-        if i < 0:
-            break
-        offs.append(i)
-        start = i + 1
-    if not offs:
-        off = find_marker(log, marker, max_flips)
-        offs = [] if off is None else [off]
-    out = []
-    for off in offs:
-        line = log[log.rfind(b"\n", 0, off) + 1:off]
-        hit = TS_RE.search(line) or LOOSE_TS_RE.search(line)
-        if hit:
-            out.append(int(hit.group(1)) + int(hit.group(2)) / 1e6)
+def _strict_at(buf: bytes, pos: int) -> tuple[float, int] | None:
+    """(stamp, end) of a strictly parsed stamp starting at ``pos``: the
+    kernel's own "[%5lu.%06lu] " layout with no leading zero."""
+    m = STRICT_STAMP_RE.match(buf, pos)
+    if not m:
+        return None
+    pad, sec = m.group(1), m.group(2)
+    if len(sec) > 1 and sec.startswith(b"0"):
+        return None                     # a padding space flipped to '0'
+    if len(pad) + len(sec) != max(5, len(sec)):
+        return None
+    return int(sec) + int(m.group(3)) / 1e6, m.end()
+
+
+def line_stamps(line: bytes) -> list[float] | None:
+    """Every printk stamp in one console line, parsed strictly. The line
+    must start with one. A record printed without a trailing newline puts
+    the next record's stamp later on the same line (river's
+    msm_pm_qos_remove_request does this); every such stamp-shaped token
+    must parse strictly too. None if anything does not parse."""
+    first = _strict_at(line, 0)
+    if first is None:
+        return None
+    out, pos = [first[0]], first[1]
+    for m in TS_RE.finditer(line, pos):
+        hit = _strict_at(line, m.start())
+        if hit is None:
+            return None
+        out.append(hit[0])
     return out
 
 
+def strict_stamp(line: bytes) -> float | None:
+    """The first stamp of a line if the whole line parses strictly
+    (line_stamps), else None."""
+    st = line_stamps(line)
+    return None if st is None else st[0]
+
+
+def marker_record(log: bytes, marker: str) -> tuple[int, float] | None:
+    """(offset, stamp) of the last intact copy of ``marker``: a strictly
+    parsed stamp, the exact marker straight after it, then the end of the
+    line. No fuzzy matching anywhere. None if no copy is intact."""
+    m = marker.encode()
+    found, start = None, 0
+    while True:
+        i = log.find(m, start)
+        if i < 0:
+            return found
+        start = i + 1
+        j = log.rfind(b"[", max(0, i - 16), i)
+        if j < 0 or log[i + len(m):i + len(m) + 1] not in (b"\n", b""):
+            continue
+        hit = _strict_at(log, j)
+        if hit is not None and hit[1] == i:
+            found = (j, hit[0])
+
+
+def clean_tail(log: bytes, start: int, max_gap_s: float) -> tuple[list[float] | None, str]:
+    """The stamps of every line from ``start`` (the marker record) to the
+    end of the log, if the tail is clean; otherwise (None, why). Clean:
+    every line parses strictly (line_stamps), the stamps never decrease,
+    no two consecutive stamps are more than ``max_gap_s`` apart, the last
+    END_K lines span at most END_WINDOW_S and the last FINAL_K lines at
+    most FINAL_WINDOW_S."""
+    lines = log[start:].split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()                     # the log's own final newline
+    ts = []
+    for n, line in enumerate(lines):
+        t = line_stamps(line)
+        if t is None:
+            return None, f"line {n} after the marker record does not parse strictly: {line[:40]!r}"
+        ts.extend(t)
+    if len(ts) < END_K + 1:
+        return None, f"only {len(ts) - 1} lines after the marker record (need {END_K})"
+    for a, b in zip(ts, ts[1:]):
+        if b < a:
+            return None, f"stamps decrease after the marker ({a:.6f} then {b:.6f})"
+        if b - a > max_gap_s:
+            return None, f"{b - a:.2f} s between consecutive stamps ({a:.6f}, {b:.6f}) exceeds {max_gap_s:.2f} s"
+    if ts[-1] - ts[-END_K] > END_WINDOW_S:
+        return None, f"the last {END_K} lines span {ts[-1] - ts[-END_K]:.3f} s (> {END_WINDOW_S} s)"
+    if ts[-1] - ts[-FINAL_K] > FINAL_WINDOW_S:
+        return None, f"the last {FINAL_K} lines span {ts[-1] - ts[-FINAL_K]:.3f} s (> {FINAL_WINDOW_S} s)"
+    return ts, ""
+
+
+def max_gap(ts: list[float]) -> float:
+    return max((b - a for a, b in zip(ts, ts[1:])), default=0.0)
+
+
+def _same_us(a: float, b: float) -> bool:
+    return round(a * 1e6) == round(b * 1e6)
+
+
 def reset_anchor(pstore_log: bytes, marker: str, pair: dict,
-                 tail_bound: tuple[float, float] | None) -> tuple[dict | None, str]:
-    """Map the old kernel's reset onto the host's monotonic clock (A1).
+                 tail_bound: tuple[float, float] | None,
+                 max_gap_s: float) -> tuple[dict | None, str]:
+    """Map the old kernel's reset onto the host's monotonic clock (A1,
+    strict rule from code review round 3).
 
-    ``pair`` ties the leaving marker's own printk timestamp (read back from
-    live dmesg right after one verified write) to the host time of that
-    write: {"marker", "printk_ts", "host_mono", "half_width"}. printk and the
-    marker share one clock, so no /proc/uptime (CLOCK_BOOTTIME) is involved.
+    ``pair`` ties the leaving marker's printk stamps (every copy, read back
+    from live dmesg right after one verified write) to the host time of
+    that write: {"marker", "printk_ts", "printk_ts_all", "host_mono",
+    "half_width"}. printk and the marker share one clock.
 
-    The pair must be for this marker, and the marker's own stamp in pstore
-    must match the live readback within MARKER_TS_TOL_S; otherwise the
-    readback and the log are not the same write and the result is
-    UNVERIFIED (review round 2). The gap to the reset is measured inside
-    pstore, from the marker's pstore stamp to the reset stamp, so both come
-    from one log. The reset is the earliest stamp of the last corroborated
-    run after the marker (corroborated_last); it must not precede the
-    marker. The result is the earliest host time the reset could have been:
-    the pairing's half-width and the live/pstore difference are both taken
-    off. With ``tail_bound`` (disconnect, disconnect + the largest
-    calibrated shutdown tail) the anchor must fall inside it, allowing for
-    that uncertainty. Anything ambiguous or out of bounds: (None, why)."""
+    1. The marker record is the last intact copy of this exact marker in
+       pstore (marker_record). No intact copy: UNVERIFIED.
+    2. Its stamp must equal one of the live readback's stamps to the
+       microsecond (the console and dmesg print the same record), so the
+       pairing and the log are the same write. Otherwise UNVERIFIED.
+    3. The tail from that record to the end must be clean (clean_tail).
+       The reset is the stamp of the final line. A flip that leaves the
+       final line inside FINAL_WINDOW_S of the lines before it can't be
+       told apart, so the earliest host time also takes off the span of
+       the last FINAL_K lines.
+    4. With ``tail_bound`` (disconnect, disconnect + the largest calibrated
+       shutdown tail) the anchor must fall inside it.
+
+    Anything else: (None, why)."""
     if pair.get("marker") != marker:
         return None, f"the printk pairing is for {pair.get('marker')}, not this boot's marker {marker}"
-    off = find_marker(pstore_log, marker)
-    if off is None:
-        return None, "leaving marker not in the previous kernel's log"
-    live = float(pair["printk_ts"])
-    found = marker_stamps_in_log(pstore_log, marker)
-    if not found:
-        return None, "the leaving marker's own timestamp in pstore is unreadable"
-    pts = min(found, key=lambda t: abs(t - live))
-    slack = abs(pts - live)
-    if slack > MARKER_TS_TOL_S:
-        return None, (f"the leaving marker's pstore stamp {pts:.6f} does not match the live readback "
-                      f"{live:.6f}: not the same write")
-    after = stamps(pstore_log[off:])
-    anchor = corroborated_last(after)
-    if anchor is None:
-        return None, f"no corroborated timestamps after the marker ({len(after)} stamps)"
-    if anchor < pts:
-        return None, f"reset stamp {anchor:.3f} precedes the marker's {pts:.3f}"
-    hw = float(pair["half_width"]) + slack
-    mid = float(pair["host_mono"]) + (anchor - pts)
-    earliest, latest = mid - hw, mid + hw
+    rec = marker_record(pstore_log, marker)
+    if rec is None:
+        return None, "no intact exact copy of the leaving marker in the previous kernel's log"
+    off, pts = rec
+    live = [float(x) for x in (pair.get("printk_ts_all") or [pair["printk_ts"]])]
+    if not any(_same_us(pts, x) for x in live):
+        return None, (f"the leaving marker's pstore stamp {pts:.6f} is not one of the live readback's "
+                      f"stamps {', '.join(f'{x:.6f}' for x in live)}: not the same write")
+    ts, why = clean_tail(pstore_log, off, max_gap_s)
+    if ts is None:
+        return None, f"tail after the marker is not clean: {why}"
+    final = ts[-1]
+    span = final - ts[-FINAL_K]
+    hw = float(pair["half_width"])
+    mid = float(pair["host_mono"]) + (final - pts)
+    earliest, latest = mid - hw - span, mid + hw
     if tail_bound is not None:
         lo, hi = tail_bound
         if latest < lo or earliest > hi:
             return None, (f"reset at {mid - lo:+.2f} s from the USB disconnect is outside "
                           f"[0, {hi - lo:.2f}] s (the largest calibrated shutdown tail)")
-    return {"printk_ts": anchor, "marker_ts": pts, "marker_ts_live": live, "host_mono": earliest,
-            "half_width": hw, "tail_s": None if tail_bound is None else round(earliest - tail_bound[0], 3)}, \
-        f"reset at printk {anchor:.3f} s, {anchor - pts:.2f} s after the marker (pstore)"
+    return {"printk_ts": final, "marker_ts": pts, "marker_ts_live": live, "host_mono": earliest,
+            "half_width": hw, "final_span": round(span, 6), "max_gap": round(max_gap(ts), 6),
+            "tail_lines": len(ts) - 1,
+            "tail_s": None if tail_bound is None else round(earliest - tail_bound[0], 3)}, \
+        f"reset at printk {final:.6f} s, {final - pts:.2f} s after the marker (pstore, {len(ts) - 1} clean lines)"
 
 
-def marker_printk_ts(dmesg: str, marker: str) -> float | None:
-    """The printk timestamp of the last copy of ``marker`` in live dmesg."""
-    found = None
+def marker_printk_stamps(dmesg: str, marker: str) -> list[float]:
+    """The printk stamps of every copy of ``marker`` in live dmesg, in order."""
+    out = []
     for line in dmesg.splitlines():
-        if marker in line:
-            m = TS_RE.search(line.encode())
+        if line.rstrip().endswith(marker):
+            m = TS_RE.match(line.encode())
             if m:
-                found = int(m.group(1)) + int(m.group(2)) / 1e6
-    return found
+                out.append(int(m.group(1)) + int(m.group(2)) / 1e6)
+    return out
 
 
 def chain_verdict(pstore_log: bytes | None, marker: str | None) -> tuple[str, str]:
-    """Judge the kernel-log chain for one boot."""
+    """Judge the kernel-log chain for one boot. PASS needs an exact copy of
+    the marker (code review round 3); a copy found only with bit flips is
+    UNVERIFIED, unless a new kernel session follows it (FAIL)."""
     if not marker:
         return UNVERIFIED, "no leaving marker was written before this boot"
     if pstore_log is None or len(pstore_log) == 0:
         return UNVERIFIED, "pstore console-ramoops missing or empty"
-    off = find_marker(pstore_log, marker)
+    exact = pstore_log.rfind(marker.encode())
+    off = exact if exact >= 0 else find_marker(pstore_log, marker)
     if off is None:
         # Without the marker this can only be FAIL or UNVERIFIED. A log too
         # short to corroborate is judged by its few stamps.
@@ -210,6 +292,8 @@ def chain_verdict(pstore_log: bytes | None, marker: str | None) -> tuple[str, st
     after = pstore_log[off:]
     if BANNER_RE.search(after):
         return FAIL, "a new kernel session started after the leaving marker"
+    if exact < 0:
+        return UNVERIFIED, "the leaving marker is only in the log with bit flips (no exact copy)"
     return PASS, "previous kernel log ends with the leaving marker"
 
 

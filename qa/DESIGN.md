@@ -865,25 +865,56 @@ reset, mapped onto host time:
    can't pair an older write's printk time with a newer host interval. If no
    write can be bracketed and read back, the boot has no pairing and its
    uptime signal is UNVERIFIED.
-2. **Bit flips can't move the anchor later.** At the next boot completion,
-   the previous kernel's log in pstore gives the reset time: the **earliest**
-   stamp of the last run of 3 consecutive non-decreasing stamps after the
-   marker that spans at most 1 s. A flipped stamp that leaves the window
-   (120 → 128, 41.1 → 45.1) breaks the run. One that stays inside it
-   (110.000000 → 110.400000 after 109.7 and 109.9) can end a run, but the
-   run's first stamp is a true stamp or, if it is the flipped one, no later
-   than the true stamp after it. So one flip never moves the anchor past the
-   true last stamp. The marker's own timestamp in pstore (tolerant parse)
-   must match the live readback within 50 ms; otherwise the readback and the
-   log are not the same write, and the result is UNVERIFIED. The gap from the
-   marker to the reset is measured inside pstore, from that pstore stamp, so
-   both values come from one log on one clock; the live/pstore difference is
-   added to the pairing's uncertainty. The anchor must not precede the
-   marker. Its host time must
-   fall between the USB disconnect and the disconnect plus the largest
-   shutdown tail calibration measured, allowing for the pairing's
-   uncertainty. Of the possible host times, the earliest is used. Anything
-   ambiguous or out of bounds is UNVERIFIED.
+2. **Strict anchor: any ambiguity is UNVERIFIED** (code review round 3,
+   replacing the "last corroborated run" heuristic). At the next boot
+   completion the previous kernel's log in pstore gives the reset time:
+   - **One exact record.** The marker record is the last intact copy of this
+     boot's exact marker: a strictly parsed stamp, the full marker straight
+     after it, then the end of the line. There is no fuzzy matching. If no
+     copy is intact, the result is UNVERIFIED. The marker is written four
+     times, so one intact copy is usually enough.
+   - **Every number from that record.** The live readback records the
+     printk stamp of every copy. The record's pstore stamp must equal one of
+     them to the microsecond (the console and `dmesg` print the same
+     record), or the readback and the log are not the same write. The gap to
+     the reset is measured from that stamp, and the tail starts at that
+     record.
+   - **The reset is the final line, only if the tail is clean.** Clean
+     means: every line from the record to the end of the log starts with a
+     stamp in the kernel's own `[%5lu.%06lu] ` layout (no leading zero, no
+     damaged byte), and any further stamp on the same line (a record
+     printed without a newline) parses the same way; the stamps never
+     decrease; no two consecutive stamps are more than the calibrated
+     `max_stamp_gap` apart; the last 5 lines span at most 1.5 s; and the
+     last 3 lines span at most 50 ms. Anything else is UNVERIFIED; the
+     harness never picks the most plausible stamp. Corruption becomes an
+     UNVERIFIED boot and a rerun, never a different anchor.
+   - **A flip inside the final window.** A flip that leaves the final stamp
+     within 50 ms of the two lines before it can't be told apart, so the
+     span of the last 3 lines is taken off the anchor. With one flip, the
+     anchor is never later than the true reset. A unit test flips every bit
+     of every byte from the marker copies to the end and checks this.
+   - **Bounds.** The anchor must not precede the marker. Its host time must
+     fall between the USB disconnect and the disconnect plus the largest
+     shutdown tail calibration measured, allowing for the pairing's
+     uncertainty. Of the possible host times, the earliest is used.
+   - **Silent tail.** The kernel may log nothing between its last line and
+     the real reset (a slower shutdown that goes quiet). That time can't be
+     measured from the log, and it isn't bounded. It is safe for the uptime
+     check: the anchor stays at the last line while the new kernel starts
+     later by the quiet time, so the measured bootloader pass grows by
+     exactly that amount. A quiet tail can turn a PASS into a FAIL, never a
+     FAIL into a PASS (unit test `test_silent_tail_only_makes_it_stricter`).
+     The residual risk is only that the recorded shutdown tail
+     (disconnect to last line) understates a slow shutdown; the tail bound
+     is a sanity check on the anchor, not a verdict, so this can't hide an
+     extra pass.
+   - **Measured cost on river.** On the three `baseline-1` adb captures
+     the tails after the marker held 130-172 lines with 1, 4 and 68 lines
+     whose stamp was damaged. None is clean under this rule, so expect many
+     adb boots to be UNVERIFIED and rerun. Two of the three would pass if
+     damaged lines before the last 5 were skipped; that relaxation is not
+     part of this rule and needs the council.
 3. **Only with a passing chain.** The anchor is used only when that boot's
    chain verdict is PASS, so the matching leaving marker is in that same log.
    The adb path never falls back to the disconnect clock: without an anchor,
@@ -897,7 +928,10 @@ reset, mapped onto host time:
 
 **Calibration.** Step 1 (`phone-qa boot-timing`) sets A on the adb path only
 from reboots that got an anchor, and records their shutdown tails
-(disconnect to reset); the largest is the bound in rule 2. The bound must
+(disconnect to reset); the largest is the bound in rule 2. While it
+measures, the gap between consecutive stamps is capped at 5 s; the largest
+gap any anchored step-1 tail had, plus 1 s, becomes `max_stamp_gap`. Without
+it the adb path has no anchor. The bound must
 include the first adb reboot after a wipe, which is every batch's first bench
 boot and has the longest tail. So step 1 runs straight after `flash --wipe`,
 its first adb reboot is that reboot (one `SYSTEM_BOOT` in dropbox), and the
@@ -922,7 +956,7 @@ is still independent of both.
 first adb reboot after the wipe must get an anchor, later adb boots, and both
 injected controls on each path. These runs also show on the phone that the
 checked kmsg write, the base64 pstore read (its size must match `stat`) and
-the 50 ms live/pstore marker match work as designed. Then the order of
+the microsecond live/pstore marker match and the clean-tail rule work as designed. Then the order of
 qualification in the README.
 
 ## Code review round 2: changes to the amendment and the design

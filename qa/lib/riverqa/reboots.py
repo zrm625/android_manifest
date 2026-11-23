@@ -130,9 +130,12 @@ def leave_marker(dev: Device) -> tuple[str | None, str | None, dict | None]:
             r = dev.read(f"dmesg | grep -F {m}", timeout=20)
         except (TimeoutError, RuntimeError):
             break
-        ts = bootsig.marker_printk_ts(r.out, m) if r.ok else None
-        if ts is not None:
-            pair = {"marker": m, "printk_ts": ts, "host_mono": (t0 + t1) / 2, "half_width": (t1 - t0) / 2}
+        ts = bootsig.marker_printk_stamps(r.out, m) if r.ok else []
+        if ts:
+            # Every copy's stamp: the boot judge matches the one intact pstore
+            # record against these to the microsecond (review round 3).
+            pair = {"marker": m, "printk_ts": ts[-1], "printk_ts_all": ts,
+                    "host_mono": (t0 + t1) / 2, "half_width": (t1 - t0) / 2}
         break
     return marker, bid, pair
 
@@ -268,6 +271,13 @@ def tail_bound(rec: BootRecord, timing: dict) -> tuple[float, float] | None:
     return None if tail is None else (rec.disconnect_mono, rec.disconnect_mono + float(tail))
 
 
+def stamp_gap_bound(rec: BootRecord, timing: dict) -> float | None:
+    """The calibrated largest gap between consecutive stamps in a clean
+    shutdown tail (review round 3), or None if calibration recorded none."""
+    g = ((timing.get("paths") or {}).get(rec.path) or {}).get("max_stamp_gap")
+    return None if g is None else float(g)
+
+
 def judge_signals(dev: Device, rec: BootRecord, timing: dict | None = None, *, measuring: bool = False) -> None:
     """Fill in the chain and uptime verdicts (reads pstore as root)."""
     from .evidence import read_pstore
@@ -286,10 +296,13 @@ def judge_record(rec: BootRecord, log: bytes | None, timing: dict, *, measuring:
 
     The fastboot path keeps the disconnect clock. The adb path starts the
     clock at the old kernel's reset (amendment A1): only if this boot's chain
-    is PASS, the marker write was paired with its printk timestamp, and the
-    anchor falls inside the calibrated shutdown tail. Otherwise its uptime
-    signal is UNVERIFIED; it never falls back to the disconnect.
-    ``measuring``: step 1 before any tail is calibrated (no bound)."""
+    is PASS, the marker write was paired with its printk timestamp, the
+    tail after the one intact marker record is clean (bootsig.clean_tail,
+    with the calibrated stamp-gap bound) and the anchor falls inside the
+    calibrated shutdown tail. Otherwise its uptime signal is UNVERIFIED; it
+    never falls back to the disconnect.
+    ``measuring``: step 1 before anything is calibrated (no tail bound, the
+    gap ceiling bootsig.MEASURE_MAX_GAP_S)."""
     rec.chain = bootsig.chain_verdict(log, rec.marker)
     if rec.pstore_read_error:
         rec.chain = (UNVERIFIED, f"pstore read failed: {rec.pstore_read_error}")
@@ -306,10 +319,13 @@ def judge_record(rec: BootRecord, log: bytes | None, timing: dict, *, measuring:
         why = "the leaving marker was not paired with its printk timestamp"
     else:
         bound = None if measuring else tail_bound(rec, timing)
+        gap = bootsig.MEASURE_MAX_GAP_S if measuring else stamp_gap_bound(rec, timing)
         if bound is None and not measuring:
             why = "no calibrated shutdown tail for the adb path"
+        elif gap is None:
+            why = "no calibrated stamp-gap bound for the adb path"
         else:
-            anchor, why = bootsig.reset_anchor(log, rec.marker, rec.marker_pair, bound)
+            anchor, why = bootsig.reset_anchor(log, rec.marker, rec.marker_pair, bound, gap)
     rec.anchor_note = why
     if anchor is None:
         rec.clock_source = "none"

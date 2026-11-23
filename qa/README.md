@@ -193,11 +193,15 @@ separate a normal boot from one with an extra bootloader pass. Amendment A1
 
 - the leaving marker's host write time is paired with its own printk
   timestamp, read back from `dmesg`;
-- the marker's own timestamp in pstore must match that readback, and the gap
-  to the reset is measured inside pstore from it;
-- the reset is the earliest stamp of the last run of three consecutive
-  non-decreasing pstore stamps within 1 s after the marker, so a bit flip
-  can't move it later;
+- the marker is found in pstore by an exact match only: the last intact copy
+  (strict stamp, full marker, end of line). Its stamp must equal one of the
+  readback's copy stamps to the microsecond, and the gap to the reset is
+  measured inside pstore from it;
+- the reset is the stamp of the log's final line, and only if the tail after
+  that record is clean: every line's stamp parses strictly, stamps never
+  decrease, no gap exceeds the calibrated `max_stamp_gap`, the last 5 lines
+  span at most 1.5 s and the last 3 at most 50 ms. Anything else is
+  UNVERIFIED, so ramoops corruption means a rerun, never a different anchor;
 - it must fall between the USB disconnect and the disconnect plus the largest
   calibrated shutdown tail;
 - it is used only when that boot's chain is PASS. Otherwise the adb-path
@@ -208,6 +212,12 @@ measurements behind the change are in `$BENCH_HOME/qa/anchor-experiment.json`.
 `boot-timing` has to be re-run on the phone before the new clock is usable.
 
 ## Known issues
+
+- **Damaged pstore stamps make adb boots UNVERIFIED.** ramoops has no ECC.
+  On the three `baseline-1` adb captures, 1, 4 and 68 lines after the marker
+  had a damaged stamp, so none would get an anchor under the strict
+  clean-tail rule. Expect adb-path uptime signals to be UNVERIFIED often,
+  and reruns. See DESIGN.md, amendment A1, rule 2.
 
 - **The shutdown-tail bound comes from step 1 only.** The bound is the
   largest tail among step 1's normal adb reboots, which must include the

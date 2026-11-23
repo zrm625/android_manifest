@@ -61,9 +61,11 @@ def one(dev: Device, w: UsbWatcher, path: str, timing: dict, *, inject=False, ma
     _ok, log_bytes, _why = read_pstore(dev, "console-ramoops*")
     exact = log_bytes.count(rec.marker.encode()) if rec.marker else 0
     fuzzy = bootsig.find_marker(log_bytes, rec.marker) is not None if rec.marker else False
+    intact = bootsig.marker_record(log_bytes, rec.marker) is not None if rec.marker else False
     d = rec.to_json()
     d["marker_copies_exact"] = exact
     d["marker_found_fuzzy"] = fuzzy
+    d["marker_record_intact"] = intact
     d["pstore_bytes"] = len(log_bytes)
     d["pstore_last_ts"] = bootsig.last_timestamp(log_bytes)
     if count_before is not None:
@@ -150,6 +152,13 @@ def compute_paths(data: dict) -> None:
             p["clock"] = "reset-anchor"
             p["shutdown_tails"] = tails
             p["first_after_wipe_tails"] = wipe_tails
+            # The consecutive-stamp gap bound for the clean-tail rule
+            # (bootsig.clean_tail, review round 3): the largest gap any
+            # anchored step-1 tail had, plus a margin.
+            gaps = [r["anchor"].get("max_gap") for r in adb_ok]
+            p["stamp_gaps"] = gaps
+            p["max_stamp_gap"] = (round(max(gaps) + bootsig.GAP_MARGIN_S, 3)
+                                  if gaps and all(g is not None for g in gaps) else None)
             if wipe_tails:
                 p["max_shutdown_tail"] = round(max(tails), 3)
             else:
@@ -163,7 +172,8 @@ def prove(dev: Device, w: UsbWatcher, data: dict) -> None:
     tail bound. allowance_for() only uses A once both proofs are recorded."""
     for path in reboots.PATHS:
         p = data["paths"].get(path) or {}
-        if p.get("A") is None or (path == "adb" and p.get("max_shutdown_tail") is None):
+        if p.get("A") is None or (path == "adb" and (p.get("max_shutdown_tail") is None
+                                                       or p.get("max_stamp_gap") is None)):
             continue
         proof_timing = {"paths": {path: dict(p, proof_normal_pass=True, proof_control_rejected=True)}}
         normal = one(dev, w, path, proof_timing)
@@ -198,6 +208,8 @@ def summary(data: dict) -> list[str]:
         if path == "adb":
             tail = (f"; shutdown-tail bound {p.get('max_shutdown_tail')} s" if p.get("max_shutdown_tail") is not None
                     else f"; no shutdown-tail bound ({p.get('tail_why')})")
+            tail += (f"; stamp-gap bound {p.get('max_stamp_gap')} s" if p.get("max_stamp_gap") is not None
+                     else "; no stamp-gap bound")
         out.append(f"  {path:8} A={p['A']} ({p.get('why')}); extra pass {p.get('extra_pass')} s (flash path "
                    f"{p.get('extra_pass_flash_path')} s, injected increment {p.get('extra_pass_injected_increment')} s)"
                    f"{tail}; normal boot passes: {p.get('proof_normal_pass')}; extra pass rejected by uptime: "
