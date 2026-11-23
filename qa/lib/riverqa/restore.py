@@ -270,8 +270,12 @@ def _bond(run, e):
 
 def _bt_discoverable(run, e):
     host_run(["bluetoothctl", "discoverable", "on" if e["original"] == "yes" else "off"], timeout=20)
-    show = host_run(["bluetoothctl", "show"], timeout=20).stdout
-    return f"Discoverable: {e['original']}" in show, f"host Discoverable: {e['original']}"
+    r = host_run(["bluetoothctl", "show"], timeout=20)
+    if r.returncode != 0:
+        # A failed show is not proof of the state (review round 4).
+        return False, f"bluetoothctl show failed (exit {r.returncode}): not proof Discoverable is {e['original']}"
+    ok = re.search(rf"^\s*Discoverable: {re.escape(str(e['original']))}\s*$", r.stdout or "", re.M) is not None
+    return ok, f"host Discoverable: {e['original'] if ok else 'not ' + str(e['original'])}"
 
 
 def _adb_reverse(run, e):

@@ -245,7 +245,7 @@ Usage: dumpsys dropbox [--print|--file] [YYYY-mm-dd] [HH:MM:SS] [tag]
         self.assertEqual(b.boot_count_verdict(tags, 3)[0], UNVERIFIED)
 
 
-GATED = {"A": 12.0, "proof_normal_pass": True, "proof_control_rejected": True}
+GATED = {"A": 12.0, "proof_normal_pass": True, "proof_control_rejected": True, "proof_unmarked_rejected": True}
 TIMING = {"paths": {"sysrq": dict(GATED), "fastboot": dict(GATED)}}
 
 
@@ -307,7 +307,20 @@ class Judge(unittest.TestCase):
         t = {"paths": {"sysrq": {"A": 12.3, "proof_normal_pass": True, "proof_control_rejected": False}}}
         self.assertIsNone(reboots.allowance_for("sysrq", t))
         t["paths"]["sysrq"]["proof_control_rejected"] = True
+        # Review round 4 (Gemini 1): the unmarked proof is needed too.
+        self.assertIsNone(reboots.allowance_for("sysrq", t))
+        t["paths"]["sysrq"]["proof_unmarked_rejected"] = True
         self.assertEqual(reboots.allowance_for("sysrq", t), 12.3)
+
+    def test_chain_survives_only_on_gated_paths(self):
+        """Review round 4 (Gemini 4): an adb chain record never turns off
+        the chain on bench boot 1."""
+        timing = {"chain": {"adb": {"survives": False}, "sysrq": {"survives": False}}}
+        self.assertIsNone(reboots.chain_survives("adb", timing))
+        self.assertFalse(reboots.chain_survives("sysrq", timing))
+        sig = {"chain": [UNVERIFIED, "x"], "uptime": [INFO, "x"], "boot_count": [PASS, "ok"]}
+        self.assertEqual(reboots.combined_verdict(sig, "adb", timing)[0], UNVERIFIED)
+        self.assertEqual(reboots.combined_verdict(dict(sig, uptime=[PASS, "x"]), "sysrq", timing)[0], PASS)
 
 
 def raw(bootloader_pass, chain=PASS, **kw):
@@ -498,12 +511,30 @@ class Calibration(unittest.TestCase):
 class CheckedPstoreRead(unittest.TestCase):
     """The boot judge reads pstore through the checked binary read (R2-4)."""
 
-    def judge(self, files):
+    def judge(self, files, timing=TIMING, path="sysrq"):
         from fakes import FakeShell
         dev = FakeShell({}, {r"console-ramoops": files})
-        rec = record()
-        reboots.judge_signals(dev, rec, TIMING)
+        rec = record(path)
+        reboots.judge_signals(dev, rec, timing)
         return rec
+
+    def test_missing_console_ramoops_where_the_chain_does_not_survive(self):
+        """Review round 4 (Gemini 2): on a gated path whose chain step 1
+        showed does not survive, no console-ramoops at all is not a read
+        error; elsewhere it still is."""
+        dead = dict(TIMING, chain={"sysrq": {"survives": False}, "fastboot": {"survives": True}})
+        rec = self.judge((0, []), dead)                     # glob matched nothing
+        self.assertEqual(rec.pstore_read_error, "")
+        self.assertEqual(rec.chain[0], UNVERIFIED)
+        sig = {"chain": list(rec.chain), "uptime": list(rec.uptime_check), "boot_count": [PASS, "ok"],
+               "reboot": rec.to_json()}
+        self.assertEqual(reboots.combined_verdict(sig, "sysrq", dead)[0], PASS)
+        # A real read failure is still an error there.
+        self.assertTrue(self.judge((5, []), dead).pstore_read_error)
+        # Where the chain survives, and on adb, missing is an error.
+        self.assertTrue(self.judge((0, []), dead, path="fastboot").pstore_read_error)
+        self.assertTrue(self.judge((0, []), dict(dead, chain={"adb": {"survives": False}}), path="adb")
+                        .pstore_read_error)
 
     def test_good_read_passes(self):
         rec = self.judge((0, shutdown_log()))
@@ -540,15 +571,15 @@ class LeaveMarker(unittest.TestCase):
         def root(self):
             pass
 
-        def boot_id(self):
-            return "aaaaaaaa-bbbb"
+        boot_id_read = (0, "aaaaaaaa-bbbb\n")
+
+        def read(self, cmd, timeout=30):
+            assert cmd == "cat /proc/sys/kernel/random/boot_id", f"no live readback under A2.1: {cmd}"
+            return Read(*self.boot_id_read)
 
         def kmsg(self, text):
             self.markers.append(text)
             return self.ok.pop(0)
-
-        def read(self, cmd, timeout=30):
-            raise AssertionError(f"no live readback under A2.1: {cmd}")
 
     def test_marker_written(self):
         dev = self.Dev()
@@ -562,6 +593,15 @@ class LeaveMarker(unittest.TestCase):
         marker, _bid = reboots.leave_marker(dev)
         self.assertEqual(marker, dev.markers[1])
         self.assertNotEqual(dev.markers[0], dev.markers[1])
+
+    def test_failed_or_empty_boot_id_read_writes_no_marker(self):
+        """Review round 4 (Gemini 3): a checked boot_id read; nothing is
+        written if it failed or came back empty."""
+        for reply in ((1, "aaaaaaaa-bbbb\n"), (0, "\n"), (0, "")):
+            dev = self.Dev()
+            dev.boot_id_read = reply
+            self.assertEqual(reboots.leave_marker(dev), (None, None), reply)
+            self.assertEqual(dev.markers, [])
 
     def test_all_writes_fail(self):
         dev = self.Dev(writes_ok=(False, False, False))

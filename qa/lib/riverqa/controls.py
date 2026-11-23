@@ -22,6 +22,8 @@ Kinds:
 
 from __future__ import annotations
 
+import hashlib
+
 import copy
 import json
 import os
@@ -261,7 +263,8 @@ def host_control(name: str) -> tuple[bool, str]:
                     # Each merge went into an unmoved river-22.2: the merge
                     # commit's tree is the tested commit's tree.
                     repo = cmd[2].split("/")[1] + "/" + cmd[2].split("/")[2]
-                    return subprocess.CompletedProcess(cmd, 0, f"tree-{repo}\n", "")
+                    tree = hashlib.sha1(f"tree-{repo}".encode()).hexdigest()
+                    return subprocess.CompletedProcess(cmd, 0, tree + "\n", "")
                 if cmd[0] == "gh":
                     repo = cmd[cmd.index("--repo") + 1]
                     return subprocess.CompletedProcess(cmd, 0, json.dumps(

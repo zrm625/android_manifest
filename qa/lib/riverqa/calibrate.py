@@ -222,7 +222,7 @@ def prove(dev: Device, w: UsbWatcher, data: dict) -> None:
         p = data["paths"].get(path) or {}
         if p.get("A") is None:
             continue
-        proof_timing = {"paths": {path: dict(p, proof_normal_pass=True, proof_control_rejected=True)}}
+        proof_timing = {"paths": {path: dict(p, **{k: True for k in reboots.PROOFS})}}
         normal = one(dev, w, path, proof_timing)
         p["proof_normal"] = normal
         p["proof_normal_pass"] = normal["uptime_check"][0] == PASS
@@ -282,8 +282,7 @@ def qualified(data: dict) -> bool:
     """Every gated path has all three proofs (a normal boot passed, the
     marked extra pass was rejected by the uptime check and the unmarked one
     by the enumeration rule), and the adb chain control qualified."""
-    return all(all((data.get("paths", {}).get(p) or {}).get(k)
-                   for k in ("proof_normal_pass", "proof_control_rejected", "proof_unmarked_rejected"))
+    return all(all((data.get("paths", {}).get(p) or {}).get(k) for k in reboots.PROOFS)
                for p in reboots.GATED_PATHS) and bool(
         ((data.get("controls") or {}).get(ADB_CHAIN_CONTROL) or {}).get("qualified"))
 

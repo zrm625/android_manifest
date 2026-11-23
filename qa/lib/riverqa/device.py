@@ -168,7 +168,10 @@ SYSRQ_REBOOT = "sync; echo b > /proc/sysrq-trigger"
 
 
 def _is_sysrq(args: tuple) -> bool:
-    return any("sysrq" in str(a) for a in args)
+    """A write to the sysrq trigger (review round 4): any argument naming
+    /proc/sysrq-trigger, which only takes writes. Other uses of the word,
+    such as reading /proc/sys/kernel/sysrq, are allowed."""
+    return any("sysrq-trigger" in str(a) for a in args)
 
 
 class Device:

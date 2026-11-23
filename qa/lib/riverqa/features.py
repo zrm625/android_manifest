@@ -1622,7 +1622,8 @@ def launch_and_watch(run, cid, key, start_cmd, accept_vpn_dialog=False) -> Resul
         return Result(cid, FAIL, f"not in front after launch (top {helper.fmt_top(top)})", d)
     if crashed:
         return Result(cid, FAIL, f"crash or ANR within 10 s: {crashed}", d)
-    return Result(cid, PASS, f"{f['package']} {f['version']} opened ({top}), no crash or ANR for 10 s", d)
+    return Result(cid, PASS, f"{f['package']} {f['version']} opened ({helper.fmt_top(top)}), no crash or ANR "
+                             "for 10 s", d)
 
 
 def check_tailscale(run):

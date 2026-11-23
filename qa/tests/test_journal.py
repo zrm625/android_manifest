@@ -283,5 +283,26 @@ class Handlers(unittest.TestCase):
         self.assertTrue(failed)
 
 
+class BtDiscoverable(unittest.TestCase):
+    """Review round 4 (Gemini 6): a failed `bluetoothctl show` is not proof."""
+
+    def restore(self, rc, out):
+        import subprocess
+        from unittest import mock
+        from riverqa import restore
+
+        def host_run(cmd, timeout=20):
+            return subprocess.CompletedProcess(cmd, rc if cmd[1] == "show" else 0, out, "")
+        with mock.patch.object(restore, "host_run", host_run):
+            return restore._bt_discoverable(None, {"original": "no"})
+
+    def test_show_must_succeed(self):
+        good = "Controller AA:BB Forge\n\tPowered: yes\n\tDiscoverable: no\n"
+        self.assertTrue(self.restore(0, good)[0])
+        self.assertFalse(self.restore(1, good)[0])
+        self.assertFalse(self.restore(0, "\tDiscoverable: yes\n")[0])
+        self.assertFalse(self.restore(0, "")[0])
+
+
 if __name__ == "__main__":
     unittest.main()

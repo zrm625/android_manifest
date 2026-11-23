@@ -34,7 +34,7 @@ def phone(slot="b", build_id=BID):
 def runner(merged, tagged):
     def run(cmd):
         if cmd[:2] == ["gh", "api"]:
-            return subprocess.CompletedProcess(cmd, 0, "T\n", "")     # merges into an unmoved branch
+            return subprocess.CompletedProcess(cmd, 0, "1" * 40 + "\n", "")   # merges into an unmoved branch
         if cmd[0] == "gh":
             n = int(cmd[3])
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"state": "MERGED" if merged[n] else "OPEN",

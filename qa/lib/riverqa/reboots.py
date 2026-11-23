@@ -47,6 +47,7 @@ from .results import FAIL, INFO, PASS, UNVERIFIED, worst
 TIMING_FILE = "qa/boot-timing.json"
 PATHS = ("adb", "sysrq", "fastboot")
 GATED_PATHS = ("fastboot", "sysrq")     # the paths with an uptime gate, calibrated by step 1
+PROOFS = ("proof_normal_pass", "proof_control_rejected", "proof_unmarked_rejected")
 
 
 def load_timing() -> dict:
@@ -58,16 +59,23 @@ def save_timing(data: dict) -> None:
 
 
 def allowance_for(path: str, timing: dict | None = None) -> float | None:
-    """A for a path, only if calibration proved it (a normal boot passed and
-    the injected extra pass was rejected by the uptime check itself)."""
+    """A for a path, only if calibration proved it: a normal boot passed, the
+    injected extra pass was rejected by the uptime check itself, and the
+    unmarked one by the enumeration rule (review round 4)."""
     timing = load_timing() if timing is None else timing
     p = (timing.get("paths") or {}).get(path) or {}
-    if p.get("A") is None or not p.get("proof_normal_pass") or not p.get("proof_control_rejected"):
+    if p.get("A") is None or not all(p.get(k) for k in PROOFS):
         return None
     return float(p["A"])
 
 
 def chain_survives(path: str, timing: dict | None = None) -> bool | None:
+    """Step 1's record of whether the chain survives this path. Only the
+    gated paths have one (review round 4): on the adb path the chain is
+    bench boot 1's main signal and always counts, whatever an old file
+    says. None for any other path."""
+    if path not in GATED_PATHS:
+        return None
     timing = load_timing() if timing is None else timing
     return ((timing.get("chain") or {}).get(path) or {}).get("survives")
 
@@ -111,11 +119,17 @@ def leave_marker(dev: Device) -> tuple[str | None, str | None]:
     Each attempt writes a new marker with its own nonce, and its write
     status is checked (review round 2). A failed write is retried with a new
     nonce and never becomes the leaving marker. marker is None if adb root
-    failed or no write succeeded (the chain is then UNVERIFIED)."""
+    failed, the boot_id read failed or was empty, or no write succeeded
+    (the chain is then UNVERIFIED)."""
     try:
         dev.root()
-        bid = dev.boot_id()
+        r = dev.read("cat /proc/sys/kernel/random/boot_id")
     except (TimeoutError, RuntimeError):
+        return None, None
+    # A checked read (review round 4): a failed or empty boot_id read never
+    # becomes part of a marker.
+    bid = r.out.strip() if r.ok else ""
+    if not bid:
         return None, None
     for _ in range(3):
         m = bootsig.make_marker(bid)
@@ -319,7 +333,10 @@ def judge_signals(dev: Device, rec: BootRecord, timing: dict | None = None) -> N
     timing = load_timing() if timing is None else timing
     try:
         dev.root()
-        ok, data, why = read_pstore(dev, "console-ramoops*")
+        # A path where step 1 showed the chain does not survive may have no
+        # console-ramoops at all: that is not a read error (review round 4).
+        ok, data, why = read_pstore(dev, "console-ramoops*",
+                                    missing_ok=chain_survives(rec.path, timing) is False)
     except (TimeoutError, RuntimeError) as e:
         ok, data, why = False, b"", str(e)
     rec.pstore_read_error = "" if ok else (why or "pstore read failed")

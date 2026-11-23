@@ -81,6 +81,17 @@ class RebootGuard(unittest.TestCase):
                     Device().sh(cmd)
         self.assertFalse(any("sysrq" in " ".join(c) for c in fake.cmds))
 
+    def test_only_a_trigger_write_is_refused(self):
+        """Review round 4 (Opus 6): reading the sysrq setting is fine."""
+        fake = FakeRun()
+        with mock.patch.object(device, "run", fake):
+            Device().sh("cat /proc/sys/kernel/sysrq")
+            Device().adb("shell", "getprop | grep -i sysrq")
+            for cmd in ("echo c >/proc/sysrq-trigger", "printf b | tee /proc/sysrq-trigger"):
+                with self.assertRaises(GuardError):
+                    Device().sh(cmd)
+        self.assertEqual(sum("sysrq" in " ".join(c) for c in fake.cmds), 2)
+
     def test_sysrq_reboot_after_the_guard_and_as_root(self):
         class Root(FakeRun):
             def __call__(self, cmd, timeout, input=None, text=True, env=None):

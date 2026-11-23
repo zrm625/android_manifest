@@ -1481,3 +1481,28 @@ enqueued never counts.
   9.89-9.93 s, not the fastboot path's figure; A2 rule 7 names
   `pstore-nopass/`; and A2's residual risk states that a bootloader reset in
   the first ~2 s falls under the margin and is outside the threat model.
+- **One enumeration for a read (Sol).** `Device.read_files` lists the
+  directory once with `ls` and reads exactly the listed names that match the
+  pattern (a shell `case`, globbing off). A listed file that is gone when it
+  is read fails the whole read.
+- **Checked boot counts (Sol).** `reboots.read_boot_count` and
+  `calibrate.boot_count_now` use the checked `dumpsys dropbox` read. A failed
+  read never counts as zero entries.
+- **The sysrq guard (Opus 6).** `Device.adb` refuses an argument that names
+  `/proc/sysrq-trigger`, which only takes writes, and allows other uses of
+  "sysrq", such as reading `/proc/sys/kernel/sysrq`.
+- **`allowance_for` (Gemini 1)** needs all three proofs, including
+  `proof_unmarked_rejected`.
+- **No `console-ramoops*` (Gemini 2).** On a gated path whose chain step 1
+  showed does not survive, a pstore with no `console-ramoops*` file is not a
+  read error (the chain is UNVERIFIED and doesn't count there). Everywhere
+  else it still is.
+- **`leave_marker` (Gemini 3)** reads `boot_id` with a checked read and
+  writes no marker if the read failed or came back empty.
+- **`chain_survives` (Gemini 4)** answers only for the gated paths. On the
+  adb path the chain always counts.
+- **`recovery.tree_of` (Gemini 5)** accepts only a 40-hex tree hash.
+- **`restore._bt_discoverable` (Gemini 6)** checks the exit status of
+  `bluetoothctl show` and matches the whole `Discoverable:` line.
+- **Log format (Gemini 7).** The app-launch PASS summary prints the top
+  activity with `helper.fmt_top`.

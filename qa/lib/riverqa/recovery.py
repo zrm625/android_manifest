@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 
 from .core import run
+from .stage import SHA_RE
 
 PR_FIELDS = "number,state,mergedAt,url,mergeCommit,headRefOid,baseRefName"
 
@@ -55,7 +56,9 @@ def tree_of(runner, repo: str, commit: str) -> str | None:
     if r.returncode != 0:
         return None
     t = r.stdout.strip()
-    return t or None
+    # Only a real tree hash (review round 4): an error page or a partial
+    # answer with exit 0 is a failed lookup.
+    return t if SHA_RE.match(t) else None
 
 
 def lookup(batch: dict, runner=None, slugs: dict[str, str] | None = None) -> dict | None:

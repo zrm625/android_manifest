@@ -104,6 +104,7 @@ class Transitions(unittest.TestCase):
 # The tested commit set: repos a and b have PRs, c has none.
 COMMITS = {"a": "a" * 40, "b": "b" * 40, "c": "c" * 40}
 SLUGS = {k: f"zrm625/{k}" for k in COMMITS}
+TREE, TREE2 = "1" * 40, "2" * 40
 
 
 def stub_runner(merged, tags, fail=None, tag_commit=None, annotated=True, heads=None, base=None, trees=None):
@@ -111,14 +112,14 @@ def stub_runner(merged, tags, fail=None, tag_commit=None, annotated=True, heads=
     are the tested commits unless ``heads`` says otherwise; PR bases are
     river-22.2 unless ``base`` says otherwise. A tag in repo zrm625/<x>
     points at tag_commit[x] or, by default, its PR's merge commit (or, for
-    c, the tested commit). Every commit's tree is "T" (the merges went into
+    c, the tested commit). Every commit's tree is TREE (the merges went into
     an unmoved branch) unless ``trees`` maps a commit to another tree."""
     def run(cmd):
         if fail and cmd[0] == fail:
             return subprocess.CompletedProcess(cmd, 1, "", "network down")
         if cmd[:2] == ["gh", "api"]:
             commit = cmd[2].rsplit("/", 1)[1]
-            return subprocess.CompletedProcess(cmd, 0, (trees or {}).get(commit, "T") + "\n", "")
+            return subprocess.CompletedProcess(cmd, 0, (trees or {}).get(commit, TREE) + "\n", "")
         if cmd[0] == "gh":
             n = int(cmd[3])
             repo = "ab"[n]
@@ -214,11 +215,22 @@ class Recovery(unittest.TestCase):
     def test_pr_must_merge_into_river_22_2(self):
         self.assertEqual(self.decide([True, True], ALL, base={"a": "main"}), slots.HALT)
 
+    def test_tree_lookup_must_return_a_sha(self):
+        """Review round 4 (Gemini 5): exit 0 with something that isn't a tree
+        hash is a failed lookup, never a tree."""
+        for out in ("T\n", "", "<html>rate limited</html>\n", "1" * 39 + "\n", "1" * 40 + "x\n"):
+            r = lambda cmd, out=out: subprocess.CompletedProcess(cmd, 0, out, "")
+            self.assertIsNone(recovery.tree_of(r, "zrm625/a", "a" * 40), out)
+        ok = lambda cmd: subprocess.CompletedProcess(cmd, 0, "1" * 40 + "\n", "")
+        self.assertEqual(recovery.tree_of(ok, "zrm625/a", "a" * 40), "1" * 40)
+        look = recovery.lookup(BATCH, stub_runner([True, True], ALL, trees={"m1": "T"}), SLUGS)
+        self.assertIsNone(look)
+
     def test_tagged_tree_must_be_the_tested_tree(self):
         # b's PR was merged into a river-22.2 that had moved on: the merge
         # commit's tree holds content that was never tested.
-        self.assertEqual(self.decide([True, True], ALL, trees={"m1": "T2"}), slots.HALT)
-        look = recovery.lookup(BATCH, stub_runner([True, True], ALL, trees={"m1": "T2"}), SLUGS)
+        self.assertEqual(self.decide([True, True], ALL, trees={"m1": TREE2}), slots.HALT)
+        look = recovery.lookup(BATCH, stub_runner([True, True], ALL, trees={"m1": TREE2}), SLUGS)
         errs = slots.commit_set_proof(BATCH, look, SLUGS)
         self.assertTrue(any("tested tree" in e for e in errs), errs)
 
