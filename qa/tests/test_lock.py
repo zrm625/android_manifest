@@ -59,5 +59,32 @@ class Lock(unittest.TestCase):
             os.environ.pop("BENCH_LOCK_TOKEN")
 
 
+class DurableWrite(unittest.TestCase):
+    def test_parent_directory_is_fsynced_after_the_rename(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        from riverqa import core
+        calls = []
+        real_replace, real_fsync = os.replace, os.fsync
+
+        def replace(a, b):
+            calls.append(("replace", b))
+            return real_replace(a, b)
+
+        def fsync(fd):
+            calls.append(("fsync-dir" if os.path.isdir(f"/proc/self/fd/{fd}") else "fsync-file", fd))
+            return real_fsync(fd)
+
+        with tempfile.TemporaryDirectory() as t, mock.patch.object(core.os, "replace", replace), \
+                mock.patch.object(core.os, "fsync", fsync):
+            core.write_json(Path(t) / "x.json", {"a": 1})
+            self.assertEqual(core.read_json(Path(t) / "x.json"), {"a": 1})
+        kinds = [c[0] for c in calls]
+        self.assertEqual(kinds, ["fsync-file", "replace", "fsync-dir"])
+
+
 if __name__ == "__main__":
     unittest.main()

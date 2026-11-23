@@ -242,17 +242,26 @@ def host_control(name: str) -> tuple[bool, str]:
             prs = [{"repo": "zrm625/android_manifest", "number": 1},
                    {"repo": "zrm625/android_device_motorola_river", "number": 2}]
             by_slug = {slugs[p]: p for p in repos}
-            wj(core.batch_dir("ctl") / "batch.json", {
-                "batch": "ctl", "kind": "batch", "build_id": bid, "vendor_build_id": bid, "commit_set": commits,
-                "commit_set_hash": h, "prs": prs, "tag": "known-good-ctl", "merge_started": {"at": "t3"},
-                "tag_repos": [f"https://github.com/{slugs[p]}" for p in repos]})
+            batch = {"batch": "ctl", "kind": "batch", "build_id": bid, "vendor_build_id": bid,
+                     "commit_set": commits, "commit_set_hash": h, "prs": prs,
+                     "no_pr": [p for p in repos if slugs[p] not in {x["repo"] for x in prs}],
+                     "tag": "known-good-ctl",
+                     "tag_repos": [f"https://github.com/{slugs[p]}" for p in repos]}
+            expected, _ = slots.expected_pr_set(batch, slugs)
+            batch["merge_started"] = {"at": "t3", "expected_prs": expected}
+            wj(core.batch_dir("ctl") / "batch.json", batch)
             merge = {p["repo"]: f"{0xabc0 + p['number']:040x}" for p in prs}
 
             def stub(cmd):
+                if cmd[:2] == ["gh", "api"]:
+                    # Each merge went into an unmoved river-22.2: the merge
+                    # commit's tree is the tested commit's tree.
+                    repo = cmd[2].split("/")[1] + "/" + cmd[2].split("/")[2]
+                    return subprocess.CompletedProcess(cmd, 0, f"tree-{repo}\n", "")
                 if cmd[0] == "gh":
                     repo = cmd[cmd.index("--repo") + 1]
                     return subprocess.CompletedProcess(cmd, 0, json.dumps(
-                        {"state": "MERGED", "url": f"https://github.com/{repo}/pull/x",
+                        {"state": "MERGED", "url": f"https://github.com/{repo}/pull/x", "baseRefName": "river-22.2",
                          "headRefOid": commits[by_slug[repo]], "mergeCommit": {"oid": merge[repo]}}), "")
                 repo = cmd[3].removeprefix("https://github.com/")
                 at = merge.get(repo) or commits[by_slug[repo]]

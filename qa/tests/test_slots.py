@@ -106,20 +106,26 @@ COMMITS = {"a": "a" * 40, "b": "b" * 40, "c": "c" * 40}
 SLUGS = {k: f"zrm625/{k}" for k in COMMITS}
 
 
-def stub_runner(merged, tags, fail=None, tag_commit=None, annotated=True, heads=None):
+def stub_runner(merged, tags, fail=None, tag_commit=None, annotated=True, heads=None, base=None, trees=None):
     """gh and git ls-remote stand-ins. Merge commits are m0, m1...; PR heads
-    are the tested commits unless ``heads`` says otherwise. A tag in repo
-    zrm625/<x> points at tag_commit[x] or, by default, its PR's merge commit
-    (or, for c, the tested commit)."""
+    are the tested commits unless ``heads`` says otherwise; PR bases are
+    river-22.2 unless ``base`` says otherwise. A tag in repo zrm625/<x>
+    points at tag_commit[x] or, by default, its PR's merge commit (or, for
+    c, the tested commit). Every commit's tree is "T" (the merges went into
+    an unmoved branch) unless ``trees`` maps a commit to another tree."""
     def run(cmd):
         if fail and cmd[0] == fail:
             return subprocess.CompletedProcess(cmd, 1, "", "network down")
+        if cmd[:2] == ["gh", "api"]:
+            commit = cmd[2].rsplit("/", 1)[1]
+            return subprocess.CompletedProcess(cmd, 0, (trees or {}).get(commit, "T") + "\n", "")
         if cmd[0] == "gh":
             n = int(cmd[3])
             repo = "ab"[n]
             return subprocess.CompletedProcess(cmd, 0, json.dumps({
-                "state": "MERGED" if merged[n] else "OPEN", "url": f"u{n}",
+                "number": n, "state": "MERGED" if merged[n] else "OPEN", "url": f"u{n}",
                 "headRefOid": (heads or {}).get(repo, COMMITS[repo]),
+                "baseRefName": (base or {}).get(repo, "river-22.2"),
                 "mergeCommit": {"oid": f"m{n}"} if merged[n] else None}), "")
         repo = cmd[3].rsplit("/", 1)[1]
         if not tags[repo]:
@@ -131,10 +137,14 @@ def stub_runner(merged, tags, fail=None, tag_commit=None, annotated=True, heads=
     return run
 
 
-BATCH = {"commit_set": COMMITS,
-         "prs": [{"repo": "zrm625/a", "number": 0}, {"repo": "zrm625/b", "number": 1}], "tag": "kg-1",
-         "tag_repos": ["https://github.com/zrm625/a", "https://github.com/zrm625/b",
-                       "https://github.com/zrm625/c"]}
+EXPECTED = {"a": {"repo": "zrm625/a", "number": 0}, "b": {"repo": "zrm625/b", "number": 1},
+            "c": {"repo": "zrm625/c", "number": None}}
+UNSTARTED = {"commit_set": COMMITS,
+             "prs": [{"repo": "zrm625/a", "number": 0}, {"repo": "zrm625/b", "number": 1}], "no_pr": ["c"],
+             "tag": "kg-1",
+             "tag_repos": ["https://github.com/zrm625/a", "https://github.com/zrm625/b",
+                           "https://github.com/zrm625/c"]}
+BATCH = dict(UNSTARTED, merge_started={"at": "t", "expected_prs": EXPECTED})
 ALL = {"a": True, "b": True, "c": True}
 NONE = {"a": False, "b": False, "c": False}
 
@@ -142,7 +152,7 @@ NONE = {"a": False, "b": False, "c": False}
 class Recovery(unittest.TestCase):
     def decide(self, merged, tags, kind="batch", fail=None, batch=None, **kw):
         batch = batch or BATCH
-        look = recovery.lookup(batch, stub_runner(merged, tags, fail, **kw))
+        look = recovery.lookup(batch, stub_runner(merged, tags, fail, **kw), SLUGS)
         return slots.decide_recovery({"kind": kind, "batch": "b"}, look, batch, SLUGS)[0]
 
     def test_all_merged_and_tagged_promotes(self):
@@ -172,7 +182,8 @@ class Recovery(unittest.TestCase):
         self.assertEqual(self.decide([True, True], ALL, batch=stale), slots.HALT)
 
     def test_none_rolls_back(self):
-        self.assertEqual(self.decide([False, False], NONE), slots.ROLLBACK)
+        self.assertEqual(self.decide([False, False], NONE, batch=UNSTARTED), slots.ROLLBACK)
+        self.assertEqual(self.decide([False, False], NONE), slots.HALT)      # merge_started: mid-merge
 
     def test_partial_halts(self):
         self.assertEqual(self.decide([True, False], NONE), slots.HALT)
@@ -181,6 +192,52 @@ class Recovery(unittest.TestCase):
     def test_lookup_failure_halts(self):
         self.assertEqual(self.decide([False, False], NONE, fail="gh"), slots.HALT)
         self.assertEqual(self.decide([False, False], NONE, fail="git"), slots.HALT)
+
+    # --- review round 3: the frozen PR set, the base branch and the tree ---
+
+    def test_no_frozen_pr_set_never_promotes(self):
+        self.assertEqual(self.decide([True, True], ALL, batch=UNSTARTED), slots.HALT)
+        old = dict(UNSTARTED, merge_started={"at": "t"})                  # recorded without the set
+        self.assertEqual(self.decide([True, True], ALL, batch=old), slots.HALT)
+
+    def test_repo_cannot_drop_from_pr_to_no_pr(self):
+        # After merge_started, the runner rewrites b as "no PR" and drops its
+        # PR: recovery still looks b's PR up from the frozen set, and the
+        # changed record halts.
+        dropped = dict(BATCH, prs=[{"repo": "zrm625/a", "number": 0}], no_pr=["b", "c"])
+        self.assertEqual(self.decide([True, True], ALL, batch=dropped), slots.HALT)
+        look = recovery.lookup(dropped, stub_runner([True, True], ALL), SLUGS)
+        self.assertEqual(sorted(p["repo"] for p in look["prs"]), ["zrm625/a", "zrm625/b"])
+        errs = slots.commit_set_proof(dropped, look, SLUGS)
+        self.assertTrue(any("changed after merge_started" in e for e in errs), errs)
+
+    def test_pr_must_merge_into_river_22_2(self):
+        self.assertEqual(self.decide([True, True], ALL, base={"a": "main"}), slots.HALT)
+
+    def test_tagged_tree_must_be_the_tested_tree(self):
+        # b's PR was merged into a river-22.2 that had moved on: the merge
+        # commit's tree holds content that was never tested.
+        self.assertEqual(self.decide([True, True], ALL, trees={"m1": "T2"}), slots.HALT)
+        look = recovery.lookup(BATCH, stub_runner([True, True], ALL, trees={"m1": "T2"}), SLUGS)
+        errs = slots.commit_set_proof(BATCH, look, SLUGS)
+        self.assertTrue(any("tested tree" in e for e in errs), errs)
+
+    def test_tree_lookup_failure_halts(self):
+        def run(cmd, inner=stub_runner([True, True], ALL)):
+            if cmd[:2] == ["gh", "api"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "rate limited")
+            return inner(cmd)
+        self.assertIsNone(recovery.lookup(BATCH, run, SLUGS))
+
+    def test_expected_pr_set(self):
+        exp, errs = slots.expected_pr_set(UNSTARTED, SLUGS)
+        self.assertEqual(exp, EXPECTED, errs)
+        for bad in (dict(UNSTARTED, no_pr=[]),                                  # c has neither
+                    dict(UNSTARTED, no_pr=["c", "a"]),                          # a has both
+                    dict(UNSTARTED, prs=UNSTARTED["prs"] + [{"repo": "zrm625/z", "number": 9}]),
+                    dict(UNSTARTED, prs=[{"repo": "zrm625/a", "number": "0"}, UNSTARTED["prs"][1]])):
+            self.assertIsNone(slots.expected_pr_set(bad, SLUGS)[0], bad)
+        self.assertIsNone(slots.expected_pr_set(UNSTARTED, dict(SLUGS, a="lineage/a"))[0])
 
     def test_pairs_without_prs_roll_back(self):
         for kind in ("baseline", "calibration", "experiment"):
@@ -203,20 +260,17 @@ class MergeStarted(unittest.TestCase):
         self.assertEqual(self.decide(self.EMPTY, merge_started={"at": "t"}), slots.HALT)
 
     def test_nothing_merged_with_marker_halts(self):
-        look = recovery.lookup(BATCH, stub_runner([False, False], NONE))
-        self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, BATCH, SLUGS)[0], slots.ROLLBACK)
-        started = dict(BATCH, merge_started={"at": "t"})
-        self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, started, SLUGS)[0], slots.HALT)
+        look = recovery.lookup(UNSTARTED, stub_runner([False, False], NONE), SLUGS)
+        self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, UNSTARTED, SLUGS)[0], slots.ROLLBACK)
+        self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, BATCH, SLUGS)[0], slots.HALT)
 
     def test_partial_with_marker_halts(self):
-        started = dict(BATCH, merge_started={"at": "t"})
-        look = recovery.lookup(started, stub_runner([True, False], NONE))
-        self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, started, SLUGS)[0], slots.HALT)
+        look = recovery.lookup(BATCH, stub_runner([True, False], NONE), SLUGS)
+        self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, BATCH, SLUGS)[0], slots.HALT)
 
     def test_complete_with_marker_promotes(self):
-        started = dict(BATCH, merge_started={"at": "t"})
-        look = recovery.lookup(started, stub_runner([True, True], ALL))
-        self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, started, SLUGS)[0], slots.PROMOTE)
+        look = recovery.lookup(BATCH, stub_runner([True, True], ALL), SLUGS)
+        self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, BATCH, SLUGS)[0], slots.PROMOTE)
 
 
 if __name__ == "__main__":

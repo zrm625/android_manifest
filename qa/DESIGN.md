@@ -166,15 +166,28 @@ owns the whole sequence and holds one lock across all of it.
    **Recovery checks GitHub first.** At the start of any batch, if a pair is
    still unresolved, the runner looks up that exact batch's merge and tag
    state with `gh` and `git ls-remote` for the tag in every repo:
-   - The batch is promoted only with proof for every repo of its tested
-     commit set (`batch.json` `commit_set`): for a repo with a PR, the PR's
-     head is the tested commit, the PR is merged and the tag points at its
-     merge commit; for a repo without a PR, the tag points at exactly the
-     tested commit. A stale or incomplete `prs`/`tag_repos` record halts.
    - Before any merge or tag action the runner records `merge_started` in
-     `batch.json` (`flash --merge-started`). If nothing is merged or tagged
-     and there is no `merge_started`, the run stopped before merging and the
-     batch is rolled back. With `merge_started` it halts.
+     `batch.json` (`flash --merge-started`). That write also freezes the
+     complete expected PR set (code review round 3): every repo of the
+     tested commit set, each with its PR number (`prs`) or an explicit "no
+     PR" (`no_pr`). `--merge-started` refuses, and the runner must not merge,
+     if any repo has neither. The set can't change afterwards: a later
+     `prs`/`no_pr` that gives a different set (a repo dropping from "PR" to
+     "no PR", say) is refused and halts recovery. If nothing is merged or
+     tagged and there is no `merge_started`, the run stopped before merging
+     and the batch is rolled back. With `merge_started` it halts.
+   - The batch is promoted only with proof, against the frozen set, for every
+     repo of its tested commit set (`batch.json` `commit_set`): for a repo
+     with a PR, the PR's head is the tested commit, the PR is merged into
+     `river-22.2` of that repo's own zrm625 fork, and the tag points at its
+     merge commit; for a repo without a PR, the tag points at exactly the
+     tested commit. In every repo the tagged commit's tree must be the
+     tested commit's tree, which catches a merge into a branch that had
+     moved on (content that was never tested). Without a frozen set,
+     nothing is promoted. A stale or incomplete `prs`/`tag_repos` record
+     halts. `batch.json` and `slot-state.json` writes are atomic and
+     durable: the file is fsynced, renamed into place, and the directory is
+     fsynced after the rename.
    - If only some are, the runner halts and notifies Zak.
    - Pairs that never have PRs (baseline before it passes, calibration,
      experiments) always roll back.

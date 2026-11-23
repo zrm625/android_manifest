@@ -204,25 +204,99 @@ def seed_written(state: dict, at: str) -> None:
 PROMOTE, ROLLBACK, HALT = "promote", "rollback", "halt"
 
 
+BRANCH = "river-22.2"
+OWNER = "zrm625"
+
+
+def expected_pr_set(batch: dict, slugs: dict[str, str]) -> tuple[dict | None, list[str]]:
+    """The complete expected PR set from the runner's ``prs`` and ``no_pr``
+    (review round 3): {path: {"repo": owner/name, "number": N | None}} for
+    every repo of commit_set, or (None, why). Every repo needs exactly one
+    of a PR or an explicit "no PR"; a PR outside the commit set, or a repo
+    outside zrm625, is refused."""
+    cs = batch.get("commit_set") or {}
+    if not cs:
+        return None, ["batch.json has no tested commit set"]
+    errs, by_slug = [], {}
+    for path in sorted(cs):
+        s = slugs.get(path)
+        if not s:
+            errs.append(f"{path}: no GitHub repo known for it in default.xml")
+        elif not s.startswith(OWNER + "/"):
+            errs.append(f"{path}: {s} is not a {OWNER} repo")
+        else:
+            by_slug[s] = path
+    out: dict = {}
+    for pr in batch.get("prs") or []:
+        s, n = pr.get("repo"), pr.get("number")
+        path = by_slug.get(s)
+        if path is None:
+            errs.append(f"{s}: has a PR but is not in the tested commit set")
+        elif not isinstance(n, int) or isinstance(n, bool):
+            errs.append(f"{path}: PR number {n!r} is not a number")
+        elif path in out:
+            errs.append(f"{path}: more than one PR recorded")
+        else:
+            out[path] = {"repo": s, "number": n}
+    for path in batch.get("no_pr") or []:
+        if path not in cs:
+            errs.append(f"{path}: in no_pr but not in the tested commit set")
+        elif path in out:
+            errs.append(f"{path}: has both a PR and no_pr")
+        elif path in by_slug.values():
+            out[path] = {"repo": slugs[path], "number": None}
+    for path in sorted(set(by_slug.values()) - set(out)):
+        errs.append(f"{path}: neither a PR nor an explicit no_pr")
+    return (None, errs) if errs else (out, [])
+
+
+def frozen_pr_set(batch: dict) -> dict | None:
+    ms = batch.get("merge_started")
+    return ms.get("expected_prs") if isinstance(ms, dict) else None
+
+
 def commit_set_proof(batch: dict, lookup: dict, slugs: dict[str, str]) -> list[str]:
     """Why the lookup does not prove the batch's tested commit set was
-    merged and tagged (C1, review round 2). Empty only if, for every repo
-    in commit_set: with a PR, the PR's head is the tested commit, the PR is
-    merged and the tag points at its merge commit; without a PR, the tag
-    points at exactly the tested commit. A PR or tag repo outside the commit
-    set, or a repo the record doesn't cover, is a stale or incomplete
+    merged and tagged (C1, review rounds 2 and 3). Empty only if:
+
+    - merge_started froze the complete expected PR set (expected_pr_set),
+      it still covers exactly the commit set, and the runner's current
+      ``prs``/``no_pr`` still give the same set (a repo can't drop from "PR"
+      to "no PR" afterwards);
+    - every expected PR was looked up, its head is the tested commit, it is
+      merged into river-22.2 of its own zrm625 repo, and the tag points at
+      its merge commit;
+    - every repo without a PR has the tag at exactly the tested commit;
+    - in every repo, the tagged tree is the tested commit's tree, so a merge
+      into a branch that had moved on (content never tested) is caught.
+
+    A PR or tag repo outside the commit set is a stale or incomplete
     record."""
     cs = batch.get("commit_set") or {}
     if not cs:
         return ["batch.json has no tested commit set"]
+    expected = frozen_pr_set(batch)
+    if not expected:
+        return ["merge_started did not record the expected PR set before merging"]
     errs = []
+    if set(expected) != set(cs):
+        errs.append("the expected PR set does not cover exactly the tested commit set "
+                    f"(missing {sorted(set(cs) - set(expected))}, extra {sorted(set(expected) - set(cs))})")
+    now, why = expected_pr_set(batch, slugs)
+    if now is None:
+        errs.extend(f"current PR record: {w}" for w in why)
+    elif now != expected:
+        changed = sorted(p for p in set(now) | set(expected) if now.get(p) != expected.get(p))
+        errs.append(f"the PR record changed after merge_started for {changed}")
     want = {}
     for path, sha in sorted(cs.items()):
-        slug = slugs.get(path)
-        if not slug:
+        s = slugs.get(path)
+        if not s:
             errs.append(f"{path}: no GitHub repo known for it in default.xml")
+        elif (expected.get(path) or {}).get("repo") not in (None, s):
+            errs.append(f"{path}: expected PR is in {expected[path]['repo']}, not its own repo {s}")
         else:
-            want[slug] = (path, sha)
+            want[s] = (path, sha)
     prs, tags = {}, {}
     for p in lookup.get("prs") or []:
         if p.get("repo") in prs:
@@ -230,26 +304,38 @@ def commit_set_proof(batch: dict, lookup: dict, slugs: dict[str, str]) -> list[s
         prs[p.get("repo")] = p
     for t in lookup.get("tags") or []:
         tags[t.get("repo")] = t
-    for slug in sorted(set(prs) - set(want)):
-        errs.append(f"{slug}: has a PR but is not in the tested commit set (stale record)")
-    for slug in sorted(set(tags) - set(want)):
-        errs.append(f"{slug}: in tag_repos but not in the tested commit set (stale record)")
-    for slug, (path, sha) in sorted(want.items()):
-        t = tags.get(slug)
+    trees = lookup.get("tested_trees") or {}
+    for s in sorted(set(prs) - set(want)):
+        errs.append(f"{s}: has a PR but is not in the tested commit set (stale record)")
+    for s in sorted(set(tags) - set(want)):
+        errs.append(f"{s}: in tag_repos but not in the tested commit set (stale record)")
+    for s, (path, sha) in sorted(want.items()):
+        exp = expected.get(path) or {}
+        t = tags.get(s)
         if t is None:
             errs.append(f"{path}: not in tag_repos")
             continue
         if not t.get("present"):
             errs.append(f"{path}: tag missing")
             continue
-        p = prs.get(slug)
-        if p is None:
-            if t.get("commit") != sha:
+        if not t.get("tree") or t.get("tree") != trees.get(s):
+            errs.append(f"{path}: tagged tree {str(t.get('tree'))[:12]} is not the tested tree "
+                        f"{str(trees.get(s))[:12]} (merged into a branch that had moved on?)")
+        p = prs.get(s)
+        if exp.get("number") is None:
+            if p is not None:
+                errs.append(f"{path}: expected no PR, but PR {p.get('number')} was looked up")
+            elif t.get("commit") != sha:
                 errs.append(f"{path}: no PR, so the tag must be at the tested commit {sha[:12]}, "
                             f"not {str(t.get('commit'))[:12]}")
             continue
+        if p is None or p.get("number") != exp["number"]:
+            errs.append(f"{path}: expected PR {exp['number']} was not looked up")
+            continue
         if p.get("head") != sha:
             errs.append(f"{path}: PR head {str(p.get('head'))[:12]} is not the tested commit {sha[:12]}")
+        if p.get("base") != BRANCH:
+            errs.append(f"{path}: PR {exp['number']} targets {p.get('base')!r}, not {BRANCH}")
         if not p.get("merged") or not p.get("merge_commit"):
             errs.append(f"{path}: PR not merged")
         elif t.get("commit") != p["merge_commit"]:
@@ -266,8 +352,8 @@ def decide_recovery(pair: dict, lookup: dict | None, batch: dict | None = None,
     commit_set and merge_started); ``slugs`` maps its repo paths to GitHub
     repos (stage.repo_slugs()).
 
-    - Every repo of the tested commit set proven merged and tagged
-      (commit_set_proof): promote.
+    - Every repo of the tested commit set proven merged and tagged against
+      the PR set frozen at merge_started (commit_set_proof): promote.
     - Nothing merged and nothing tagged (or nothing recorded at all), and no
       merge_started: the run stopped before merging, so roll back.
     - Anything else, including merge_started with incomplete evidence and a
@@ -291,7 +377,8 @@ def decide_recovery(pair: dict, lookup: dict | None, batch: dict | None = None,
         return HALT, f"{what}, but merge_started at {started}: interrupted mid-merge; needs Zak"
     errs = commit_set_proof(batch, lookup, slugs or {})
     if not errs:
-        return PROMOTE, ("every repo of the tested commit set is merged and tagged "
-                         "(PR heads are the tested commits; tags at merge commits or tested commits)")
+        return PROMOTE, ("every repo of the tested commit set is merged into river-22.2 and tagged "
+                         "(PR heads are the tested commits; tags at merge commits or tested commits; "
+                         "tagged trees are the tested trees)")
     return HALT, ("not proven: " + "; ".join(errs[:8]) + (f"; +{len(errs) - 8} more" if len(errs) > 8 else "")
                   + "; needs Zak")

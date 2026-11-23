@@ -20,13 +20,15 @@ phone-qa:
       "installed_files": {"system": {"file", "sha256"}, "vendor": {...}},
       "cameras": {"set": [0, 1, 2], "source": "bootstrap" | "<device repo file>"},
       "camera_set_change": null | {"url", "set"},
-      "prs": [], "tag": null, "tag_repos": [],
-                     # runner: the PRs it opened, the tag and every repo the
+      "prs": [], "no_pr": [], "tag": null, "tag_repos": [],
+                     # runner: the PRs it opened, the repo paths of commit_set
+                     # with no PR (explicitly), the tag and every repo the
                      # tag goes in (all of commit_set)
-      "merge_started": null | {"at": "..."},
+      "merge_started": null | {"at": "...", "expected_prs": {"<path>": {"repo", "number" | null}}},
                      # runner: flash --merge-started, durably, before any
-                     # merge or tag action (recovery tells "never started"
-                     # from "interrupted mid-merge" by it)
+                     # merge or tag action. It freezes the complete PR set;
+                     # recovery tells "never started" from "interrupted
+                     # mid-merge" by it, and proves promotion against it
       "pair": null | {...},                 # written by flash
       "first_boot_seconds": null,           # written by flash (information only)
       "bench_runs": [],                     # run IDs of the current flash attempt (device-bench)
@@ -189,7 +191,7 @@ def stage(batch_id: str, product: Path, kind: str, experiment: bool, build_info:
         "installed_files": inst,
         "cameras": camera_set(),
         "camera_set_change": None,
-        "prs": [], "tag": None, "tag_repos": [],
+        "prs": [], "no_pr": [], "tag": None, "tag_repos": [],
         "merge_started": None,
         "pair": None,
         "first_boot_seconds": None,

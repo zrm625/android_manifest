@@ -279,11 +279,14 @@ measurements behind the change are in `$BENCH_HOME/qa/anchor-experiment.json`.
   token into the file, and export `BENCH_LOCK_TOKEN`. `scripts/device-lock`
   does exactly this. Child tools reuse the lock only if the token matches.
 - **`batch.json`.** `phone-qa stage` writes it. The schema is in the docstring
-  of `lib/riverqa/stage.py`. The runner adds `prs`, `tag` and `tag_repos`
-  when it opens PRs, so recovery can look them up. `tag_repos` must list
-  every repo in the batch's `commit_set`, not only the ones with PRs. Before
-  any merge or tag action the runner runs `flash --merge-started <id>` and
-  waits for it to succeed; that records `merge_started` in `batch.json`. It also adds
+  of `lib/riverqa/stage.py`. The runner adds `prs`, `no_pr`, `tag` and
+  `tag_repos` when it opens PRs, so recovery can look them up. Every repo in
+  the batch's `commit_set` must be in exactly one of `prs` (with its PR
+  number) or `no_pr` (its repo path), and `tag_repos` must list every repo
+  in `commit_set`, not only the ones with PRs. Before any merge or tag
+  action the runner runs `flash --merge-started <id>` and waits for it to
+  succeed; that records `merge_started` in `batch.json` and freezes the
+  expected PR set. It refuses an incomplete set, and a changed one later. It also adds
   `camera_set_change` (`url` of Zak's comment or review on one of the
   batch's PRs, and the new `set`) when Zak approves a camera change. A
   batch with `camera_set_change` is never eligible ("camera set change: Zak
@@ -298,10 +301,12 @@ measurements behind the change are in `$BENCH_HOME/qa/anchor-experiment.json`.
   `flash --rollback` after a FAIL, UNVERIFIED, experiment or calibration run,
   and `flash --promote <id>` after it has durably merged and tagged a batch.
   `--promote` itself looks the batch up the way `--recover` does and releases
-  the fallback only with proof for every repo of the tested commit set: for a
-  repo with a PR, the PR's head is the tested commit, the PR is merged and
-  the tag is at its merge commit; for a repo without a PR, the tag is at the
-  tested commit. A stale or incomplete `prs`/`tag_repos` record halts. With
+  the fallback only with proof, against the PR set `--merge-started` froze,
+  for every repo of the tested commit set: for a repo with a PR, the PR's
+  head is the tested commit, the PR is merged into `river-22.2` of its own
+  zrm625 repo and the tag is at its merge commit; for a repo without a PR,
+  the tag is at the tested commit; in every repo the tagged tree is the
+  tested commit's tree. A stale or incomplete `prs`/`tag_repos` record halts. With
   nothing merged or tagged, recovery rolls back only if `merge_started` is
   absent; with it, recovery halts. A baseline pair is never promoted (`phone-qa --baseline`
   closes it). A closed baseline's seed is saved in `slot-state.json` in the

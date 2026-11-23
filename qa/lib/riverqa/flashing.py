@@ -419,8 +419,9 @@ def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
     if errs:
         log(f"error: {batch_id}'s build is not tied to the batch: " + "; ".join(errs))
         return EXIT_ERROR
-    look = recovery.lookup(batch, runner)
-    decision, why = slots.decide_recovery(pair, look, batch, stage.repo_slugs())
+    slugs = stage.repo_slugs()
+    look = recovery.lookup(batch, runner, slugs)
+    decision, why = slots.decide_recovery(pair, look, batch, slugs)
     if decision != slots.PROMOTE:
         log(f"error: {batch_id} is not proven merged and tagged ({why}). The fallback slot stays reserved.")
         return EXIT_HALT if decision == slots.HALT else EXIT_ERROR
@@ -446,7 +447,13 @@ def merge_started(batch_id: str) -> int:
     succeed, before any merge or tag action for the batch. It records
     merge_started in batch.json with an atomic, fsynced write, so recovery
     can tell a run that stopped before merging (roll back) from one
-    interrupted mid-merge (halt). Idempotent: the first time is kept."""
+    interrupted mid-merge (halt).
+
+    It also freezes the complete expected PR set (review round 3): every
+    repo of the commit set with its PR number from ``prs`` or an explicit
+    entry in ``no_pr``. It refuses (and the runner must not merge) if any
+    repo has neither. Idempotent: the first record is kept, and a later
+    call whose ``prs``/``no_pr`` give a different set is refused."""
     path = batch_dir(batch_id) / "batch.json"
     batch = read_json(path)
     if batch is None:
@@ -455,10 +462,26 @@ def merge_started(batch_id: str) -> int:
     if batch.get("kind") != "batch":
         log(f"error: {batch_id} is a {batch.get('kind')} run, which is never merged")
         return EXIT_ERROR
-    if not batch.get("merge_started"):
-        batch["merge_started"] = {"at": now_iso()}
+    expected, errs = slots.expected_pr_set(batch, stage.repo_slugs())
+    ms = batch.get("merge_started")
+    if ms:
+        frozen = slots.frozen_pr_set(batch)
+        if not frozen:
+            log(f"error: {batch_id}'s merge_started has no expected PR set; recovery will halt")
+            return EXIT_ERROR
+        if expected != frozen:
+            log(f"error: {batch_id}'s PR record changed after merge_started: "
+                + ("; ".join(errs) if errs else "a different PR set"))
+            return EXIT_ERROR
+    else:
+        if expected is None:
+            log(f"error: {batch_id} has no complete PR set; record every repo of the commit set in prs "
+                "or no_pr before merging: " + "; ".join(errs[:8]))
+            return EXIT_ERROR
+        batch["merge_started"] = {"at": now_iso(), "expected_prs": expected}
         write_json(path, batch)
-    log(f"merge_started for {batch_id} at {batch['merge_started'].get('at')}")
+    n = sum(1 for e in batch["merge_started"]["expected_prs"].values() if e["number"] is not None)
+    log(f"merge_started for {batch_id} at {batch['merge_started'].get('at')} ({n} PRs expected)")
     return EXIT_OK
 
 
@@ -471,8 +494,9 @@ def recover(runner=None, dev: Device | None = None) -> int:
         return EXIT_OK
     pair = st["pair"]
     batch = read_json(batch_dir(pair["batch"]) / "batch.json", {}) or {}
-    look = None if pair["kind"] != "batch" else recovery.lookup(batch, runner)
-    decision, why = slots.decide_recovery(pair, look, batch, stage.repo_slugs() if pair["kind"] == "batch" else {})
+    slugs = stage.repo_slugs() if pair["kind"] == "batch" else {}
+    look = None if pair["kind"] != "batch" else recovery.lookup(batch, runner, slugs)
+    decision, why = slots.decide_recovery(pair, look, batch, slugs)
     log(f"Recovery for {pair['batch']} ({pair['kind']}): {decision}: {why}")
     st.setdefault("history", []).append({"event": "recovery-decision", "at": now_iso(),
                                          "batch": pair["batch"], "decision": decision, "why": why})

@@ -33,10 +33,14 @@ def phone(slot="b", build_id=BID):
 
 def runner(merged, tagged):
     def run(cmd):
+        if cmd[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(cmd, 0, "T\n", "")     # merges into an unmoved branch
         if cmd[0] == "gh":
             n = int(cmd[3])
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"state": "MERGED" if merged[n] else "OPEN",
-                                                                   "url": f"u{n}", "headRefOid": HEADS[n],
+                                                                   "number": n, "url": f"u{n}",
+                                                                   "headRefOid": HEADS[n],
+                                                                   "baseRefName": "river-22.2",
                                                                    "mergeCommit": {"oid": f"m{n}"}}), "")
         n = int(cmd[3][-1])
         at = f"m{n}" if n < 2 else COMMITS[".repo/manifests"]
@@ -45,16 +49,23 @@ def runner(merged, tagged):
     return run
 
 
-def setup(home, kind="batch", build_id=BID, commit_set=None):
+EXPECTED = {"build/make": {"repo": "zrm625/r0", "number": 0}, "vendor/lineage": {"repo": "zrm625/r1", "number": 1},
+            ".repo/manifests": {"repo": "zrm625/r2", "number": None}}
+
+
+def setup(home, kind="batch", build_id=BID, commit_set=None, started=True):
     st = slots.first_run("a", "f" * 64, "t0")
     st["baseline_closed"] = {"batch": "base", "build_id": None, "at": "t0", "seed": None, "seed_written": True}
     slots.reserve(st, "b1", kind, "f" * 64, "t1")
     flashing.save_state(st)
     b = {"batch": "b1", "kind": kind, "build_id": build_id, "vendor_build_id": build_id,
          "commit_set": commit_set or COMMITS, "commit_set_hash": HASH, "pair": dict(st["pair"]),
-         "prs": [{"repo": "zrm625/r0", "number": 0}, {"repo": "zrm625/r1", "number": 1}], "tag": "kg-1",
+         "prs": [{"repo": "zrm625/r0", "number": 0}, {"repo": "zrm625/r1", "number": 1}],
+         "no_pr": [".repo/manifests"], "tag": "kg-1",
          "tag_repos": ["https://github.com/zrm625/r0", "https://github.com/zrm625/r1",
                        "https://github.com/zrm625/r2"]}
+    if started:
+        b["merge_started"] = {"at": "t3", "expected_prs": EXPECTED}
     core.write_json(core.batch_dir("b1") / "batch.json", b)
 
 
@@ -69,9 +80,17 @@ def promote(merged, tagged, dev=None):
 
 
 class PromoteCommand(unittest.TestCase):
+    def test_merged_without_a_frozen_pr_set_halts(self):
+        with bench_home() as h:
+            setup(h, started=False)
+            rc, err, st = promote([True, True], [True, True, True])
+        self.assertEqual(rc, flashing.EXIT_HALT)
+        self.assertEqual(st["known_good_slot"], "a")
+        self.assertIn("expected PR set", err)
+
     def test_pending_batch_keeps_the_fallback(self):
         with bench_home() as h:
-            setup(h)
+            setup(h, started=False)
             rc, err, st = promote([False, False], [False, False, False])
         self.assertEqual(rc, flashing.EXIT_ERROR)
         self.assertEqual(st["known_good_slot"], "a")
@@ -116,23 +135,46 @@ class PromoteCommand(unittest.TestCase):
 
 
 class MergeStartedCommand(unittest.TestCase):
+    def merge_started(self):
+        with mock.patch.object(stage, "repo_slugs", lambda manifest=None: dict(SLUGS)), \
+                redirect_stderr(io.StringIO()):
+            return flashing.main(["--merge-started", "b1"])
+
+    def batch(self):
+        return core.read_json(core.batch_dir("b1") / "batch.json")
+
     def test_marker_is_written_once_and_kept(self):
         with bench_home() as h:
-            setup(h)
-            with redirect_stderr(io.StringIO()):
-                self.assertEqual(flashing.main(["--merge-started", "b1"]), flashing.EXIT_OK)
-            first = core.read_json(core.batch_dir("b1") / "batch.json")["merge_started"]
+            setup(h, started=False)
+            self.assertEqual(self.merge_started(), flashing.EXIT_OK)
+            first = self.batch()["merge_started"]
             self.assertTrue(first["at"])
-            with redirect_stderr(io.StringIO()):
-                self.assertEqual(flashing.main(["--merge-started", "b1"]), flashing.EXIT_OK)
-            self.assertEqual(core.read_json(core.batch_dir("b1") / "batch.json")["merge_started"], first)
+            self.assertEqual(first["expected_prs"], EXPECTED)          # the full PR set, frozen
+            self.assertEqual(self.merge_started(), flashing.EXIT_OK)
+            self.assertEqual(self.batch()["merge_started"], first)
+
+    def test_incomplete_pr_set_is_refused(self):
+        with bench_home() as h:
+            setup(h, started=False)
+            b = self.batch()
+            b["no_pr"] = []                                            # the manifest has neither
+            core.write_json(core.batch_dir("b1") / "batch.json", b)
+            self.assertEqual(self.merge_started(), flashing.EXIT_ERROR)
+            self.assertIsNone(self.batch().get("merge_started"))
+
+    def test_pr_set_cannot_change_afterwards(self):
+        with bench_home() as h:
+            setup(h, started=False)
+            self.assertEqual(self.merge_started(), flashing.EXIT_OK)
+            b = self.batch()
+            b["prs"], b["no_pr"] = b["prs"][:1], ["vendor/lineage", ".repo/manifests"]
+            core.write_json(core.batch_dir("b1") / "batch.json", b)
+            self.assertEqual(self.merge_started(), flashing.EXIT_ERROR)
+            self.assertEqual(self.batch()["merge_started"]["expected_prs"], EXPECTED)
 
     def test_recover_with_marker_and_nothing_merged_halts(self):
         with bench_home() as h:
             setup(h)
-            b = core.read_json(core.batch_dir("b1") / "batch.json")
-            b["merge_started"] = {"at": "t5"}
-            core.write_json(core.batch_dir("b1") / "batch.json", b)
             with mock.patch.object(stage, "repo_slugs", lambda manifest=None: dict(SLUGS)), \
                     redirect_stderr(io.StringIO()):
                 rc = flashing.recover(runner=runner([False, False], [False, False, False]), dev=phone())

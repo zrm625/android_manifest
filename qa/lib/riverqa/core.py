@@ -75,8 +75,19 @@ def read_json(path: Path, default=None):
         return default
 
 
+def fsync_dir(path: Path) -> None:
+    """fsync a directory, so a rename inside it survives a power cut."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def write_json(path: Path, data) -> None:
-    """Write atomically: a crash leaves the old file or the new one, never half."""
+    """Write atomically and durably: a crash leaves the old file or the new
+    one, never half, and once this returns the rename is on disk (the parent
+    directory is fsynced after it, review round 3)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
@@ -86,6 +97,7 @@ def write_json(path: Path, data) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        fsync_dir(path.parent)
     except BaseException:
         try:
             os.unlink(tmp)
