@@ -14,6 +14,7 @@ from . import bootsig, evidence, flashing, journal as jmod, reboots, regression,
 from .bench import read_rows
 from .core import (BENCH_HOME, CODENAME, QA_DIR, SCRIPTS_DIR, SERIAL, batch_dir, bench_path, log, new_id,
                    now_iso, read_json, sha256_file, write_json, append_jsonl)
+from .controls import active as control_active
 from .device import Device, GuardError
 from .lock import DeviceLock, LockError
 from .results import GROUPS
@@ -28,6 +29,7 @@ KNOWN_GOOD = QA_HOME / "known-good.json"
 CONTROLS_FILE = QA_HOME / "controls.json"
 CONTROL_OVERRIDE = QA_HOME / "control-override.json"
 HISTORY = QA_HOME / "history.jsonl"
+CALIBRATION_FILE = QA_HOME / "calibration.json"
 TELEPHONY_RE = re.compile(r"feature:android\.hardware\.telephony")
 BAD_DROPBOX = ("system_server_crash", "system_app_crash", "data_app_crash", "SYSTEM_TOMBSTONE",
                "system_server_native_crash", "system_app_native_crash", "data_app_native_crash")
@@ -71,6 +73,22 @@ def controls_status(version: str) -> tuple[bool, str]:
     if missing:
         return False, f"{len(missing)}/{len(CONTROLS)} controls not qualified for harness {version}"
     return True, ""
+
+
+def calibration_runs(version: str) -> int:
+    """Clean --calibrate runs recorded for this harness version."""
+    data = read_json(CALIBRATION_FILE, {}) or {}
+    return len((data.get(version) or {}).get("clean_runs") or [])
+
+
+def record_calibration(run: "Run", code: int) -> None:
+    """A full --calibrate run with exit 0 counts toward the 5 the gate needs."""
+    if run.mode != "calibrate" or code != 0 or run.only or run.skip:
+        return
+    data = read_json(CALIBRATION_FILE, {}) or {}
+    data.setdefault(run.version, {"clean_runs": []})["clean_runs"].append(
+        {"run_id": run.run_id, "batch": run.batch_id, "at": now_iso()})
+    write_json(CALIBRATION_FILE, data)
 
 
 def control_overrides() -> list[str]:
@@ -391,8 +409,18 @@ def check_props(run: Run) -> Result:
                   f"dates and slot {have['slot']} match batch.json and the flash record", {"have": have})
 
 
+def read_low_ram(run: Run) -> str | None:
+    """ro.config.low_ram, or None if the read failed (not the same as unset).
+    The low-ram-flag control overrides the value read, nothing else."""
+    if control_active() == "low-ram-flag":
+        run.control_injected = "low-ram-flag"
+        return "true"
+    r = run.dev.read("getprop ro.config.low_ram")
+    return r.out.strip() if r.ok else None
+
+
 def check_low_ram(run: Run) -> Result:
-    st, msg = low_ram_check(run.dev.getprop("ro.config.low_ram"), (run.batch or {}).get("experiment"))
+    st, msg = low_ram_check(read_low_ram(run), (run.batch or {}).get("experiment"))
     return Result("identity.low_ram", st, msg)
 
 
@@ -799,9 +827,13 @@ def full_run(run: Run, lock_result: Result) -> int:
     ctrl_ok, ctrl_reason = controls_status(run.version)
     gate = GateInputs(mode=run.mode, full_set=not run.only and not run.skip,
                       experiment=(run.batch or {}).get("experiment"),
-                      low_ram=run.dev.getprop("ro.config.low_ram") if run.dev.state() == "device" else "",
-                      controls_qualified=ctrl_ok, controls_reason=ctrl_reason, batch_id=run.batch_id)
+                      low_ram=read_low_ram(run) if run.dev.state() == "device" else None,
+                      controls_qualified=ctrl_ok, controls_reason=ctrl_reason, batch_id=run.batch_id,
+                      kind=(run.batch or {}).get("kind"),
+                      thresholds_calibrated=run.thresholds.get("calibrated") is True,
+                      calibration_runs=calibration_runs(run.version))
     code = finish(run, REQUIRED, gate)
+    record_calibration(run, code)
     if run.mode == "control":
         from .controls import record_control
         record_control(run, code)

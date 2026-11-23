@@ -943,6 +943,12 @@ def check_gestures(run) -> Result:
         seen["after"] = top_activity(dev)
         return None
     res = helper.instrument(run, "back", {}, timeout=40, on_stage=on_stage, need_foreground=False)
+    if control_active() == "nav-mode-0":
+        restore_now(run, PHONE, "setting", "secure/navigation_mode")
+    early = helper_result(cid, res)
+    if early:
+        dev.sh("input keyevent KEYCODE_HOME")
+        return early
     tb, ta = seen.get("before", ""), seen.get("after", "")
     d["back"] = {"before": tb, "after": ta, "helper": res.values}
     if not tb.endswith(".ChildActivity"):
@@ -950,11 +956,9 @@ def check_gestures(run) -> Result:
     if ta != f"{helper.PKG}/.MainActivity":
         problems.append(f"after Back the top is {ta}, not A")
     dev.sh("input keyevent KEYCODE_HOME")
-    if control_active() == "nav-mode-0":
-        restore_now(run, PHONE, "setting", "secure/navigation_mode")
     return Result(cid, FAIL if problems else PASS, "; ".join(problems) or
                   "Perch is home and bound; HOME and swipe up go to Perch; Back returns to A", d,
-                  helper_terminal=res.terminal)
+                  helper_terminal=True)
 
 
 def screen_size(dev) -> tuple[int, int]:

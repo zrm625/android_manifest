@@ -102,15 +102,21 @@ def exit_code(results: dict[str, Result], required: list[str]) -> int:
     return 0
 
 
+CALIBRATION_RUNS_NEEDED = 5
+
+
 @dataclass
 class GateInputs:
     mode: str                      # batch, quick, calibrate, baseline, control
     full_set: bool                 # no --only / --skip
     experiment: bool | None        # from batch.json; None if unknown
-    low_ram: str                   # phone's ro.config.low_ram
+    low_ram: str | None            # phone's ro.config.low_ram; None if the read failed
     controls_qualified: bool
     controls_reason: str = ""
     batch_id: str | None = None
+    kind: str | None = None        # batch.json kind; only "batch" can merge
+    thresholds_calibrated: bool = False
+    calibration_runs: int = 0      # clean --calibrate runs for this harness version
 
 
 def eligibility(results: dict[str, Result], g: GateInputs) -> tuple[bool, list[str]]:
@@ -124,8 +130,19 @@ def eligibility(results: dict[str, Result], g: GateInputs) -> tuple[bool, list[s
         reasons.append("batch.json experiment flag unknown")
     elif g.experiment:
         reasons.append("experiment batch")
-    if g.low_ram.strip().lower() == "true":
-        reasons.append("ro.config.low_ram is true")
+    if g.kind != "batch":
+        reasons.append(f"batch kind is {g.kind!r}, not 'batch'")
+    low = parse_bool(g.low_ram)
+    if g.low_ram is None:
+        reasons.append("ro.config.low_ram could not be read")
+    elif low is None:
+        reasons.append(f"ro.config.low_ram={g.low_ram.strip()!r} is not a boolean")
+    elif low:
+        reasons.append("ro.config.low_ram is enabled")
+    if not g.thresholds_calibrated:
+        reasons.append("thresholds.json is not calibrated")
+    if g.calibration_runs < CALIBRATION_RUNS_NEEDED:
+        reasons.append(f"{g.calibration_runs}/{CALIBRATION_RUNS_NEEDED} clean --calibrate runs for this harness version")
     if not g.controls_qualified:
         reasons.append("controls not qualified" + (f" ({g.controls_reason})" if g.controls_reason else ""))
     for cid in REQUIRED:
@@ -136,7 +153,7 @@ def eligibility(results: dict[str, Result], g: GateInputs) -> tuple[bool, list[s
             reasons.append(f"{cid}: {r.state}")
     for cid in HELPER_CHECKS:
         r = results.get(cid)
-        if r is not None and r.helper_terminal is False:
+        if r is not None and r.helper_terminal is not True:
             reasons.append(f"{cid}: helper returned no terminal result")
     for key, label in (("identity.build_id", "build identity"), ("identity.boot_hash", "boot hash"),
                        ("final.boot_id", "boot_id unchanged"), ("cleanup.verified", "cleanup"),
@@ -153,13 +170,36 @@ def eligibility(results: dict[str, Result], g: GateInputs) -> tuple[bool, list[s
     return (not uniq, uniq)
 
 
-def low_ram_check(low_ram: str, experiment: bool | None) -> tuple[str, str]:
-    """ro.config.low_ram=true while experiment is false is a FAIL."""
-    on = low_ram.strip().lower() == "true"
+# Android's boolean property values (system/libbase/parsebool.cpp).
+_TRUE = ("1", "y", "yes", "on", "true")
+_FALSE = ("0", "n", "no", "off", "false")
+
+
+def parse_bool(value: str | None) -> bool | None:
+    """True or False the way Android's GetBoolProperty reads it; an unset
+    property ("") is False. None for a failed read or an unparseable value."""
+    if value is None:
+        return None
+    v = value.strip()
+    if v == "" or v in _FALSE:
+        return False
+    if v in _TRUE:
+        return True
+    return None
+
+
+def low_ram_check(low_ram: str | None, experiment: bool | None) -> tuple[str, str]:
+    """ro.config.low_ram enabled while experiment is false is a FAIL. A failed
+    read (None) is not the same as an unset property, and is UNVERIFIED."""
+    if low_ram is None:
+        return UNVERIFIED, "cannot read ro.config.low_ram"
+    on = parse_bool(low_ram)
+    if on is None:
+        return UNVERIFIED, f"ro.config.low_ram={low_ram.strip()!r} is not a boolean Android understands"
     if experiment is None:
         return UNVERIFIED, "batch.json has no experiment flag"
     if on and not experiment:
-        return FAIL, "ro.config.low_ram=true but batch.json says experiment: false"
+        return FAIL, f"ro.config.low_ram={low_ram.strip()} (enabled) but batch.json says experiment: false"
     if on:
         return PASS, "low-RAM experiment (never merge-eligible)"
     return PASS, f"ro.config.low_ram={low_ram.strip() or 'unset'}"
