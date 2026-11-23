@@ -122,17 +122,58 @@ def boot_count_now(dev: Device, settle_s: float = 60) -> int:
         time.sleep(3)
 
 
+MIN_CLEAN_NORMALS = 3   # clean normal reboots a path needs before it gets an A (review round 4)
+
+
+def sample_problems(r: dict, *, normal: bool) -> list[str]:
+    """Signs that one calibration reboot was not a single clean boot, or
+    that its timing is not trustworthy (review round 4): an unplanned
+    fastboot enumeration, a chain that isn't PASS, a boot count that isn't
+    PASS (normal reboots, which record one), or a disconnect or status
+    read bracketed more loosely than the bounds. Empty means clean. Pure."""
+    why = []
+    if r.get("unplanned_fastboot"):
+        why.append(f"{r['unplanned_fastboot']} unplanned fastboot enumeration(s)")
+    chain = (r.get("chain") or [None])[0]
+    if chain != PASS:
+        why.append(f"chain {chain}")
+    if normal:
+        count = (r.get("boot_count") or [None])[0]
+        if count != PASS:
+            why.append(f"boot count {count}")
+    timing = bootsig.timing_bracket_problem(r.get("disconnect_gap"), r.get("status_read_s"))
+    if timing:
+        why.append(timing)
+    return why
+
+
 def compute_paths(data: dict) -> None:
     """Set A and the chain record for each gated path from data["raw"] and
-    data["inject_measure"]. Pure."""
-    passes = {p: [r["bootloader_pass"] for r in data["raw"].get(p) or []] for p in reboots.GATED_PATHS}
+    data["inject_measure"]. Pure.
+
+    Only clean samples count (review round 4): a normal reboot with any
+    sign of an extra boot or a loose timing bracket (sample_problems) is
+    excluded and listed, and a path with fewer than MIN_CLEAN_NORMALS clean
+    normal reboots, or whose injected-pass measurement is not clean, gets
+    no A."""
+    clean: dict = {}
+    excluded: dict = {}
+    for p in reboots.GATED_PATHS:
+        clean[p], excluded[p] = [], []
+        for i, r in enumerate(data["raw"].get(p) or []):
+            probs = sample_problems(r, normal=True)
+            if probs:
+                excluded[p].append({"sample": i, "bootloader_pass": r.get("bootloader_pass"), "why": probs})
+            else:
+                clean[p].append(r["bootloader_pass"])
+    passes = clean
     # "One more bootloader pass": the flash path's normal pass (reset to
     # kernel start, DESIGN.md round-10 note) or the measured increment of
     # an injected pass, whichever is smaller. On river the injected pass
     # (reset to fastboot and on) adds about 4.4 s, far less than the 10 s
     # reset-to-kernel pass, so the smaller value is the one that lets the
     # uptime check reject the control.
-    flash_pass = min(passes["fastboot"]) if passes["fastboot"] else None
+    flash_pass = min(passes["fastboot"]) if len(passes["fastboot"]) >= MIN_CLEAN_NORMALS else None
     for path in reboots.GATED_PATHS:
         raws = data["raw"].get(path) or []
         chains = [r["chain"][0] for r in raws]
@@ -140,12 +181,25 @@ def compute_paths(data: dict) -> None:
                                "exact_copies": [r.get("marker_copies_exact") for r in raws],
                                "fuzzy_found": [r.get("marker_found_fuzzy") for r in raws]}
         inj = data["inject_measure"].get(path)
-        empty = {"A": None, "normal_passes": passes[path], "proof_normal_pass": False,
+        inj_probs = sample_problems(inj, normal=False) if inj else []
+        empty = {"A": None, "normal_passes": passes[path], "excluded": excluded[path],
+                 "all_passes": [r.get("bootloader_pass") for r in raws], "proof_normal_pass": False,
                  "proof_control_rejected": False, "proof_unmarked_rejected": False}
-        if not passes[path] or flash_pass is None or not inj:
-            why = (f"no {path} reboots measured" if not passes[path] else
-                   "no fastboot reboots, so no flash-path pass" if flash_pass is None else
-                   "no injected-pass measurement")
+        if not raws:
+            why = f"no {path} reboots measured"
+        elif len(passes[path]) < MIN_CLEAN_NORMALS:
+            why = (f"only {len(passes[path])} clean normal {path} reboots of {len(raws)} (need "
+                   f"{MIN_CLEAN_NORMALS}); excluded: " + "; ".join(
+                       f"#{e['sample']} ({', '.join(e['why'])})" for e in excluded[path]))
+        elif flash_pass is None:
+            why = f"fewer than {MIN_CLEAN_NORMALS} clean fastboot reboots, so no flash-path pass"
+        elif not inj:
+            why = "no injected-pass measurement"
+        elif inj_probs:
+            why = "the injected-pass measurement is not clean: " + ", ".join(inj_probs)
+        else:
+            why = None
+        if why:
             data["paths"][path] = dict(empty, why=why)
             continue
         inc = inj["bootloader_pass"] - min(passes[path])

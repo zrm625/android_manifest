@@ -1366,3 +1366,16 @@ Everything in A2 and A2.1 stands except as changed here.
 - `BootRecord` and `boot-timing.json` carry `disconnect_gap` and
   `status_read_s`. On the adb path both are recorded but, like the uptime,
   are INFO only.
+
+**R4-2. Calibration uses only clean samples.** `calibrate.compute_paths`
+leaves out every normal reboot that shows a sign of an extra boot or a loose
+timing bracket (`calibrate.sample_problems`): an unplanned fastboot
+enumeration, a chain that isn't PASS, a boot count that isn't PASS, a
+disconnect gap above 0.5 s, or a status read above 1 s. The excluded samples
+and the reasons are listed in `boot-timing.json` (`paths.<path>.excluded`).
+A path needs at least 3 clean normal reboots (`MIN_CLEAN_NORMALS`), and a
+clean injected-pass measurement, or it gets no A and is not qualified.
+Before this change, normal passes {10.00, 10.00, 14.20} with the 14.20 s
+sample a hidden extra pass gave A = 14.80, so a real 14.2 s extra pass
+passed. Normal reboots reused with `--reuse-normals` from before this change
+have no bracket and are all excluded.

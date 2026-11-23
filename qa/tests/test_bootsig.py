@@ -265,9 +265,12 @@ class Judge(unittest.TestCase):
         self.assertEqual(reboots.allowance_for("sysrq", t), 12.3)
 
 
-def raw(bootloader_pass, chain=PASS):
-    return {"bootloader_pass": bootloader_pass, "chain": [chain, ""], "marker_copies_exact": 4,
-            "marker_found_fuzzy": True}
+def raw(bootloader_pass, chain=PASS, **kw):
+    r = {"bootloader_pass": bootloader_pass, "chain": [chain, ""], "marker_copies_exact": 4,
+         "marker_found_fuzzy": True, "boot_count": [PASS, ""], "unplanned_fastboot": 0,
+         "disconnect_gap": 0.06, "status_read_s": 0.1}
+    r.update(kw)
+    return r
 
 
 DROPBOX0 = "Drop box contents: 0 entries\n"
@@ -310,6 +313,50 @@ class Calibration(unittest.TestCase):
         calibrate.compute_paths(empty)
         calibrate.summary(empty)
         self.assertFalse(calibrate.qualified(empty))
+
+    def test_sol_bad_sample_never_sets_the_allowance(self):
+        """{10.00, 10.00, 14.20 bad}: with the bad sample counted, A was
+        (14.20 + 10.00 + 5.4) / 2 = 14.80, and a real 14.2 s extra pass
+        passed. Every sign of an extra boot or a loose bracket excludes it,
+        and two clean samples are not enough (review round 4)."""
+        from riverqa import calibrate
+        bad_flavours = ({"unplanned_fastboot": 1}, {"chain": [FAIL, ""]}, {"chain": [UNVERIFIED, ""]},
+                        {"boot_count": [FAIL, ""]}, {"boot_count": [UNVERIFIED, ""]}, {"disconnect_gap": 0.9},
+                        {"disconnect_gap": None}, {"status_read_s": 1.4})
+        unfiltered = self.data(sysrq=[raw(10.0), raw(10.0), raw(14.2)], inj_sysrq=raw(15.4))
+        calibrate.compute_paths(unfiltered)
+        self.assertEqual(unfiltered["paths"]["sysrq"]["A"], 14.8)     # the counterexample, unfiltered
+        for bad in bad_flavours:
+            d = self.data(sysrq=[raw(10.0), raw(10.0), raw(14.2, **bad)], inj_sysrq=raw(15.4))
+            calibrate.compute_paths(d)
+            p = d["paths"]["sysrq"]
+            self.assertIsNone(p["A"], bad)
+            self.assertIn("only 2 clean normal sysrq reboots", p["why"])
+            self.assertEqual([e["sample"] for e in p["excluded"]], [2], bad)
+            self.assertFalse(calibrate.qualified(d))
+            # With a third clean sample the bad one is still left out.
+            d = self.data(sysrq=[raw(10.0), raw(10.0), raw(14.2, **bad), raw(10.01)], inj_sysrq=raw(15.4))
+            calibrate.compute_paths(d)
+            p = d["paths"]["sysrq"]
+            self.assertEqual(p["normal_passes"], [10.0, 10.0, 10.01], bad)
+            self.assertLess(p["A"], 14.2, bad)
+
+    def test_unclean_injected_measurement_sets_no_allowance(self):
+        from riverqa import calibrate
+        for bad in ({"disconnect_gap": 0.9}, {"unplanned_fastboot": 1}, {"chain": [FAIL, ""]}):
+            d = self.data(inj_sysrq=raw(14.46, **bad))
+            calibrate.compute_paths(d)
+            self.assertIsNone(d["paths"]["sysrq"]["A"], bad)
+            self.assertIn("injected-pass measurement is not clean", d["paths"]["sysrq"]["why"])
+
+    def test_too_few_clean_fastboot_reboots_means_no_flash_pass(self):
+        from riverqa import calibrate
+        d = self.data()
+        d["raw"]["fastboot"] = [raw(10.07), raw(10.06), raw(10.08, disconnect_gap=0.7), raw(10.07, chain=FAIL)]
+        calibrate.compute_paths(d)
+        self.assertIsNone(d["paths"]["fastboot"]["A"])
+        self.assertIsNone(d["paths"]["sysrq"]["A"])
+        self.assertIn("flash-path pass", d["paths"]["sysrq"]["why"])
 
     def test_chain_record_counts_boots_that_did_not_pass(self):
         from riverqa import calibrate
