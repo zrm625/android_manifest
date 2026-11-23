@@ -42,25 +42,6 @@ def record_wipe(qa_home: Path, attempt_id: str, how: str) -> int:
     return seq
 
 
-def record_wipe_boot(qa_home: Path, seq: int, boot_id: str) -> None:
-    """Record the boot_id of the first boot after wipe ``seq`` (review round
-    3): calibration ties "the first adb reboot after a wipe" to it."""
-    append_jsonl(wipe_log_path(qa_home), {"seq": seq, "first_boot_id": boot_id, "at": now_iso()})
-
-
-def last_wipe(qa_home: Path) -> dict | None:
-    """The latest successful wipe, with ``first_boot_id`` if its first boot
-    was recorded. None if there was none."""
-    recs = read_jsonl(wipe_log_path(qa_home))
-    seq = current_wipe_seq(qa_home)
-    if not seq:
-        return None
-    out = dict(next(w for w in recs if w.get("ok") and w.get("seq") == seq))
-    boots = [w["first_boot_id"] for w in recs if w.get("seq") == seq and w.get("first_boot_id")]
-    out["first_boot_id"] = boots[0] if len(boots) == 1 else None
-    return out
-
-
 class Journal:
     def __init__(self, path: Path, qa_home: Path | None = None):
         self.path = path

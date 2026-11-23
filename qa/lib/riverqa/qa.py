@@ -623,9 +623,11 @@ def check_selinux(run: Run) -> Result:
     return Result("health.selinux", PASS if mode == "Enforcing" else FAIL, mode or "unreadable")
 
 
-def evidence_dirs(run: Run) -> list[tuple[str, Path, str, bool]]:
+def evidence_dirs(run: Run) -> list[tuple[str, Path, str | None, bool]]:
     """(label, dir, reboot path, first boot) for the first boot after the wipe
-    and every measured boot."""
+    and every measured boot. A bench boot's path ("adb" or "sysrq",
+    amendment A2) is the one its device.csv row records, None if it has
+    none."""
     out = []
     bdir = batch_dir(run.batch_id)
     if run.flash_attempt and (run.flash_attempt.get("first_boot") or {}).get("evidence"):
@@ -633,7 +635,8 @@ def evidence_dirs(run: Run) -> list[tuple[str, Path, str, bool]]:
     else:
         out.append(("first boot", bdir / "boots" / "missing-first-boot", "fastboot", True))
     for r in batch_rows(run):
-        out.append((f"bench {r['run_id']}#{r['boot']}", BENCH_HOME / (r.get("evidence") or "missing"), "adb", False))
+        out.append((f"bench {r['run_id']}#{r['boot']}", BENCH_HOME / (r.get("evidence") or "missing"),
+                    r.get("reboot_path") or None, False))
     return out
 
 
@@ -712,31 +715,49 @@ def check_boot_signals(run: Run) -> Result:
     name = control_active()
     dirs = evidence_dirs(run)
     states, notes, per = [], [], {}
-    for label, d, path, _first in dirs:
+    for label, d, path, first in dirs:
         sig = read_json(d / "signals.json")
         if sig is None:
             states.append(UNVERIFIED)
             notes.append(f"{label}: no signals recorded")
-            per[label] = (UNVERIFIED, None)
+            per[label] = (UNVERIFIED, None, None)
+            continue
+        if not first and sig.get("path") != path:
+            states.append(UNVERIFIED)
+            notes.append(f"{label}: signals.json path {sig.get('path')} differs from the row's {path}")
+            per[label] = (UNVERIFIED, None, None)
             continue
         st, msg = reboots.combined_verdict(sig, path, timing)
         states.append(st)
         notes.append(f"{label}: {st} ({msg})")
-        per[label] = (st, (sig.get("reboot") or {}).get("boot_id"))
+        per[label] = (st, (sig.get("reboot") or {}).get("boot_id"), (sig.get("uptime") or [None])[0])
+    # Amendment A2: bench boot 1 is the adb reboot (the charter's boot time),
+    # and every batch performs at least one sysrq bench boot, the bench boot
+    # with an uptime gate.
+    bench_paths = [path for _label, _d, path, first in dirs if not first]
+    if bench_paths and bench_paths[0] != "adb":
+        states.append(UNVERIFIED)
+        notes.append(f"bench boot 1 used the {bench_paths[0]} path, not adb (amendment A2)")
+    if "sysrq" not in bench_paths:
+        states.append(UNVERIFIED)
+        notes.append("no sysrq bench boot: every batch needs one after bench boot 1 (amendment A2)")
     details: dict = {}
     if name in ("extra-reboot-first-boot", "extra-reboot-bench"):
         # The fault went in during flash or device-bench; batch.json records
         # it against this flash attempt. It qualifies only if the injected
         # boot's own signal record is rejected, matched by row key and
-        # boot_id, never by the aggregate (review round 2).
+        # boot_id, never by the aggregate (review round 2). On the sysrq
+        # bench boot the rejection must come from its uptime gate (A2).
         inj = injection_for(run, name)
         label = injected_boot_label(inj, dirs) if inj else None
-        st, bid = per.get(label, (None, None)) if label else (None, None)
+        st, bid, up = per.get(label, (None, None, None)) if label else (None, None, None)
         # The injection must name the boot it went into, and that boot_id
         # must be the row's (review round 3): a missing one never matches.
         bid_ok = bool(inj and inj.get("boot_id") and bid and inj.get("boot_id") == bid)
-        details["injected_boot"] = {"record": inj, "row": label, "state": st, "boot_id_matches": bid_ok}
-        if inj and label and bid_ok and st == FAIL:
+        gate_ok = name != "extra-reboot-bench" or up == FAIL
+        details["injected_boot"] = {"record": inj, "row": label, "state": st, "uptime": up,
+                                    "boot_id_matches": bid_ok}
+        if inj and label and bid_ok and st == FAIL and gate_ok:
             run.control_injected = name
     return Result("health.boot_signals", worst(states), " | ".join(notes), details)
 
@@ -1067,12 +1088,13 @@ Usage:
   phone-qa --control NAME --batch ID   Run one deliberately broken control (qa/README.md).
   phone-qa stage ID [--product DIR] [--kind batch|baseline|calibration|experiment] [--experiment]
                                        Copy a build's images into $BENCH_HOME/batches/ID.
-  phone-qa boot-timing [--normal N]    Calibration step 1: reboot-path timing and the
-                                       allowance A. Run it straight after `flash --wipe`.
+  phone-qa boot-timing [--normal N]    Calibration step 1: the allowance A for the fastboot
+                                       and sysrq reboot paths, their proofs, and the adb
+                                       chain control.
   phone-qa controls                    Show which controls are qualified for this harness.
-  phone-qa controls --boot-timing      Run the step-1 proofs again with the recorded A and
-                                       tail bound; records the boot-timing controls under the
-                                       current harness version.
+  phone-qa controls --boot-timing      Run the step-1 proofs again with the recorded A;
+                                       records the boot-timing controls under the current
+                                       harness version.
   phone-qa journal                     Show leftovers in the state journal.
   phone-qa helper                      Build (or verify) the river-qa helper APK.
   phone-qa version                     Print the harness version.

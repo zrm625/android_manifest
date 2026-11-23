@@ -22,7 +22,9 @@ COLUMNS = ["run_id", "env", "boot", "host_boot_seconds", "uptime_at_boot_complet
            "build_date_utc", "vendor_date_utc", "bootimage_date_utc", "slot", "batch", "build_id",
            "boot_id", "signals", "evidence",
            # The flash attempt a batch row belongs to (B1): a reflash starts over.
-           "flash_attempt"]
+           "flash_attempt",
+           # Amendment A2: "adb" for bench boot 1, "sysrq" for every later boot.
+           "reboot_path"]
 
 
 def csv_path() -> Path:
@@ -114,6 +116,25 @@ def current_attempt(batch: dict) -> dict | None:
     return atts[-1]
 
 
+def boot_plan(done_before: int, boots: int, batch: bool, control: str | None) -> list[tuple[str, bool]]:
+    """(reboot path, inject the extra-reboot-bench fault) for each boot of
+    this run (amendment A2). ``done_before``: bench boots this flash attempt
+    already has. Boot 1 of the attempt is a normal adb reboot (the charter's
+    boot time, and a clean Android shutdown); every later boot is the
+    immediate sysrq reboot, which has an uptime gate. A batch's first run
+    measures at least 2 boots, so every batch has a sysrq boot. The
+    extra-reboot-bench control goes into this run's first sysrq boot."""
+    if batch:
+        boots = max(boots, 2 - done_before)
+    plan, injected = [], False
+    for i in range(1, boots + 1):
+        path = "adb" if done_before + i == 1 else "sysrq"
+        inject = control == "extra-reboot-bench" and path == "sysrq" and not injected
+        injected = injected or inject
+        plan.append((path, inject))
+    return plan
+
+
 USAGE = """\
 Measure a build on the Moto G7 test phone, and optionally flash it first.
 
@@ -125,7 +146,11 @@ Usage: device-bench <baseline|stripped|current> [--flash] [--wipe] [--boots N] [
   current            Measure whatever the phone runs now. Cannot be combined with --flash.
   --flash   Install the build with scripts/flash (fastboot, inactive slot).
   --wipe    Factory reset while flashing.
-  --boots N   Reboot and measure N times. Default: 3.
+  --boots N   Reboot and measure N times. Default: 3. Boot 1 of a flash is a
+              normal `adb reboot` (the charter's boot time); every later boot is
+              the immediate sysrq reboot, which has an uptime gate. With --batch
+              the first run of a flash attempt measures at least 2 boots, so
+              every batch has a sysrq boot (amendment A2).
   --settle S  Seconds to wait after boot before measuring memory and CPU. Default: 120.
   --batch ID  Measure for a staged batch (with current): the rows carry the batch
               ID, slot, build dates and build ID, and each boot gets health
@@ -193,16 +218,18 @@ def run(a) -> int:
     run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{a.env}"
     # Only this flash attempt's boots count (B1).
     done_before = len(attempt_rows(batch)) if batch else 0
+    plan = boot_plan(done_before, a.boots, bool(batch), control)
+    if len(plan) != a.boots:
+        log(f"Measuring {len(plan)} boots: every batch needs a sysrq bench boot after bench boot 1 (amendment A2)")
     if batch:
         batch.setdefault("bench_runs", []).append(run_id)
         stage.save(batch)
     timing = reboots.load_timing()
-    for i in range(1, a.boots + 1):
-        log(f"Boot {i}/{a.boots}")
+    for i, (path, inject) in enumerate(plan, 1):
+        log(f"Boot {i}/{len(plan)} ({path} reboot)")
         dev.root()
         try:
-            rec = reboots.planned_reboot(dev, "adb", boot_timeout=flashing.BOOT_TIMEOUT,
-                                         inject_early_reboot=control == "extra-reboot-bench" and i == 1)
+            rec = reboots.planned_reboot(dev, path, boot_timeout=flashing.BOOT_TIMEOUT, inject_early_reboot=inject)
         except (TimeoutError, RuntimeError) as e:
             log(f"error: boot {i} failed: {e}")
             if batch:
@@ -252,19 +279,17 @@ def run(a) -> int:
             "build_date_utc": props[0].strip(), "vendor_date_utc": props[1].strip(),
             "bootimage_date_utc": props[2].strip(), "slot": props[3].strip().lstrip("_"),
             "batch": a.batch or "", "build_id": sys_id or "", "boot_id": rec.boot_id,
-            "flash_attempt": attempt["attempt_id"] if attempt else "",
+            "flash_attempt": attempt["attempt_id"] if attempt else "", "reboot_path": path,
         }
         if batch:
             expected = 1 + done_before + i  # the first boot after the wipe, then each bench boot
             count = reboots.read_boot_count(dev, expected)
-            signals = {"path": "adb", "chain": list(rec.chain), "uptime": list(rec.uptime_check),
+            signals = {"path": path, "chain": list(rec.chain), "uptime": list(rec.uptime_check),
                        "boot_count": list(count), "reboot": rec.to_json(), "expected_boots": expected}
             evidence.collect(dev, ev_dir, expected_boot_id=rec.boot_id,
                              context={"run_id": run_id, "boot": i, "batch": a.batch, "kind": "bench"})
             write_json(ev_dir / "signals.json", signals)
-            verdict = reboots.combined_verdict(signals, "adb", timing)
-            if i == 1 and done_before == 0:
-                record_first_tail(rec, count, expected, a.batch, props[4].strip())
+            verdict = reboots.combined_verdict(signals, path, timing)
             row["signals"] = verdict[0]
             row["evidence"] = str(ev_dir.relative_to(BENCH_HOME))
         else:
@@ -275,26 +300,6 @@ def run(a) -> int:
             f"signals {row['signals']}")
     log(f"Results: {csv_path()}")
     return 0
-
-
-def record_first_tail(rec, count: tuple, expected: int, batch_id: str, build: str) -> bool:
-    """The first bench boot of a flash with a wipe is the first adb reboot
-    after that wipe: add its shutdown tail to the samples that set
-    max_shutdown_tail (amendment A1′ rule 4). Only when the flash record
-    and dropbox prove it (calibrate.first_after_wipe): it rebooted from the
-    wipe's recorded first boot, and dropbox holds exactly that boot and this
-    one."""
-    from .calibrate import first_after_wipe
-    from .journal import last_wipe
-    from .results import PASS
-    wipe = last_wipe(flashing.qa_home())
-    boots_before = expected - 1 if count[0] == PASS else None
-    ok, why = first_after_wipe("adb", 0, rec.boot_id_before, boots_before, wipe)
-    added = ok and reboots.add_tail_sample(rec.to_json(), wipe, f"bench:{batch_id}", build)
-    if ok:
-        log(f"  first adb reboot after wipe #{wipe['seq']}: shutdown tail {rec.reset_tail_s} s "
-            f"{'recorded' if added else 'not recorded (no anchor, or the wipe has a sample)'}")
-    return bool(added)
 
 
 if __name__ == "__main__":

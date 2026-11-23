@@ -117,27 +117,5 @@ class FlashBatch(unittest.TestCase):
         self.assertEqual(rc, flashing.EXIT_ERROR)
 
 
-class WipeFirstBoot(unittest.TestCase):
-    """The flash record names the first boot after each wipe, so calibration
-    can tie "the first adb reboot after a wipe" to it (review round 3)."""
-
-    def test_rollback_records_the_wipes_first_boot(self):
-        from riverqa import journal
-        from riverqa.device import BootStatus
-        with bench_home() as h:
-            stage_batch(h)
-            phone = FakePhone(h)
-            phone.reboot_fastboot = lambda *a, **k: None
-            phone.wait_for_device = lambda *a, **k: None
-            phone.wait_boot_completed = lambda *a, **k: BootStatus("boot-after-wipe", True, 30.0, 0.0, 0.0)
-            with mock.patch.object(flashing, "to_fastboot", lambda *a, **k: None), \
-                    mock.patch.object(flashing, "verify_slot_build", lambda *a, **k: "slot a, build ok"), \
-                    redirect_stderr(io.StringIO()):
-                flashing.rollback(phone, flashing.load_state(), "test")
-            w = journal.last_wipe(flashing.qa_home())
-        self.assertEqual(w["how"], "rollback")
-        self.assertEqual(w["first_boot_id"], "boot-after-wipe")
-
-
 if __name__ == "__main__":
     unittest.main()

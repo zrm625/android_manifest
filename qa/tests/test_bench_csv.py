@@ -37,5 +37,25 @@ class Migrate(unittest.TestCase):
             bench.migrate_header(p)
 
 
+class BootPlan(unittest.TestCase):
+    """Amendment A2: bench boot 1 is adb, every later boot sysrq, and every
+    batch has a sysrq boot."""
+
+    def test_paths(self):
+        self.assertEqual(bench.boot_plan(0, 3, True, None), [("adb", False), ("sysrq", False), ("sysrq", False)])
+        self.assertEqual(bench.boot_plan(2, 2, True, None), [("sysrq", False), ("sysrq", False)])
+        self.assertEqual(bench.boot_plan(0, 3, False, None), [("adb", False), ("sysrq", False), ("sysrq", False)])
+
+    def test_every_batch_gets_a_sysrq_boot(self):
+        self.assertEqual(bench.boot_plan(0, 1, True, None), [("adb", False), ("sysrq", False)])
+        self.assertEqual(bench.boot_plan(1, 1, True, None), [("sysrq", False)])
+        self.assertEqual(bench.boot_plan(0, 1, False, None), [("adb", False)])     # no batch: as asked
+
+    def test_extra_reboot_bench_goes_into_the_first_sysrq_boot(self):
+        self.assertEqual(bench.boot_plan(0, 3, True, "extra-reboot-bench"),
+                         [("adb", False), ("sysrq", True), ("sysrq", False)])
+        self.assertEqual(bench.boot_plan(0, 2, True, "wifi-off"), [("adb", False), ("sysrq", False)])
+
+
 if __name__ == "__main__":
     unittest.main()

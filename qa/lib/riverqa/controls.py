@@ -12,7 +12,8 @@ Kinds:
   and a target check reached the expected state (control_verdict). The two
   extra-reboot controls inject during flash or device-bench (run them with
   RIVERQA_CONTROL set); batch.json's ``control_injections`` records it.
-- ``step1``: proved by ``phone-qa boot-timing`` (the extra-pass controls).
+- ``step1``: proved by ``phone-qa boot-timing`` (the extra-pass controls on
+  the fastboot and sysrq paths, and the chain control on the adb path).
 - ``host``: flash --recover against a scratch $BENCH_HOME with stubbed gh /
   git ls-remote, judged by the slot-state.json it persists.
 - ``recovery``: kill a run mid-check, then run again; the journal must restore
@@ -57,10 +58,13 @@ CONTROLS: dict[str, tuple[str, list[str], str, str]] = {
     "nav-mode-0": ("qa", ["system.gestures"], FAIL, "navigation_mode 0"),
     "camera-set-changed": ("qa", ["hardware.cameras"], UNVERIFIED, "camera set changed in batch.json"),
     "extra-reboot-first-boot": ("qa", ["health.boot_signals"], FAIL, "extra reboot before the first boot completes"),
-    "extra-reboot-bench": ("qa", ["health.boot_signals"], FAIL, "extra reboot before a bench boot completes"),
-    "boot-timing-adb-extra-pass": ("step1", [], FAIL, "extra bootloader pass, planned marking (adb path)"),
+    "extra-reboot-bench": ("qa", ["health.boot_signals"], FAIL,
+                           "extra reboot before the sysrq bench boot completes (its uptime gate)"),
+    "boot-timing-adb-extra-reboot": ("step1", [], FAIL,
+                                     "extra full reboot after ramoops init on an adb reboot (bench boot 1): the chain"),
+    "boot-timing-sysrq-extra-pass": ("step1", [], FAIL, "extra bootloader pass, planned marking (sysrq path)"),
     "boot-timing-fastboot-extra-pass": ("step1", [], FAIL, "extra bootloader pass, planned marking (fastboot path)"),
-    "boot-timing-adb-extra-pass-unmarked": ("step1", [], FAIL, "extra pass without planned marking (adb path)"),
+    "boot-timing-sysrq-extra-pass-unmarked": ("step1", [], FAIL, "extra pass without planned marking (sysrq path)"),
     "boot-timing-fastboot-extra-pass-unmarked": ("step1", [], FAIL,
                                                  "extra pass without planned marking (fastboot path)"),
     "tag-pushed-host-killed": ("host", [], PASS, "tag pushed, host killed before slot-state update: promote"),
@@ -82,7 +86,7 @@ def record_step1(results: dict) -> None:
     v = harness_version()
     for name, r in results.items():
         _store(v, name, {"at": now_iso(), "expected": r["expected"], "got": r["got"],
-                         "qualified": bool(r["qualified"]), "check": "uptime/enumeration (boot-timing)"})
+                         "qualified": bool(r["qualified"]), "check": r.get("check") or "boot-timing"})
 
 
 def show_controls(version: str) -> int:

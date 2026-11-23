@@ -1,11 +1,11 @@
-"""Calibration step 1: boot timing (DESIGN.md, "Calibration and bootstrap").
-It flashes nothing itself, but it runs straight after `flash --wipe`, so its
-first adb reboot is the first adb reboot after a wipe (F1, compute_paths).
+"""Calibration step 1: boot timing (DESIGN.md, "Calibration and bootstrap",
+and amendment A2). It flashes nothing itself.
 
-For each reboot path (a plain ``adb reboot``, and a reboot through fastboot
-with no writes) this measures the normal bootloader pass (host time from the
-USB disconnect to kernel start), sets the allowance A with the rule in
-bootsig.compute_allowance, then proves on fresh reboots that:
+For each gated reboot path (reboots.GATED_PATHS: a reboot through fastboot
+with no writes, and the immediate sysrq reboot) this measures the normal
+bootloader pass (host time from the USB disconnect to kernel start), sets
+the allowance A with the rule in bootsig.compute_allowance, then proves on
+fresh reboots that:
 
 - a normal boot passes the uptime check;
 - an injected extra bootloader pass, with its enumerations marked planned, is
@@ -13,30 +13,26 @@ bootsig.compute_allowance, then proves on fresh reboots that:
 - the same injection without the planned marking is rejected by the
   unplanned-enumeration rule.
 
+On the sysrq path the injected pass is a bootloader stop set up with
+``fastboot oem fb_mode_set`` (reboots.arm_bootloader_stop).
+
 "One more bootloader pass" is the smaller of the flash path's normal pass
 (reset to kernel start) and the measured increment of an injected pass; see
-run() for why.
+compute_paths() for why.
 
-Amendment A1′: on the adb path the clock starts at the old kernel's reset
-(reboots.judge_record), so only reboots whose chain passed and whose anchor
-could be mapped count. max_shutdown_tail, the bound every later adb-path
-anchor must fall inside, is the largest of at least 3 first-adb-reboot-
-after-wipe shutdown tails (disconnect to reset) plus 1.0 s. Each run adds
-its first adb reboot's tail as that wipe's sample
-($BENCH_HOME/qa/shutdown-tails.jsonl, reboots.add_tail_sample); the first
-bench boot of a baseline or batch flash adds one too. With fewer than 3
-samples there is no bound and the adb path stays UNVERIFIED.
+The adb path (bench boot 1) has no uptime gate, so it gets no A and no
+extra-pass proofs. Its control is the chain: an extra full reboot injected
+after ramoops init must FAIL through the kernel-log chain
+(prove_adb_chain).
 
-The raw pstore of every adb reboot that got no anchor is saved under
-$BENCH_HOME/qa/pstore-noanchor/ for diagnosis.
+It also records whether the kernel-log chain survives each gated path and
+how often ramoops corrupts the marker. The raw pstore of every reboot whose
+chain did not pass is kept under $BENCH_HOME/qa/pstore-unproven/ for
+diagnosis. Results: $BENCH_HOME/qa/boot-timing.json. The proofs are part of
+the control set (controls.json).
 
 `phone-qa controls --boot-timing` (prove_main) runs only the proofs again,
-with the recorded A and bound, so they can be renewed under the final
-harness version.
-
-It also records whether the kernel-log chain survives each path and how
-often ramoops corrupts the marker. Results: $BENCH_HOME/qa/boot-timing.json.
-The proofs are part of the control set (controls.json).
+with the recorded A, so they can be renewed under the final harness version.
 """
 
 from __future__ import annotations
@@ -52,66 +48,61 @@ from .device import Device, UsbWatcher
 from .lock import DeviceLock, LockError
 from .results import FAIL, PASS
 
+ADB_CHAIN_CONTROL = "boot-timing-adb-extra-reboot"
+
 
 def one(dev: Device, w: UsbWatcher, path: str, timing: dict, *, inject=False, mark_planned=True,
-        count_before: int | None = None, measuring: bool = False) -> dict:
-    if inject:
-        os.environ["RIVERQA_CONTROL"] = "boot-timing-extra-pass"
+        early_reboot=False, count_before: int | None = None) -> dict:
+    control = ADB_CHAIN_CONTROL if early_reboot else "boot-timing-extra-pass" if inject else None
+    if control:
+        os.environ["RIVERQA_CONTROL"] = control
     try:
         rec = reboots.planned_reboot(dev, path, boot_timeout=600, inject_extra_pass=inject,
-                                     mark_planned=mark_planned, watcher=w)
+                                     mark_planned=mark_planned, inject_early_reboot=early_reboot, watcher=w)
     finally:
-        if inject:
+        if control:
             os.environ.pop("RIVERQA_CONTROL", None)
-    reboots.judge_signals(dev, rec, timing, measuring=measuring)
+    reboots.judge_signals(dev, rec, timing)
     from .evidence import read_pstore
     _ok, log_bytes, _why = read_pstore(dev, "console-ramoops*")
     exact = log_bytes.count(rec.marker.encode()) if rec.marker else 0
     copies = len(bootsig.marker_offsets(log_bytes, rec.marker)) if rec.marker else 0
-    proven = (bootsig.proven_marker(log_bytes, rec.marker, bootsig.live_stamps(rec.marker_pair))[0] is not None
-              if rec.marker and rec.marker_pair else False)
+    proven = (bootsig.proven_marker(log_bytes, rec.marker, rec.marker_stamps)[0] is not None
+              if rec.marker and rec.marker_stamps else False)
     d = rec.to_json()
     d["marker_copies_exact"] = exact
     d["marker_copies_fuzzy"] = copies
     d["marker_found_fuzzy"] = copies > 0
     d["marker_proven"] = proven
-    if path == "adb" and rec.clock_source != "reset-anchor" and log_bytes:
-        d["pstore_saved"] = str(save_noanchor_pstore(rec, log_bytes))
+    if rec.chain[0] != PASS and log_bytes:
+        d["pstore_saved"] = str(save_unproven_pstore(rec, log_bytes))
     d["pstore_bytes"] = len(log_bytes)
-    d["pstore_last_ts"] = bootsig.last_timestamp(log_bytes)
     if count_before is not None:
         st, msg = reboots.read_boot_count(dev, count_before + 1, settle_s=90)
         d["boot_count"] = [st, msg]
-    tail_note = "" if not rec.anchor else " (tail %.2f s)" % rec.anchor["tail_s"]
-    log(f"  {path:8} {'inject' if inject else 'normal'}{'' if mark_planned else ' unmarked'}: "
+    kind = "early reboot" if early_reboot else "inject" if inject else "normal"
+    log(f"  {path:8} {kind}{'' if mark_planned else ' unmarked'}: "
         f"boot {rec.host_boot_seconds:.1f} s, uptime {rec.uptime:.1f} s, elapsed {rec.elapsed:.2f} s, "
         f"pass {rec.bootloader_pass:.2f} s, fastboot planned {rec.planned_fastboot} unplanned "
-        f"{rec.unplanned_fastboot}, chain {rec.chain[0]} ({exact} exact copies), clock {rec.clock_source}"
-        f"{tail_note}, uptime-check {rec.uptime_check[0]}"
-        f"{'' if rec.clock_source != 'none' else ' (' + rec.anchor_note + ')'}")
+        f"{rec.unplanned_fastboot}, chain {rec.chain[0]} ({exact} exact copies, proven {proven}), "
+        f"uptime-check {rec.uptime_check[0]}{' (' + rec.control + ')' if rec.control else ''}")
     ids = sorted({e['ids'] for e in d['usb_events'] if e['kind'] == 'present'})
     log(f"           usb ids seen: {ids}")
     return d
 
 
-def save_noanchor_pstore(rec, log_bytes: bytes):
-    """Keep the raw pstore of an adb reboot that got no anchor (A1′ field
-    check): $BENCH_HOME/qa/pstore-noanchor/<time>-<marker>.bin, with the
-    marker pairing and the reason next to it."""
+def save_unproven_pstore(rec, log_bytes: bytes):
+    """Keep the raw pstore of a reboot whose chain did not pass:
+    $BENCH_HOME/qa/pstore-unproven/<time>-<marker>.bin, with the live
+    stamps and the verdict next to it."""
     name = time.strftime("%Y%m%d-%H%M%S") + "-" + (rec.marker or "nomarker").replace(":", "_")
-    out = bench_path("qa", "pstore-noanchor", name + ".bin")
+    out = bench_path("qa", "pstore-unproven", name + ".bin")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(log_bytes)
-    write_json(out.with_suffix(".json"), {"marker": rec.marker, "marker_pair": rec.marker_pair,
-                                          "anchor_note": rec.anchor_note, "chain": list(rec.chain),
-                                          "control": rec.control, "boot_id_before": rec.boot_id_before})
+    write_json(out.with_suffix(".json"), {"path": rec.path, "marker": rec.marker, "marker_stamps": rec.marker_stamps,
+                                          "chain": list(rec.chain), "control": rec.control,
+                                          "boot_id_before": rec.boot_id_before})
     return out
-
-
-def usable(path: str, r: dict) -> bool:
-    """A step-1 reboot that can set A: on the adb path only one whose clock
-    started at the reset anchor."""
-    return path != "adb" or r.get("clock_source") == "reset-anchor"
 
 
 def boot_count_now(dev: Device, settle_s: float = 60) -> int:
@@ -128,63 +119,31 @@ def boot_count_now(dev: Device, settle_s: float = 60) -> int:
         time.sleep(3)
 
 
-def first_after_wipe(path: str, index: int, boot_id_before: str | None, boots_before: int,
-                     wipe: dict | None) -> tuple[bool, str]:
-    """Is this step-1 reboot the first adb reboot after a recorded wipe
-    (review round 3)? Only if it is step 1's first reboot, on the adb path,
-    from the boot the flash record names as the wipe's first boot (so no
-    other boot came between), and dropbox holds exactly that one boot."""
-    if path != "adb" or index != 0:
-        return False, "not step 1's first adb reboot"
-    if not wipe:
-        return False, "no wipe recorded"
-    if not wipe.get("first_boot_id"):
-        return False, f"wipe #{wipe.get('seq')} has no recorded first boot"
-    if boot_id_before != wipe["first_boot_id"]:
-        return False, (f"rebooted from boot {str(boot_id_before)[:8]}, not wipe #{wipe['seq']}'s first boot "
-                       f"{wipe['first_boot_id'][:8]}")
-    if boots_before != 1:
-        return False, f"dropbox holds {boots_before} SYSTEM_BOOT entries, not 1"
-    return True, f"the first adb reboot after wipe #{wipe['seq']} ({wipe.get('how')})"
-
-
 def compute_paths(data: dict) -> None:
-    """Set A, the shutdown-tail bound and the chain record for each path
-    from data["raw"] and data["inject_measure"]. Pure.
-
-    F1 (review round 2), amendment A1′ rule 4: the tail bound comes from
-    the first adb reboot after a wipe, which is every batch's first bench
-    boot and has the longest shutdown tail (8-9.2 s on river). It needs at
-    least bootsig.MIN_TAIL_SAMPLES such tails, one per wipe, from
-    data["tail_samples"] (reboots.load_tail_samples), plus a margin.
-    Without them there is no bound, and every adb-path uptime signal stays
-    UNVERIFIED."""
-    passes = {p: [r["bootloader_pass"] for r in data["raw"][p] if usable(p, r)] for p in reboots.PATHS}
-    adb_ok = [r for r in data["raw"]["adb"] if usable("adb", r)]
-    tails = [r["anchor"]["tail_s"] for r in adb_ok]
+    """Set A and the chain record for each gated path from data["raw"] and
+    data["inject_measure"]. Pure."""
+    passes = {p: [r["bootloader_pass"] for r in data["raw"].get(p) or []] for p in reboots.GATED_PATHS}
     # "One more bootloader pass": the flash path's normal pass (reset to
     # kernel start, DESIGN.md round-10 note) or the measured increment of
     # an injected pass, whichever is smaller. On river the injected pass
-    # (reset to fastboot and on) adds about 4 s, far less than the 10 s
+    # (reset to fastboot and on) adds about 4.4 s, far less than the 10 s
     # reset-to-kernel pass, so the smaller value is the one that lets the
     # uptime check reject the control.
     flash_pass = min(passes["fastboot"]) if passes["fastboot"] else None
-    for path in reboots.PATHS:
-        raws = data["raw"][path]
+    for path in reboots.GATED_PATHS:
+        raws = data["raw"].get(path) or []
         chains = [r["chain"][0] for r in raws]
         data["chain"][path] = {"survives": bool(chains) and all(c == PASS for c in chains), "verdicts": chains,
                                "exact_copies": [r.get("marker_copies_exact") for r in raws],
-                               "fuzzy_found": [r.get("marker_found_fuzzy") for r in raws]}
-        inj = data["inject_measure"].get(path) or {}
+                               "fuzzy_found": [r.get("marker_found_fuzzy") for r in raws],
+                               "proven": [r.get("marker_proven") for r in raws]}
+        inj = data["inject_measure"].get(path)
         empty = {"A": None, "normal_passes": passes[path], "proof_normal_pass": False,
                  "proof_control_rejected": False, "proof_unmarked_rejected": False}
-        if not passes[path] or flash_pass is None or not usable(path, inj):
-            notes = sorted({r.get("anchor_note") or "" for r in raws + [inj] if not usable(path, r)} - {""})
-            why = (f"no usable {path} reboots" if not passes[path] else
-                   "no usable fastboot reboots, so no flash-path pass" if flash_pass is None else
-                   "the injected-pass measurement got no reset anchor")
-            if path == "adb" and notes:
-                why += " (reset anchor: " + "; ".join(notes[:4]) + ")"
+        if not passes[path] or flash_pass is None or not inj:
+            why = (f"no {path} reboots measured" if not passes[path] else
+                   "no fastboot reboots, so no flash-path pass" if flash_pass is None else
+                   "no injected-pass measurement")
             data["paths"][path] = dict(empty, why=why)
             continue
         inc = inj["bootloader_pass"] - min(passes[path])
@@ -193,34 +152,15 @@ def compute_paths(data: dict) -> None:
         data["paths"][path] = dict(empty, A=a_val, why=why, extra_pass=round(extra, 3),
                                    extra_pass_flash_path=flash_pass, extra_pass_injected_increment=round(inc, 3),
                                    mean=round(statistics.mean(passes[path]), 3))
-        if path == "adb":
-            p = data["paths"][path]
-            p["clock"] = "reset-anchor"
-            p["shutdown_tails"] = tails
-            set_tail_bound(p, data.get("tail_samples") or [])
-
-
-def set_tail_bound(p: dict, samples: list[dict]) -> None:
-    """max_shutdown_tail for the adb path from the first-after-wipe tail
-    samples (A1′ rule 4), or None with ``tail_why``."""
-    wipe_tails = [s["tail_s"] for s in samples]
-    p["first_after_wipe_tails"] = wipe_tails
-    p["first_after_wipe_wipes"] = [s.get("wipe_seq") for s in samples]
-    p["max_shutdown_tail"] = bootsig.tail_bound_from(wipe_tails)
-    if p["max_shutdown_tail"] is None:
-        p["tail_why"] = (f"{len(wipe_tails)} of {bootsig.MIN_TAIL_SAMPLES} first-adb-reboot-after-wipe tail "
-                         "samples: run `flash --rollback` (or another wipe) and then `phone-qa boot-timing` "
-                         "straight away")
-    else:
-        p.pop("tail_why", None)
 
 
 def prove(dev: Device, w: UsbWatcher, data: dict) -> None:
-    """The step-1 proofs on fresh reboots, judged with the recorded A and
-    tail bound. allowance_for() only uses A once both proofs are recorded."""
-    for path in reboots.PATHS:
+    """The step-1 proofs on fresh reboots, judged with the recorded A, then
+    the adb chain control. allowance_for() only uses A once both uptime
+    proofs are recorded."""
+    for path in reboots.GATED_PATHS:
         p = data["paths"].get(path) or {}
-        if p.get("A") is None or (path == "adb" and p.get("max_shutdown_tail") is None):
+        if p.get("A") is None:
             continue
         proof_timing = {"paths": {path: dict(p, proof_normal_pass=True, proof_control_rejected=True)}}
         normal = one(dev, w, path, proof_timing)
@@ -234,44 +174,58 @@ def prove(dev: Device, w: UsbWatcher, data: dict) -> None:
         p["proof_unmarked_rejected"] = unm["unplanned_fastboot"] > 0 and unm["uptime_check"][0] == FAIL
         p["proved_at"] = now_iso()
         data["controls"][f"boot-timing-{path}-extra-pass"] = {
-            "expected": "FAIL (uptime)", "got": ctrl["uptime_check"], "qualified": p["proof_control_rejected"]}
+            "expected": "FAIL (uptime)", "got": ctrl["uptime_check"], "qualified": p["proof_control_rejected"],
+            "check": "uptime (boot-timing)"}
         data["controls"][f"boot-timing-{path}-extra-pass-unmarked"] = {
             "expected": "FAIL (unplanned enumeration)", "got": unm["uptime_check"],
-            "qualified": p["proof_unmarked_rejected"]}
+            "qualified": p["proof_unmarked_rejected"], "check": "unplanned enumeration (boot-timing)"}
         reboots.save_timing(data)
+    prove_adb_chain(dev, w, data)
+    reboots.save_timing(data)
+
+
+def prove_adb_chain(dev: Device, w: UsbWatcher, data: dict) -> None:
+    """The bench-boot-1 control (amendment A2 rule 6): an ``adb reboot``
+    with an extra full reboot injected as soon as adb answers and before
+    boot completes, so well after ramoops init. The extra kernel's log
+    replaces pstore, so the chain must FAIL. It qualifies only if the fault
+    went in (the phone dropped off USB again) and the chain itself is FAIL."""
+    rec = one(dev, w, "adb", data, early_reboot=True)
+    data["adb_chain_control"] = rec
+    data["controls"][ADB_CHAIN_CONTROL] = {
+        "expected": "FAIL (chain)", "got": rec["chain"], "injected": rec["control"] == "early-reboot",
+        "qualified": rec["control"] == "early-reboot" and rec["chain"][0] == FAIL, "check": "chain (boot-timing)"}
 
 
 def summary(data: dict) -> list[str]:
     """The report lines, also for a path that got no A (the recorded reason
     is printed, never a KeyError)."""
     out = ["Boot-timing calibration:"]
-    for path in reboots.PATHS:
+    for path in reboots.GATED_PATHS:
         p = data.get("paths", {}).get(path) or {}
         chain = (data.get("chain", {}).get(path) or {}).get("survives")
         if p.get("A") is None:
             out.append(f"  {path:8} not qualified: {p.get('why') or 'not measured'}; chain survives: {chain}")
             continue
-        tail = ""
-        if path == "adb":
-            n = len(p.get("first_after_wipe_tails") or [])
-            tail = (f"; shutdown-tail bound {p.get('max_shutdown_tail')} s from {n} first-after-wipe tails"
-                    if p.get("max_shutdown_tail") is not None
-                    else f"; no shutdown-tail bound ({p.get('tail_why')})")
         out.append(f"  {path:8} A={p['A']} ({p.get('why')}); extra pass {p.get('extra_pass')} s (flash path "
                    f"{p.get('extra_pass_flash_path')} s, injected increment {p.get('extra_pass_injected_increment')} s)"
-                   f"{tail}; normal boot passes: {p.get('proof_normal_pass')}; extra pass rejected by uptime: "
+                   f"; normal boot passes: {p.get('proof_normal_pass')}; extra pass rejected by uptime: "
                    f"{p.get('proof_control_rejected')}; unmarked rejected by enumeration rule: "
                    f"{p.get('proof_unmarked_rejected')}; chain survives: {chain}")
+    c = (data.get("controls") or {}).get(ADB_CHAIN_CONTROL)
+    out.append(f"  adb      no uptime gate; extra reboot after ramoops init rejected by the chain: "
+               f"{c.get('qualified') if c else 'not run'}{' (' + str(c.get('got')) + ')' if c else ''}")
     return out
 
 
 def qualified(data: dict) -> bool:
-    """Every path has all three proofs: a normal boot passed, the marked
-    extra pass was rejected by the uptime check and the unmarked one by the
-    enumeration rule (review round 3)."""
+    """Every gated path has all three proofs (a normal boot passed, the
+    marked extra pass was rejected by the uptime check and the unmarked one
+    by the enumeration rule), and the adb chain control qualified."""
     return all(all((data.get("paths", {}).get(p) or {}).get(k)
                    for k in ("proof_normal_pass", "proof_control_rejected", "proof_unmarked_rejected"))
-               for p in reboots.PATHS)
+               for p in reboots.GATED_PATHS) and bool(
+        ((data.get("controls") or {}).get(ADB_CHAIN_CONTROL) or {}).get("qualified"))
 
 
 def boot_timing_main(argv: list[str]) -> int:
@@ -290,8 +244,8 @@ def boot_timing_main(argv: list[str]) -> int:
 
 def prove_main() -> int:
     """phone-qa controls --boot-timing: run the step-1 proofs again with the
-    recorded A and tail bound, and record the four boot-timing controls
-    under the harness version that results. Run it after the last change to
+    recorded A, and record the five boot-timing controls under the harness
+    version that results. Run it after the last change to
     the harness, the thresholds or the seed, and before the other controls
     (README, "Order of qualification")."""
     try:
@@ -304,11 +258,6 @@ def prove_main() -> int:
             dev.guard()
             dev.root()
             data.setdefault("controls", {})
-            # The samples may have grown since boot-timing ran (bench first
-            # boots, A1′ rule 4): renew the bound from them.
-            data["tail_samples"] = reboots.load_tail_samples()
-            if (data["paths"].get("adb") or {}).get("A") is not None:
-                set_tail_bound(data["paths"]["adb"], data["tail_samples"])
             w = UsbWatcher(dev.serial).start()
             try:
                 prove(dev, w, data)
@@ -337,48 +286,29 @@ def run(n_normal: int, reuse: bool = False) -> int:
     dev.root()
     old = reboots.load_timing()
     data = {"measured_at": now_iso(), "build": dev.getprop("ro.lineage.display.version"),
-            "build_date_utc": dev.getprop("ro.build.date.utc"), "raw": {p: [] for p in reboots.PATHS},
+            "build_date_utc": dev.getprop("ro.build.date.utc"), "raw": {p: [] for p in reboots.GATED_PATHS},
             "inject_measure": {}, "paths": {}, "chain": {}, "controls": {}}
     timing_none = {}  # no allowance while measuring
     if reuse and old.get("build_date_utc") == data["build_date_utc"] and all(old.get("raw", {}).get(p)
-                                                                             for p in reboots.PATHS):
-        data["raw"] = old["raw"]
+                                                                             for p in reboots.GATED_PATHS):
+        data["raw"] = {p: old["raw"][p] for p in reboots.GATED_PATHS}
         data["reused_normals_from"] = old.get("measured_at")
-        # A flag set before review round 3 (dropbox count only) is not
-        # trusted: it carries no tie to the flash record.
-        for r in data["raw"].get("adb") or []:
-            if not r.get("first_after_wipe_why"):
-                r["first_after_wipe"] = False
-        log(f"Reusing {sum(len(v) for v in old['raw'].values())} normal reboots from {old.get('measured_at')}")
-    from .flashing import qa_home
-    from .journal import last_wipe
-    wipe = last_wipe(qa_home())
-    data["wipe"] = wipe
+        log(f"Reusing {sum(len(v) for v in data['raw'].values())} normal reboots from {old.get('measured_at')}")
     w = UsbWatcher(dev.serial).start()
     try:
         if not data.get("reused_normals_from"):
-            for i in range(n_normal):
-                for path in reboots.PATHS:
+            for _ in range(n_normal):
+                for path in reboots.GATED_PATHS:
                     before = boot_count_now(dev)
-                    r = one(dev, w, path, timing_none, count_before=before, measuring=True)
-                    # The first adb reboot after a wipe, tied to the flash
-                    # record's first boot after it (F1, review round 3).
+                    r = one(dev, w, path, timing_none, count_before=before)
                     r["boots_before"] = before
-                    r["first_after_wipe"], r["first_after_wipe_why"] = first_after_wipe(
-                        path, i, r.get("boot_id_before"), before, wipe)
                     data["raw"][path].append(r)
-                    if r["first_after_wipe"]:
-                        added = reboots.add_tail_sample(r, wipe, "boot-timing", data["build"])
-                        log(f"  first adb reboot after wipe #{wipe['seq']}: tail "
-                            f"{r.get('reset_tail_s')} s {'recorded' if added else 'not recorded'}")
                     write_json(bench_path("qa", "boot-timing.partial.json"), data)
         # One injected extra pass per path, to measure how long an extra
         # bootloader pass really is on this phone (separate from the proofs).
-        for path in reboots.PATHS:
-            data["inject_measure"][path] = one(dev, w, path, timing_none, inject=True, mark_planned=True,
-                                               measuring=True)
+        for path in reboots.GATED_PATHS:
+            data["inject_measure"][path] = one(dev, w, path, timing_none, inject=True, mark_planned=True)
             write_json(bench_path("qa", "boot-timing.partial.json"), data)
-        data["tail_samples"] = reboots.load_tail_samples()
         compute_paths(data)
         reboots.save_timing(data)
         prove(dev, w, data)

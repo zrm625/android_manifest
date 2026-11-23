@@ -153,17 +153,21 @@ class Attribution(unittest.TestCase):
     """Controls are credited only for their own fault (review round 2)."""
 
     def run_with(self, injections, sig_states, attempt="att-1"):
+        """sig_states: (label, first boot, combined state, boot_id[, path[, uptime state]]).
+        Bench rows default to the sysrq path, after an adb bench boot 1."""
         from pathlib import Path
         import tempfile
         tmp = Path(tempfile.mkdtemp())
         dirs = []
-        for label, first, st, bid in sig_states:
+        for label, first, st, bid, *rest in sig_states:
+            path = "fastboot" if first else (rest[0] if rest else "sysrq")
+            up = rest[1] if len(rest) > 1 else st
             d = tmp / label.replace(" ", "_").replace("#", "_")
             d.mkdir()
             verdict = [st, "x"]
-            core.write_json(d / "signals.json", {"chain": verdict, "uptime": verdict, "boot_count": verdict,
-                                                 "reboot": {"boot_id": bid}})
-            dirs.append((label, d, "adb" if not first else "fastboot", first))
+            core.write_json(d / "signals.json", {"path": path, "chain": verdict, "uptime": [up, "x"],
+                                                 "boot_count": verdict, "reboot": {"boot_id": bid}})
+            dirs.append((label, d, path, first))
         run = mock.Mock()
         run.batch = {"control_injections": injections}
         run.attempt_id.return_value = attempt
@@ -173,48 +177,87 @@ class Attribution(unittest.TestCase):
             r = qa.check_boot_signals(run)
         return r, run.control_injected
 
+    BENCH1 = ("bench dev-1#1", False, PASS, "B1", "adb")
     INJ = {"control": "extra-reboot-bench", "injected": True, "flash_attempt": "att-1", "where": "bench boot",
-           "run_id": "dev-1", "boot": 1, "boot_id": "B1"}
+           "run_id": "dev-1", "boot": 2, "boot_id": "B2"}
 
     def test_injected_boots_own_record_must_be_rejected(self):
         with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-bench"}):
             # The injected boot passes; another boot fails. The aggregate is
             # FAIL but the control does not qualify.
-            r, marked = self.run_with([self.INJ], [("first boot", True, FAIL, "B0"),
-                                                   ("bench dev-1#1", False, PASS, "B1")])
+            r, marked = self.run_with([self.INJ], [("first boot", True, FAIL, "B0"), self.BENCH1,
+                                                   ("bench dev-1#2", False, PASS, "B2")])
             self.assertEqual(r.state, FAIL)
             self.assertIsNone(marked)
-            r, marked = self.run_with([self.INJ], [("first boot", True, PASS, "B0"),
-                                                   ("bench dev-1#1", False, FAIL, "B1")])
+            r, marked = self.run_with([self.INJ], [("first boot", True, PASS, "B0"), self.BENCH1,
+                                                   ("bench dev-1#2", False, FAIL, "B2")])
             self.assertEqual(marked, "extra-reboot-bench")
+
+    def test_sysrq_bench_injection_must_fail_its_uptime_gate(self):
+        # A2: extra-reboot-bench goes into the sysrq bench boot, and only its
+        # uptime gate's FAIL qualifies it, not the chain or the count alone.
+        with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-bench"}):
+            _, marked = self.run_with([self.INJ], [("first boot", True, PASS, "B0"), self.BENCH1,
+                                                   ("bench dev-1#2", False, FAIL, "B2", "sysrq", PASS)])
+            self.assertIsNone(marked)
+
+    def test_every_batch_needs_a_sysrq_bench_boot(self):
+        r, _ = self.run_with([], [("first boot", True, PASS, "B0"), self.BENCH1])
+        self.assertEqual(r.state, UNVERIFIED)
+        self.assertIn("no sysrq bench boot", r.summary)
+        r, _ = self.run_with([], [("first boot", True, PASS, "B0"), self.BENCH1,
+                                  ("bench dev-1#2", False, PASS, "B2")])
+        self.assertEqual(r.state, PASS, r.summary)
+
+    def test_bench_boot_1_must_be_the_adb_reboot(self):
+        r, _ = self.run_with([], [("first boot", True, PASS, "B0"), ("bench dev-1#1", False, PASS, "B1", "sysrq"),
+                                  ("bench dev-1#2", False, PASS, "B2")])
+        self.assertEqual(r.state, UNVERIFIED)
+        self.assertIn("bench boot 1 used the sysrq path", r.summary)
+
+    def test_signals_path_must_match_the_row(self):
+        from pathlib import Path
+        import tempfile
+        d = Path(tempfile.mkdtemp())
+        core.write_json(d / "signals.json", {"path": "adb", "chain": [PASS, "x"], "uptime": [PASS, "x"],
+                                             "boot_count": [PASS, "x"], "reboot": {"boot_id": "B2"}})
+        run = mock.Mock()
+        run.batch = {}
+        dirs = [("bench dev-1#2", d, "sysrq", False)]
+        with mock.patch.object(qa, "evidence_dirs", lambda r: dirs), \
+                mock.patch.object(reboots, "load_timing", lambda: {}):
+            r = qa.check_boot_signals(run)
+        self.assertEqual(r.state, UNVERIFIED)
+        self.assertIn("differs from the row's sysrq", r.summary)
 
     def test_boot_id_must_match(self):
         with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-bench"}):
-            _, marked = self.run_with([self.INJ], [("first boot", True, PASS, "B0"),
-                                                   ("bench dev-1#1", False, FAIL, "OTHER")])
+            _, marked = self.run_with([self.INJ], [("first boot", True, PASS, "B0"), self.BENCH1,
+                                                   ("bench dev-1#2", False, FAIL, "OTHER")])
             self.assertIsNone(marked)
 
     def test_missing_boot_id_never_matches(self):
         # Review round 3: the injection must carry the boot_id, and the row
         # must have one too.
-        rows = [("first boot", True, PASS, "B0"), ("bench dev-1#1", False, FAIL, "B1")]
+        rows = [("first boot", True, PASS, "B0"), self.BENCH1, ("bench dev-1#2", False, FAIL, "B2")]
         no_bid = {k: v for k, v in self.INJ.items() if k != "boot_id"}
         with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-bench"}):
             self.assertIsNone(self.run_with([no_bid], rows)[1])
             self.assertIsNone(self.run_with([dict(self.INJ, boot_id="")], rows)[1])
-            self.assertIsNone(self.run_with([self.INJ], [("first boot", True, PASS, "B0"),
-                                                         ("bench dev-1#1", False, FAIL, None)])[1])
+            self.assertIsNone(self.run_with([self.INJ], [("first boot", True, PASS, "B0"), self.BENCH1,
+                                                         ("bench dev-1#2", False, FAIL, None)])[1])
 
     def test_first_boot_injection(self):
         inj = dict(self.INJ, control="extra-reboot-first-boot", where="first boot", boot_id="B0")
         with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-first-boot"}):
-            _, marked = self.run_with([inj], [("first boot", True, FAIL, "B0"), ("bench dev-1#1", False, PASS, "B1")])
+            _, marked = self.run_with([inj], [("first boot", True, FAIL, "B0"), self.BENCH1,
+                                              ("bench dev-1#2", False, PASS, "B2")])
             self.assertEqual(marked, "extra-reboot-first-boot")
 
     def test_missed_injection_never_matches(self):
         missed = {k: v for k, v in self.INJ.items() if k != "flash_attempt"}
         missed["injected"] = False
-        rows = [("first boot", True, PASS, "B0"), ("bench dev-1#1", False, FAIL, "B1")]
+        rows = [("first boot", True, PASS, "B0"), self.BENCH1, ("bench dev-1#2", False, FAIL, "B2")]
         with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-bench"}):
             self.assertIsNone(self.run_with([missed], rows)[1])
             # No attempt ID on the run: a record without one must not match.
