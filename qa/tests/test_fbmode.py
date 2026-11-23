@@ -4,11 +4,12 @@ from unittest import mock
 
 import _path  # noqa: F401
 from benchhome import bench_home
+from fakes import Boots
 from riverqa import fbmode, flashing, journal as jmod
 from riverqa.results import FAIL
 
 
-class Phone:
+class Phone(Boots):
     """Where the phone is ("android", "fastboot" or "gone") and whether
     fb_mode is set. Every call is logged."""
     serial = "ZY225DPT7F"
@@ -20,6 +21,8 @@ class Phone:
         # The slot fastboot reports active; the slot Android runs (R7-1: a
         # bootloader may fall back to the other one); the build on it.
         self.active, self.running, self.falls_back_to, self.build_id = active, active, falls_back_to, build_id
+        if where == "android":
+            self._new_boot()
 
     def getvar(self, name):
         assert name == "current-slot" and self.where == "fastboot", (name, self.where)
@@ -34,6 +37,14 @@ class Phone:
         assert name == "ro.boot.slot_suffix" and self.where == "android", (name, self.where)
         return f"_{self.running}"
 
+    def root(self, seconds=60):
+        pass
+
+    def sh(self, cmd, timeout=30):
+        assert "build_id" in cmd and self.where == "android", (cmd, self.where)
+        key = "ro.vendor.river.build_id" if "vendor" in cmd else "ro.river.build_id"
+        return f"{key}={self.build_id}\n"
+
     def in_fastboot(self):
         return self.where == "fastboot"
 
@@ -43,6 +54,8 @@ class Phone:
     def reboot_adb(self, target=None):
         self.calls.append(("reboot_adb", target))
         self.where = "fastboot" if target == "bootloader" or self.fb else "android"
+        if self.where == "android":
+            self._new_boot()
 
     def wait_fastboot(self, seconds):
         if self.where != "fastboot":
@@ -64,6 +77,7 @@ class Phone:
         self.where = "fastboot" if target == "bootloader" or self.fb else "android"
         if self.where == "android":
             self.running = self.falls_back_to or self.active
+            self._new_boot()
 
     def wait_for_device(self, seconds):
         if self.where != "android":
@@ -77,22 +91,24 @@ class Obligation(unittest.TestCase):
     def test_arm_journals_before_the_set(self):
         with bench_home():
             p = Phone("fastboot")
-            fbmode.arm(p)
+            fbmode.arm(p, "a", ("B1", "B1"))
             self.assertIsNotNone(p.journal_at_set, "fb_mode_set ran before the obligation was durable")
             self.assertEqual(p.journal_at_set["where"], jmod.HOST)
             self.assertIsNotNone(fbmode.pending())
-            fbmode.disarm(p)
-            self.assertIsNone(fbmode.pending())
-            self.assertFalse(p.fb)
+            x = fbmode.pending()["extra"]
+            self.assertEqual((x["slot"], x["build_ids"], x["cleared_at"]), ("a", ["B1", "B1"], None))
+            with self.assertRaisesRegex(RuntimeError, "already pending"):
+                fbmode.arm(p, "a", ("B1", "B1"))
+            self.assertEqual(p.calls, [("fb_mode_set",)])
 
     def test_killed_while_armed_then_recovered_from_android(self):
         """Armed, booted Android with fastboot continue, then the host died:
         recovery takes the phone to fastboot, clears fb_mode and boots."""
         with bench_home():
             p = Phone("fastboot")
-            fbmode.arm(p)
+            fbmode.arm(p, "a", ("B1", "B1"))
             p.where = "android"          # fastboot continue, then the harness was killed
-            what = fbmode.recover(p, 10)
+            what = fbmode.recover(p, 10).what
             self.assertIn("booted Android", what)
             self.assertEqual(p.calls[1:], [("reboot_adb", "bootloader"), ("fb_mode_clear",),
                                            ("reboot_fastboot", None), ("boot_completed",), ("guard",)])
@@ -102,7 +118,7 @@ class Obligation(unittest.TestCase):
     def test_killed_after_the_stop_recovers_from_fastboot(self):
         with bench_home():
             p = Phone("fastboot")
-            fbmode.arm(p)                # then sysrq, and the bootloader stopped: the phone sits in fastboot
+            fbmode.arm(p, "a", ("B1", "B1"))                # then sysrq, and the bootloader stopped: the phone sits in fastboot
             fbmode.recover(p, 10)
             self.assertEqual(p.calls[1:], [("fb_mode_clear",), ("reboot_fastboot", None), ("boot_completed",),
                                            ("guard",)])
@@ -112,7 +128,7 @@ class Obligation(unittest.TestCase):
     def test_phone_in_fastboot_with_nothing_pending(self):
         with bench_home():
             p = Phone("fastboot")
-            self.assertIn("cleared fb_mode", fbmode.recover(p, 10))
+            self.assertIn("cleared fb_mode", fbmode.recover(p, 10).what)
             self.assertEqual(p.calls, [("fb_mode_clear",)])            # cleared, left in fastboot
             p = Phone("fastboot")
             fbmode.recover(p, 10, boot=True)                            # calibration boots it
@@ -121,13 +137,13 @@ class Obligation(unittest.TestCase):
     def test_nothing_to_do(self):
         with bench_home():
             p = Phone("android")
-            self.assertIsNone(fbmode.recover(p, 10))
+            self.assertEqual(fbmode.recover(p, 10), fbmode.Recovery(None, None))
             self.assertEqual(p.calls, [])
 
     def test_failed_clear_keeps_the_obligation(self):
         with bench_home():
             p = Phone("fastboot")
-            fbmode.arm(p)
+            fbmode.arm(p, "a", ("B1", "B1"))
             p.clear_fails = True
             with self.assertRaises(RuntimeError):
                 fbmode.recover(p, 10)
@@ -136,7 +152,7 @@ class Obligation(unittest.TestCase):
     def test_unreachable_phone_keeps_the_obligation(self):
         with bench_home():
             p = Phone("fastboot")
-            fbmode.arm(p)
+            fbmode.arm(p, "a", ("B1", "B1"))
             p.where = "gone"
             with self.assertRaises(RuntimeError):
                 fbmode.recover(p, 10)
@@ -144,43 +160,43 @@ class Obligation(unittest.TestCase):
 
 
 class VerifyBeforeSettle(unittest.TestCase):
-    """R7-1: fbmode.recover resolves the obligation only after the booted
-    phone passed the guard, the slot check and the caller's build check."""
+    """R7-1, R8-1: fbmode.recover resolves the obligation only after the
+    booted phone passed verify_boot: the guard, the slot and both build
+    IDs, against ``want`` or the identity the obligation was armed with."""
 
     def test_bootloader_fallback_keeps_the_obligation(self):
-        for slot in (None, "b"):
-            with self.subTest(slot=slot), bench_home():
+        for want in (None, fbmode.Want("b", ("B1", "B1"))):
+            with self.subTest(want=want), bench_home():
                 p = Phone("fastboot", active="b", falls_back_to="a")
-                fbmode.arm(p)
+                fbmode.arm(p, "b", ("B1", "B1"))
                 with self.assertRaisesRegex(RuntimeError, "runs slot a"):
-                    fbmode.recover(p, 10, boot=True, slot=slot)
+                    fbmode.recover(p, 10, boot=True, want=want)
                 self.assertEqual((p.where, p.running), ("android", "a"))
                 self.assertIsNotNone(fbmode.pending())
 
     def test_failed_build_check_keeps_the_obligation(self):
         with bench_home():
             p = Phone("fastboot", active="b")
-            fbmode.arm(p)
-            seen = []
-
-            def verify():
-                seen.append(fbmode.pending())
-                raise RuntimeError("build IDs differ")
-            with self.assertRaisesRegex(RuntimeError, "build IDs differ"):
-                fbmode.recover(p, 10, boot=True, slot="b", verify=verify)
-            self.assertIsNotNone(seen[0])
+            fbmode.arm(p, "b", ("B1", "B1"))
+            p.build_id = "B2"
+            with self.assertRaisesRegex(RuntimeError, "build IDs system=B2"):
+                fbmode.recover(p, 10, boot=True)
             self.assertIsNotNone(fbmode.pending())
-            self.assertIn("booted Android on slot b", fbmode.recover(p, 10, boot=True, slot="b",
-                                                                      verify=lambda: None) or "")
+            p.build_id = "B1"
+            r = fbmode.recover(p, 10, boot=True)
+            self.assertIn("verified: slot b, build IDs B1/B1", r.what)
+            self.assertEqual(r.proof.slot, "b")
+            self.assertIsNone(fbmode.pending())
 
     def test_wrong_active_slot_raises_before_anything(self):
-        with bench_home():
-            p = Phone("fastboot", active="a")
-            fbmode.arm(p)
-            with self.assertRaises(fbmode.WrongSlot):
-                fbmode.recover(p, 10, boot=True, slot="b")
-            self.assertEqual(p.calls[1:], [])
-            self.assertIsNotNone(fbmode.pending())
+        for want in (None, fbmode.Want("b", ("B1", "B1"))):
+            with self.subTest(want=want), bench_home():
+                p = Phone("fastboot", active="a")
+                fbmode.arm(p, "b", ("B1", "B1"))
+                with self.assertRaises(fbmode.WrongSlot):
+                    fbmode.recover(p, 10, boot=True, want=want)
+                self.assertEqual(p.calls[1:], [])
+                self.assertIsNotNone(fbmode.pending())
 
 
 class Callers(unittest.TestCase):
@@ -189,7 +205,7 @@ class Callers(unittest.TestCase):
         and sets the slot it wants first."""
         with bench_home():
             p = Phone("fastboot", fb=True)
-            fbmode.arm(p)
+            fbmode.arm(p, "a", ("B1", "B1"))
             flashing.to_fastboot(p, 5)
             self.assertEqual(p.calls, [("fb_mode_set",)])
             self.assertIsNotNone(fbmode.pending())
@@ -199,28 +215,31 @@ class Callers(unittest.TestCase):
         entry, so the next recovery boots the phone."""
         with bench_home():
             p = Phone("fastboot")
-            fbmode.arm(p)
+            fbmode.arm(p, "a", ("B1", "B1"))
             p.reboot_fastboot = mock.Mock(side_effect=KeyboardInterrupt)    # killed here
             with self.assertRaises(KeyboardInterrupt):
                 fbmode.recover(p, 10)
             self.assertFalse(p.fb)
             self.assertIsNotNone(fbmode.pending(), "resolved before the phone left fastboot")
             del p.reboot_fastboot
-            self.assertIn("booted Android", fbmode.recover(p, 10))
+            self.assertIn("booted Android", fbmode.recover(p, 10).what)
             self.assertEqual(p.where, "android")
             self.assertIsNone(fbmode.pending())
 
     def test_boot_false_never_boots(self):
         """R5-16: a dev flash recovers with boot=False and stays in fastboot,
-        even when it had to take the phone out of Android."""
+        even when it had to take the phone out of Android. R8-1: nothing was
+        booted or verified, so the obligation stays pending (stamped
+        cleared); the dev flash settles it after its own verified boot."""
         with bench_home():
             p = Phone("fastboot")
-            fbmode.arm(p)
+            fbmode.arm(p, "a", ("B1", "B1"))
             p.where = "android"
-            self.assertIn("stays in fastboot", fbmode.recover(p, 10, boot=False))
+            self.assertIn("stays in fastboot", fbmode.recover(p, 10, boot=False).what)
             self.assertEqual(p.calls[1:], [("reboot_adb", "bootloader"), ("fb_mode_clear",)])
             self.assertEqual(p.where, "fastboot")
-            self.assertIsNone(fbmode.pending())
+            self.assertIsNotNone(fbmode.pending())
+            self.assertIsNotNone(fbmode.pending()["extra"]["cleared_at"])
 
     def test_calibration_starts_from_fastboot(self):
         from riverqa import calibrate
@@ -242,7 +261,7 @@ class Callers(unittest.TestCase):
         from riverqa.results import PASS, Result
         with bench_home():
             p = Phone("fastboot")
-            fbmode.arm(p)
+            fbmode.arm(p, "a", ("B1", "B1"))
 
             class R:
                 dev, results = p, {}
@@ -266,7 +285,7 @@ class Callers(unittest.TestCase):
         for batch, want in (("b1", 1), (None, "guarded")):
             with bench_home():
                 p = Phone("android")
-                fbmode.arm(p)
+                fbmode.arm(p, "a", ("B1", "B1"))
                 # fbmode.recover's own guard passes (R7-1); bench's raises.
                 p.guard = mock.Mock(side_effect=[None, RuntimeError("guarded")])
                 a = mock.Mock(batch=batch, flash=False)
@@ -285,7 +304,7 @@ class Callers(unittest.TestCase):
         from riverqa import qa
         with bench_home():
             p = Phone("fastboot")
-            fbmode.arm(p)
+            fbmode.arm(p, "a", ("B1", "B1"))
             out = io.StringIO()
             with mock.patch.object(qa, "Device", lambda *a: p), redirect_stderr(out), redirect_stdout(out):
                 self.assertEqual(qa.main(["recover"]), 0)
@@ -297,7 +316,7 @@ class Callers(unittest.TestCase):
         from riverqa import restore
         with bench_home():
             p = Phone("fastboot")
-            fbmode.arm(p)
+            fbmode.arm(p, "a", ("B1", "B1"))
             p.where = "android"
 
             class R:
@@ -316,7 +335,7 @@ class FailedRecoveryExitsCleanly(unittest.TestCase):
 
     def gone(self):
         p = Phone("fastboot")
-        fbmode.arm(p)
+        fbmode.arm(p, "a", ("B1", "B1"))
         p.where = "gone"
         return p
 
@@ -342,10 +361,11 @@ class FailedRecoveryExitsCleanly(unittest.TestCase):
                     p.where = "fastboot"
                     p.wait_for_device = mock.Mock(side_effect=TimeoutError("no adb"))
                 with mock.patch.object(calibrate, "Device", lambda *a: p), redirect_stderr(io.StringIO()) as err:
-                    self.assertEqual(calibrate.boot_timing_main([]), 1)
+                    # R8-1: a failure with the obligation pending halts (3).
+                    self.assertEqual(calibrate.boot_timing_main([]), 3)
                     with mock.patch.object(reboots, "load_timing", return_value={"paths": {"sysrq": {}}}), \
                             mock.patch.object(calibrate, "record_problems", return_value=[]):
-                        self.assertEqual(calibrate.prove_main(), 1)
+                        self.assertEqual(calibrate.prove_main(), 3)
                 self.assertEqual(err.getvalue().count("error: fb_mode recovery failed"), 2, err.getvalue())
                 self.assertIsNotNone(fbmode.pending())
 

@@ -10,7 +10,7 @@ import time
 import traceback
 from pathlib import Path
 
-from . import bootsig, evidence, flashing, journal as jmod, reboots, regression, stage
+from . import bootsig, evidence, fbmode, flashing, journal as jmod, reboots, regression, stage
 from .bench import attempt_rows
 from .core import (BENCH_HOME, CODENAME, QA_DIR, SCRIPTS_DIR, SERIAL, batch_dir, bench_path, log, new_id,
                    now_iso, read_json, sha256_file, write_json, append_jsonl)
@@ -436,7 +436,7 @@ def fb_mode_preflight(run: Run) -> bool:
     if fbmode.pending(run.journal) is None:
         return True
     try:
-        what = fbmode.recover(run.dev, 900, j=run.journal)
+        what = fbmode.recover(run.dev, 900, j=run.journal).what
     except Exception as e:  # noqa: BLE001 - any failure stops the run
         run.add(Result("preflight.journal", FAIL, f"fb_mode recovery failed: {e}"))
         return False
@@ -514,7 +514,7 @@ def build_id_verdict(batch: dict, system: str | None, vendor: str | None) -> tup
 
 
 def check_build_id(run: Run) -> Result:
-    s, v = flashing.partition_build_ids(run.dev)
+    s, v = fbmode.partition_build_ids(run.dev)
     st, msg, d = build_id_verdict(run.batch, s, v)
     return Result("identity.build_id", st, msg, d)
 
@@ -523,7 +523,7 @@ def check_boot_hash(run: Run) -> Result:
     img = run.batch["images"]["boot"]
     slot = (run.flash_attempt or {}).get("target") or run.dev.getprop("ro.boot.slot_suffix").lstrip("_")
     try:
-        got = flashing.boot_partition_sha(run.dev, slot, int(img["size"]))
+        got = fbmode.boot_partition_sha(run.dev, slot, int(img["size"]))
     except RuntimeError as e:
         return Result("identity.boot_hash", FAIL, str(e))
     ok = got == img["sha256"]
@@ -953,12 +953,14 @@ def quick(run: Run, wait: bool) -> int:
     from . import fbmode
     if fbmode.pending(run.journal) is not None:
         # A leftover fb_mode obligation (review round 4): the dev loop just
-        # clears it and boots Android.
+        # clears it and boots Android, verified against the identity it was
+        # armed with (R8-1). A failure halts (exit 3), obligation pending.
         try:
             fbmode.recover(dev, 900, j=run.journal)
         except Exception as e:  # noqa: BLE001
             log(f"error: fb_mode recovery failed: {e}")
-            return 1
+            log("HALT: the fb_mode obligation stays pending (phone-qa journal); notify Zak.")
+            return 3
     st = dev.state()
     if st != "device":
         log(f"error: {SERIAL} is not connected in adb device mode (state: {st or 'none'})")
@@ -976,7 +978,7 @@ def quick(run: Run, wait: bool) -> int:
         return finish(run, QUICK_REQUIRED)
     dev.root()
     print(f"Phone {SERIAL}: {dev.getprop('ro.lineage.display.version')}, slot {dev.getprop('ro.boot.slot_suffix')}, "
-          f"build ID {flashing.partition_build_ids(dev)[0] or 'unstamped'}")
+          f"build ID {fbmode.partition_build_ids(dev)[0] or 'unstamped'}")
     for cid, fn in (("health.boot", check_boot), ("health.selinux", check_selinux),
                     ("health.crashes", quick_crashes), ("health.tombstones", quick_tombstones),
                     ("health.services", check_services), ("health.telephony", check_telephony)):
@@ -1004,7 +1006,7 @@ def baseline_close(run: Run) -> None:
     if flashing.running_slot(run.dev) != target:
         log(f"Baseline not closed: the phone is not running slot {target}.")
         return
-    sha = flashing.boot_partition_sha(run.dev, target)
+    sha = fbmode.boot_partition_sha(run.dev, target)
     bid = run.batch.get("build_id")
     stamped = bool(bid) and bid != stage.UNSTAMPED
     identity = None if stamped else {"dates": dict(run.batch["dates"]), "slot": target, "boot_sha256": sha}
@@ -1131,7 +1133,9 @@ Usage:
                                        harness version.
   phone-qa recover                     Clear a leftover fastboot oem fb_mode (a pending
                                        obligation, or the phone sitting in fastboot) and
-                                       boot Android.
+                                       boot Android. The obligation is settled only once
+                                       the booted phone matches the slot and build IDs it
+                                       was armed on; otherwise exit 3 (HALT), still pending.
   phone-qa journal                     Show leftovers in the state journal.
   phone-qa helper                      Build (or verify) the river-qa helper APK.
   phone-qa version                     Print the harness version.
@@ -1243,18 +1247,26 @@ def main(argv: list[str]) -> int:
 def cmd_recover(argv: list[str]) -> int:
     """phone-qa recover: under the device lock, clear a leftover fb_mode
     (a pending obligation, or the phone found in fastboot) and boot Android
-    (review round 4). The rest of the journal is restored by the next
-    phone-qa run's preflight."""
+    (review round 4). The obligation is settled only once the booted phone
+    is verified against the slot and build IDs it was armed with (R8-1);
+    otherwise it halts (exit 3) with the obligation pending. The rest of
+    the journal is restored by the next phone-qa run's preflight."""
     from . import fbmode
     if argv:
         print("usage: phone-qa recover")
         return 1
     try:
         with DeviceLock():
-            what = fbmode.recover(Device(SERIAL), 900, boot=True)
-    except (LockError, GuardError, RuntimeError, TimeoutError) as e:
+            what = fbmode.recover(Device(SERIAL), 900, boot=True).what
+    except LockError as e:
         log(f"error: {e}")
         return 1
+    except (RuntimeError, TimeoutError) as e:
+        log(f"error: {e}")
+        if fbmode.pending() is None:
+            return 1
+        log("HALT: the fb_mode obligation stays pending (phone-qa journal); notify Zak.")
+        return 3
     if what is None:     # fbmode.recover logs what it did
         log("Nothing to recover: no fb_mode obligation and the phone is not in fastboot.")
     return 0

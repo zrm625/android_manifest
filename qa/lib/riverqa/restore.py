@@ -301,10 +301,11 @@ def _gvfs(run, e):
 
 def _fb_mode(run, e):
     """A leftover fb_mode obligation (review round 4): clear it and boot
-    Android (fbmode.recover), then confirm the entry is gone. The entry is
-    resolved by fbmode itself, so this handler re-reads the journal."""
+    Android (fbmode.recover), then confirm the entry is gone. Only
+    fbmode.settle resolves it, with a verified boot (R8-1), so this
+    handler re-reads the journal and restore_entry never resolves it."""
     from . import fbmode
-    what = fbmode.recover(run.dev, 600, boot=True, j=run.journal)
+    what = fbmode.recover(run.dev, 600, boot=True, j=run.journal).what
     left = fbmode.pending(jmod.Journal(run.journal.path, run.journal.qa_home))
     return left is None, f"fb_mode: {what or 'nothing to clear'}"
 
@@ -326,7 +327,7 @@ def restore_entry(run, e) -> tuple[bool, str]:
         ok, msg = h(run, e)
     except Exception as ex:  # noqa: BLE001
         return False, f"{e['kind']} {e['key']}: {ex}"
-    if ok:
+    if ok and e["kind"] != jmod.FB_MODE:      # fbmode.settle resolved it (R8-1)
         run.journal.resolve(e)
     return ok, msg
 
@@ -365,5 +366,4 @@ def recover_journal(run) -> tuple[list, list, list]:
     if left:
         failed.append(f"journal not empty after recovery ({len(left)} entries): " +
                       ", ".join(f"{e['kind']} {e['key']}" for e in left))
-    run.journal.entries = left
     return done, drop, failed

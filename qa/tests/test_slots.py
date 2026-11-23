@@ -20,13 +20,15 @@ class Transitions(unittest.TestCase):
             slots.first_run("b", "", "t")
 
     def test_preflight_rules(self):
-        self.assertEqual(slots.preflight(None, "base", "baseline", "b"), [])
-        self.assertTrue(slots.preflight(None, "x", "batch", "b"))
+        self.assertEqual(slots.preflight(None, "base", "baseline"), [])
+        self.assertTrue(slots.preflight(None, "x", "batch"))
         st = base()
-        self.assertTrue(any("running slot" in e for e in slots.preflight(st, "base", "baseline", "a")))
+        # R8-3: preflight is host-only; the running slot is checked on the
+        # phone by verify_boot, after it.
+        self.assertEqual(slots.preflight(st, "base", "baseline"), [])
         # Batches need a closed baseline.
-        self.assertTrue(any("baseline" in e for e in slots.preflight(st, "x", "batch", "b")))
-        self.assertTrue(slots.preflight(st, "x", "nonsense", "b"))
+        self.assertTrue(any("baseline" in e for e in slots.preflight(st, "x", "batch")))
+        self.assertTrue(slots.preflight(st, "x", "nonsense"))
 
     def test_target_is_never_known_good(self):
         st = base("a")
@@ -39,8 +41,8 @@ class Transitions(unittest.TestCase):
     def test_unresolved_pair_blocks_other_batch_and_own_retry(self):
         st = base()
         slots.reserve(st, "base", "baseline", "h" * 64, "t1")
-        self.assertTrue(any("unresolved pair" in e for e in slots.preflight(st, "other", "batch", "b")))
-        self.assertTrue(any("own pair" in e for e in slots.preflight(st, "base", "baseline", "b")))
+        self.assertTrue(any("unresolved pair" in e for e in slots.preflight(st, "other", "batch")))
+        self.assertTrue(any("own pair" in e for e in slots.preflight(st, "base", "baseline")))
 
     def test_rollback_releases_and_retry_reuses_target(self):
         st = base()
@@ -50,7 +52,7 @@ class Transitions(unittest.TestCase):
             slots.rolled_back(st, "a", "wrong slot", "t3")
         slots.rolled_back(st, "b", "verified", "t3")
         self.assertIsNone(st["pair"])
-        self.assertEqual(slots.preflight(st, "base", "baseline", "b"), [])
+        self.assertEqual(slots.preflight(st, "base", "baseline"), [])
         p2 = slots.reserve(st, "base", "baseline", "h" * 64, "t4")
         self.assertEqual(p2["target"], p["target"])
 
@@ -60,11 +62,11 @@ class Transitions(unittest.TestCase):
         slots.close_baseline(st, "base", "id-1", "c" * 64, "t2", seed={"ram_reference": {}})
         self.assertEqual(st["known_good_slot"], "a")
         # The seed rides in the same write; until it is written out, no batch.
-        self.assertTrue(any("checkpoint" in e for e in slots.preflight(st, "b1", "batch", "a")))
+        self.assertTrue(any("checkpoint" in e for e in slots.preflight(st, "b1", "batch")))
         slots.seed_written(st, "t2")
         self.assertFalse(st["known_good"]["provisional"])
         self.assertIsNotNone(st["baseline_closed"])
-        self.assertEqual(slots.preflight(st, "b1", "batch", "a"), [])
+        self.assertEqual(slots.preflight(st, "b1", "batch"), [])
         p = slots.reserve(st, "b1", "batch", "c" * 64, "t3")
         self.assertEqual(p["target"], "b")
 

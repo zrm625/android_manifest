@@ -189,11 +189,11 @@ class Checkpoint(unittest.TestCase):
             slots.reserve(st, "base", "baseline", "f" * 64, "t1")
             slots.close_baseline(st, "base", "id-1", BOOT, "t2", seed={"calibration_seed": {"median_mb": 900.0}})
             flashing.save_state(st)   # the host died here, before known-good.json
-            self.assertTrue(slots.preflight(flashing.load_state(), "b1", "batch", "b"))
+            self.assertTrue(slots.preflight(flashing.load_state(), "b1", "batch"))
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(flashing.recover(dev=phone()), flashing.EXIT_OK)
             self.assertEqual(core.read_json(flashing.known_good_path())["calibration_seed"]["median_mb"], 900.0)
-            self.assertEqual(slots.preflight(flashing.load_state(), "b1", "batch", "b"), [])
+            self.assertEqual(slots.preflight(flashing.load_state(), "b1", "batch"), [])
 
 
 class Identity(unittest.TestCase):

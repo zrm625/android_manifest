@@ -672,7 +672,7 @@ class CalibrationProvenance(unittest.TestCase):
                 return CalibrationProvenance.BUILD if name == "ro.build.date.utc" else "22-test"
         reboots.save_timing(old)
         with mock.patch.object(calibrate, "Device", lambda *a: Dev()), \
-                mock.patch.object(calibrate, "recover_fb_mode", return_value=True), \
+                mock.patch.object(calibrate, "recover_fb_mode", return_value=None), \
                 mock.patch.object(calibrate, "UsbWatcher"), \
                 mock.patch.object(calibrate, "boot_count_now", return_value=1), \
                 mock.patch.object(calibrate, "one", side_effect=one), \
@@ -929,6 +929,23 @@ class Enumeration(unittest.TestCase):
         def getprop(self, name):
             return "_a"
 
+        # verify_boot and settle (R8-1): the boot status, both build IDs.
+        def root(self, seconds=60):
+            pass
+
+        def sh(self, cmd, timeout=30):
+            assert "build_id" in cmd, cmd
+            return ("ro.vendor.river.build_id" if "vendor" in cmd else "ro.river.build_id") + "=B1\n"
+
+        def boot_status(self):
+            import time
+            from riverqa.device import BootStatus
+            t = time.monotonic()
+            return BootStatus("bid", True, 0.0, t, t, time.time())
+
+        def boot_id(self):
+            return "bid"
+
     def reboot(self, path, stray=False, dev=None, **kw):
         w = self.W()
         dev = dev or self.Dev(w, stray)
@@ -960,11 +977,14 @@ class Enumeration(unittest.TestCase):
 
     def test_sysrq_extra_pass_is_a_bootloader_stop(self):
         rec, dev = self.reboot("sysrq", inject_extra_pass=True)
-        self.assertEqual(dev.calls, [("fb_mode", True), ("continue",), ("sysrq",), ("fb_mode", False),
-                                     ("reboot_fastboot", None)])
+        # R8-1: the control starts from Android, where the identity the
+        # obligation records is read, then goes to the bootloader to arm.
+        self.assertEqual(dev.calls, [("reboot_adb", "bootloader"), ("fb_mode", True), ("continue",), ("sysrq",),
+                                     ("fb_mode", False), ("reboot_fastboot", None)])
         self.assertEqual(rec.planned_fastboot, 1)
-        # The clock starts at the sysrq disconnect (event 3), not the final reboot's.
-        self.assertAlmostEqual(rec.elapsed, 100.0 - 2.95)
+        # The clock starts at the sysrq disconnect (event 5, after the two
+        # of the arm's adb reboot bootloader), not the final reboot's.
+        self.assertAlmostEqual(rec.elapsed, 100.0 - 4.95)
 
     def test_unmarked_extra_pass_counts(self):
         for path in reboots.GATED_PATHS:

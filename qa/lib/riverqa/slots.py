@@ -69,8 +69,11 @@ def first_run(running_slot: str, boot_sha256: str, at: str) -> dict:
     return st
 
 
-def preflight(state: dict | None, batch_id: str, kind: str, running_slot: str) -> list[str]:
-    """Problems that forbid a flash for this batch. Empty list: go."""
+def preflight(state: dict | None, batch_id: str, kind: str) -> list[str]:
+    """Problems that forbid a flash for this batch, all decided from disk
+    (R8-3): flash_batch runs this before it touches the phone. Empty list:
+    go. That the phone runs known_good_slot with its build is checked on
+    the phone afterwards (fbmode.verify_boot)."""
     if kind not in KINDS:
         return [f"unknown pair kind {kind!r}"]
     if state is None:
@@ -88,9 +91,6 @@ def preflight(state: dict | None, batch_id: str, kind: str, running_slot: str) -
                         "rollback (flash --rollback)")
     if checkpoint_pending(state):
         errs.append("an interrupted baseline checkpoint has not written known-good.json yet: run flash --recover")
-    kg = state.get("known_good_slot")
-    if running_slot != kg:
-        errs.append(f"running slot {running_slot} is not known_good_slot {kg}")
     if kind in ("batch", "calibration", "experiment") and not state.get("baseline_closed"):
         errs.append("no closed baseline in slot-state.json; run the baseline first")
     return errs

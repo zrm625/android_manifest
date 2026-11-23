@@ -221,6 +221,16 @@ class _PromotePhone:
             return "c" * 64 + "  boot\n"
         return "0\n" if cmd == "id -u" else ""
 
+    def boot_status(self):
+        """A completed boot (fbmode.verify_boot reads it, R8-1)."""
+        import time
+        from .device import BootStatus
+        t = time.monotonic()
+        return BootStatus("control-boot", True, 0.0, t, t, time.time())
+
+    def boot_id(self):
+        return "control-boot"
+
 
 def host_control(name: str) -> tuple[bool, str]:
     """tag-pushed-host-killed: a batch whose PRs (heads at the tested

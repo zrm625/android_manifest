@@ -23,6 +23,7 @@ from pathlib import Path
 from .core import append_jsonl, now_iso, read_json, read_jsonl, write_json
 
 PHONE, HOST, RESOURCE = "phone", "host", "resource"
+FB_MODE = "fb_mode"      # the kind of fbmode's obligation entry
 
 
 def wipe_log_path(qa_home: Path) -> Path:
@@ -43,14 +44,23 @@ def record_wipe(qa_home: Path, attempt_id: str, how: str) -> int:
 
 
 class Journal:
+    """The journal file. Every read and every change goes to the file, never
+    to a copy held in memory (R8-1): two Journal objects for the same file
+    (phone-qa's run journal and fbmode's) can't overwrite each other's
+    entries with a stale list. The device lock keeps out other processes."""
+
     def __init__(self, path: Path, qa_home: Path | None = None):
         self.path = path
         self.qa_home = qa_home or path.parent
-        data = read_json(path, None) or {"version": 1, "entries": []}
-        self.entries: list[dict] = data["entries"]
 
-    def save(self) -> None:
-        write_json(self.path, {"version": 1, "entries": self.entries})
+    @property
+    def entries(self) -> list[dict]:
+        """The entries now in the file (a fresh list on every read)."""
+        data = read_json(self.path, None) or {"version": 1, "entries": []}
+        return data["entries"]
+
+    def _save(self, entries: list[dict]) -> None:
+        write_json(self.path, {"version": 1, "entries": entries})
 
     def find(self, where: str, kind: str, key: str) -> dict | None:
         for e in self.entries:
@@ -64,20 +74,45 @@ class Journal:
         wins: a second change of the same thing keeps the first value."""
         if where not in (PHONE, HOST, RESOURCE):
             raise ValueError(where)
-        old = self.find(where, kind, key)
-        if old is not None:
-            return old
+        entries = self.entries
+        for old in entries:
+            if old["where"] == where and old["kind"] == kind and old["key"] == key:
+                return old
         e = {"id": secrets.token_hex(4), "where": where, "kind": kind, "key": key,
              "original": original, "attempt_id": attempt_id, "run_id": run_id,
              "wipe_seq": current_wipe_seq(self.qa_home) if where == PHONE else None,
              "created_at": now_iso(), "extra": extra or {}}
-        self.entries.append(e)
-        self.save()  # durable before the change is made
+        self._save(entries + [e])  # durable before the change is made
         return e
 
+    def annotate(self, entry: dict, **extra) -> dict:
+        """Add fields to an entry's ``extra``, durably. Returns the entry as
+        saved. Raises KeyError if the entry is gone."""
+        entries = self.entries
+        for e in entries:
+            if e["id"] == entry["id"]:
+                e["extra"] = {**(e.get("extra") or {}), **extra}
+                self._save(entries)
+                return e
+        raise KeyError(f"journal entry {entry['id']} is not in {self.path}")
+
     def resolve(self, entry: dict) -> None:
-        self.entries = [e for e in self.entries if e["id"] != entry["id"]]
-        self.save()
+        """Drop a restored or cleaned-up entry. An fb_mode obligation is
+        refused: only fbmode.settle resolves one, with a verified boot
+        (R8-1)."""
+        if entry.get("kind") == FB_MODE:
+            raise ValueError("an fb_mode obligation is resolved only by fbmode.settle, with a VerifiedBoot")
+        self._drop(entry)
+
+    def _settle_fb_mode(self, entry: dict) -> None:
+        """For fbmode.settle only (a unit test checks that nothing else
+        calls it)."""
+        if entry.get("kind") != FB_MODE:
+            raise ValueError(entry.get("kind"))
+        self._drop(entry)
+
+    def _drop(self, entry: dict) -> None:
+        self._save([e for e in self.entries if e["id"] != entry["id"]])
 
 
 def plan_recovery(entries: list[dict], wipe_seq_now: int) -> tuple[list[dict], list[dict]]:

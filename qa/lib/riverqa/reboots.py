@@ -203,9 +203,10 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             if inject_extra_pass:
                 dev.wait_fastboot(120)                       # fb_mode: the bootloader stops
                 planned += 1
-                # Clear now; resolve the obligation only once Android booted
-                # (R5-1), so a host killed in between leaves it for recovery.
-                owed = fbmode.clear_in_fastboot(dev)
+                # Clear now (stamped in the journal); the obligation is
+                # settled only with a verified boot (R8-1), so a host killed
+                # in between leaves it for recovery.
+                owed = fbmode.clear(dev)
                 armed = False
                 mark2 = w.mark()
                 dev.reboot_fastboot()
@@ -241,8 +242,6 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
         if inject_early_reboot:
             rec.control = inject_reboot_before_completion(dev, boot_timeout, w)
         first, st, reads = completed_status(dev, boot_timeout)
-        if owed:
-            fbmode.settle()
         rec.completed_wall = st.host_wall
         rec.boot_id, rec.uptime = st.boot_id, st.uptime
         # Review round 4: the clock starts at the earliest possible
@@ -264,6 +263,11 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
         rec.usb_events = [asdict(e) for e in w.since(start_mark)]
         rec.unplanned_fastboot = len(fastboot_ids_seen(_after(w, start_mark, window_from)))
         rec.planned_fastboot = planned
+        if owed:
+            # R8-1: settle with a proof that the phone booted the slot and
+            # build it was armed on. Last, after every timing value and USB
+            # event above was taken: verify_boot uses adb root.
+            fbmode.settle(fbmode.verify_boot(dev, fbmode.armed_want(fbmode.pending())))
         return rec
     finally:
         if armed:
@@ -299,11 +303,18 @@ def arm_bootloader_stop(dev: Device, boot_timeout: float) -> None:
     """The sysrq extra-pass control, before its leaving marker: set fb_mode
     in fastboot, so the bootloader stops after the sysrq reset, then boot
     Android with ``fastboot continue`` (no reset) and wait for it. That stop
-    is the injected bootloader pass."""
-    if dev.state() == "device":
-        dev.reboot_adb("bootloader")
+    is the injected bootloader pass. It starts from Android: the obligation
+    records the slot and both build IDs read there (R8-1), and recovery
+    verifies the phone against them."""
+    dev.guard()
+    slot = dev.getprop("ro.boot.slot_suffix").lstrip("_")
+    ids = fbmode.partition_build_ids(dev)
+    if slot not in fbmode.SLOTS or not all(ids):
+        raise RuntimeError(f"cannot arm fb_mode: running slot {slot!r}, build IDs {ids[0]}/{ids[1]} (an "
+                           "unstamped build can't be verified after the stop)")
+    dev.reboot_adb("bootloader")
     dev.wait_fastboot(120)
-    fbmode.arm(dev)          # journaled before the set (review round 4)
+    fbmode.arm(dev, slot, ids)   # journaled before the set (review round 4)
     dev.fastboot_continue()
     dev.wait_for_device(boot_timeout)
     dev.wait_boot_completed(boot_timeout)

@@ -206,7 +206,7 @@ def run(a) -> int:
     # (R6-4).
     if fbmode.pending() is not None and not a.flash:
         try:
-            what = fbmode.recover(dev, flashing.BOOT_TIMEOUT)
+            what = fbmode.recover(dev, flashing.BOOT_TIMEOUT).what
         except (RuntimeError, TimeoutError) as e:   # R5-11: a clean HALT; the obligation stays pending
             log(f"HALT: fb_mode recovery failed: {e}")
             return flashing.EXIT_HALT
@@ -284,7 +284,7 @@ def run(a) -> int:
         props = dev.sh("getprop ro.build.date.utc; getprop ro.vendor.build.date.utc; "
                        "getprop ro.bootimage.build.date.utc; getprop ro.boot.slot_suffix; "
                        "getprop ro.lineage.display.version; getprop ro.build.fingerprint").split("\n") + [""] * 6
-        sys_id, _ven_id = flashing.partition_build_ids(dev)
+        sys_id, _ven_id = fbmode.partition_build_ids(dev)
         row = {
             "run_id": run_id, "env": a.env, "boot": i,
             "host_boot_seconds": f"{rec.host_boot_seconds:.2f}",

@@ -9,13 +9,14 @@ from unittest import mock
 
 import _path  # noqa: F401
 from benchhome import bench_home
+from fakes import Boots
 from riverqa import core, flashing, reboots, slots
 from riverqa.device import GuardError
 
 BOOT = "f" * 64
 
 
-class FakePhone:
+class FakePhone(Boots):
     serial = "ZY225DPT7F"
 
     def __init__(self, home, slot="a"):
@@ -134,11 +135,17 @@ class FlashBatch(unittest.TestCase):
         self.assertIn("HALT: notify Zak.", err.getvalue())
 
     def test_running_slot_must_be_known_good(self):
+        """R8-2: a phone in Android on a confirmed other slot halts (3) with
+        the rollback advice; nothing is reserved."""
         with bench_home() as h:
             stage_batch(h)
-            rc = self.flash(h, FakePhone(h, slot="b"), lambda *a, **k: self.fail("no rollback expected"))
+            with mock.patch.object(flashing, "Device", lambda *a: FakePhone(h, slot="b")), \
+                    redirect_stderr(io.StringIO()) as err:
+                rc = flashing.flash_batch("b1", None, True)
             self.assertIsNone(flashing.load_state()["pair"])
-        self.assertEqual(rc, flashing.EXIT_ERROR)
+        self.assertEqual(rc, flashing.EXIT_HALT, err.getvalue())
+        self.assertIn("the phone runs slot b, not slot a", err.getvalue())
+        self.assertIn("flash --rollback returns the phone to known_good_slot a", err.getvalue())
 
 
 if __name__ == "__main__":

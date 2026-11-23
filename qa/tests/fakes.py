@@ -59,6 +59,13 @@ class FakeShell:
     def boot_id(self):
         return self._boot_id
 
+    def boot_status(self):
+        """A completed boot that began now (verify_boot, R8-1)."""
+        import time
+        from riverqa.device import BootStatus
+        t = time.monotonic()
+        return BootStatus(self._boot_id, True, 0.0, t, t, time.time())
+
     def state(self):
         return "device"
 
@@ -70,3 +77,28 @@ class FakeShell:
 
 
 DROPBOX_EMPTY = "Drop box contents: 0 entries\nMax entries: 1000\n"
+
+
+class Boots:
+    """boot_id and boot status for the phone fakes (R8-1: verify_boot reads
+    them and settle reads boot_id again). Call ``_new_boot()`` whenever the
+    fake reaches Android; ``state()`` says whether it is there."""
+    _boot_n = 0
+    _boot_wall = 0.0
+
+    def _new_boot(self):
+        import time
+        self._boot_n += 1
+        self._boot_wall = time.time()
+
+    def boot_id(self):
+        return f"boot-{self._boot_n}" if self.state() == "device" else ""
+
+    def boot_status(self):
+        import time
+        from riverqa.device import BootStatus
+        if self.state() != "device":
+            return None
+        t = time.monotonic()
+        now = time.time()
+        return BootStatus(self.boot_id(), True, max(0.0, now - self._boot_wall), t, t, now)

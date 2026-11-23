@@ -1,37 +1,42 @@
 """Motorola's ``fastboot oem fb_mode_set`` as a durable obligation (review
-round 4).
+round 4), settled only by a verified boot (round 8).
 
 While fb_mode is set, the bootloader stops in fastboot on every boot. Only
 the sysrq extra-pass control sets it (reboots.arm_bootloader_stop). If the
 host dies while it is set, every later boot stops in fastboot, so:
 
 - ``arm`` writes a host entry (kind ``fb_mode``) to the state journal,
-  durably, **before** it sends ``fb_mode_set``;
-- ``disarm`` sends ``fb_mode_clear`` and only then resolves the entry;
-- ``recover`` runs under the device lock before anything else touches the
-  phone (calibration, phone-qa, device-bench, flash builds): with an entry
-  pending, or with the phone found in fastboot, it clears fb_mode and, when
-  asked or when it had to take the phone out of Android, boots the active
-  slot. The entry is resolved only once that boot completed and the
-  booted phone passed the guard, the slot check and the caller's build
-  check (R7-1), or, with ``boot=False``, once the clear succeeded. A host
-  that dies between the clear and the resolve leaves the entry for the
-  next recovery (review round 5, R5-1);
-- slot recovery (``flash --rollback``, ``flash --recover``, rescue) never
-  calls ``recover``: it must not boot the active slot, which may be the
-  failed candidate. It calls ``clear_in_fastboot`` while in fastboot, sets
-  the fallback slot active, reboots, verifies the slot, and only then calls
-  ``settle`` (R5-1).
+  durably, **before** it sends ``fb_mode_set``. The entry records the
+  identity of the phone it was armed on: the slot and both build IDs
+  (R8-1). Generic recovery verifies the phone against that identity.
+- ``clear`` (and ``recover``) send ``fb_mode_clear`` in fastboot and stamp
+  the entry with the time of the clear. Nothing else is resolved there.
+- **The single rule (R8-1).** ``settle(proof)`` is the only function that
+  resolves the obligation. ``proof`` is a ``VerifiedBoot``, which only
+  ``verify_boot`` makes: on the booted phone, the adb guard, the boot_id,
+  the running slot, both build IDs, and the boot-partition hash when the
+  caller asks for it. ``settle`` refuses unless the entry was stamped
+  cleared, the verified boot began after that clear, and the phone's
+  boot_id is still the proof's. ``journal.Journal.resolve`` refuses an
+  fb_mode entry, and a unit test checks that nothing but ``settle`` calls
+  the journal's private resolver.
+- Callers pass everything they need to ``verify_boot`` (through
+  ``recover``'s ``want``), settle, and then use the values on the proof:
+  no verification read happens after the settle.
 
 Every fastboot command goes through Device, which guards first.
 """
 
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass, field
+
 from . import journal as jmod
 from .core import bench_path, log, now_iso
 
-KIND = KEY = "fb_mode"
+KIND = KEY = jmod.FB_MODE
+SLOTS = ("a", "b")
 
 
 def journal() -> jmod.Journal:
@@ -43,46 +48,196 @@ def pending(j: jmod.Journal | None = None) -> dict | None:
     return (j or journal()).find(jmod.HOST, KIND, KEY)
 
 
-def arm(dev, j: jmod.Journal | None = None) -> dict:
-    """Journal the obligation (fsynced), then ``fastboot oem fb_mode_set``.
-    The phone must be in fastboot."""
-    j = j or journal()
-    e = j.record(jmod.HOST, KIND, KEY, "clear", extra={"serial": dev.serial, "armed_at": now_iso()})
-    dev.fb_mode_set()
-    return e
-
-
 class ClearFailed(RuntimeError):
     """``fb_mode_clear`` failed while an fb_mode obligation is pending."""
 
 
-def settle(j: jmod.Journal | None = None) -> None:
-    """Resolve the obligation, if any. Call it only once fb_mode was cleared
-    and the phone is where the caller meant it to be."""
+class WrongSlot(RuntimeError):
+    """fastboot reports a slot active, read and confirmed, other than the
+    one the caller may boot (R6-8). Raised before anything is cleared or
+    booted. The caller says what to do: the right advice differs for a
+    promotion, a batch preflight and generic recovery (R7-2)."""
+
+    def __init__(self, serial: str, active: str, want: str):
+        self.active, self.want = active, want
+        super().__init__(f"{serial} is in fastboot with slot {active} active, not slot {want}; not booting it")
+
+
+class SlotUnreadable(RuntimeError):
+    """``getvar current-slot`` gave no slot (R8-2). Never a WrongSlot, never
+    rollback advice: raised before anything is cleared or booted."""
+
+    def __init__(self, serial: str, got: str):
+        super().__init__(f"cannot read the active slot; recheck with `fastboot -s {serial} getvar current-slot` "
+                         f"(fastboot reported {got!r})")
+
+
+class NotVerified(RuntimeError):
+    """verify_boot found a mismatch or could not read something."""
+
+
+class SlotMismatch(NotVerified):
+    """verify_boot read the running slot, and it is another one (R8-2: a
+    confirmed slot, unlike an unreadable one)."""
+
+
+# --- reads on the booted phone ------------------------------------------------
+
+def partition_build_ids(dev) -> tuple[str | None, str | None]:
+    """ro.river.build_id and ro.vendor.river.build_id read straight from the
+    partitions' build.prop files, as root."""
+    dev.root()
+    sysp = dev.sh("grep -m1 '^ro.river.build_id=' /system/build.prop").strip()
+    venp = dev.sh("grep -m1 '^ro.vendor.river.build_id=' /vendor/build.prop").strip()
+    return (sysp.split("=", 1)[1] if "=" in sysp else None, venp.split("=", 1)[1] if "=" in venp else None)
+
+
+def boot_partition_sha(dev, slot: str, nbytes: int | None = None) -> str:
+    """SHA-256 of boot_<slot> as root: the whole partition, or its first
+    nbytes. A short read raises."""
+    dev.root()
+    part = f"/dev/block/by-name/boot_{slot}"
+    if nbytes is None:
+        out = dev.sh(f"sha256sum {part}", timeout=120).split()
+    else:
+        size = int(dev.sh(f"blockdev --getsize64 {part}").strip() or 0)
+        if size < nbytes:
+            raise RuntimeError(f"{part} is {size} bytes, shorter than {nbytes}")
+        out = dev.sh(f"head -c {int(nbytes)} {part} | sha256sum", timeout=120).split()
+    if not out or len(out[0]) != 64:
+        raise RuntimeError(f"could not hash {part}")
+    return out[0]
+
+
+# --- the proof ----------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Want:
+    """What the booted phone must be. ``build_ids`` is (system, vendor);
+    ``boot_sha`` is compared with the boot partition (its first
+    ``boot_bytes`` bytes, if given); ``hash_boot`` hashes it even with
+    nothing to compare, so the caller can use the hash from the proof. At
+    least one of ``build_ids`` and ``boot_sha`` is required."""
+    slot: str
+    build_ids: tuple[str, str] | None
+    boot_sha: str | None = None
+    boot_bytes: int | None = None
+    hash_boot: bool = False
+
+    def __post_init__(self):
+        if self.slot not in SLOTS:
+            raise ValueError(f"bad slot {self.slot!r}")
+        if self.build_ids is not None and (len(self.build_ids) != 2 or not all(self.build_ids)):
+            raise ValueError(f"bad build IDs {self.build_ids!r}")
+        if self.build_ids is None and not self.boot_sha:
+            raise ValueError("no build IDs and no boot hash: nothing to verify the build with")
+
+    def describe(self) -> str:
+        ids = "" if self.build_ids is None else f", build IDs {'/'.join(self.build_ids)}"
+        return f"slot {self.slot}{ids}" + (f", boot {self.boot_sha[:12]}" if self.boot_sha else "")
+
+
+_SEAL = object()
+
+
+@dataclass(frozen=True)
+class VerifiedBoot:
+    """Proof that the phone booted Android and passed verify_boot. Only
+    verify_boot makes one (the seal); settle accepts nothing else."""
+    serial: str
+    boot_id: str
+    booted_at: float          # host time.time() at which this boot's kernel started (wall - uptime)
+    slot: str
+    build_ids: tuple[str | None, str | None]
+    boot_sha: str | None
+    dev: object = field(repr=False, compare=False)
+    _seal: object = field(repr=False, compare=False, default=None)
+
+    def __post_init__(self):
+        if self._seal is not _SEAL:
+            raise TypeError("a VerifiedBoot is made only by fbmode.verify_boot")
+
+    def describe(self) -> str:
+        return (f"slot {self.slot}, build IDs {self.build_ids[0]}/{self.build_ids[1]}"
+                + (f", boot {self.boot_sha[:12]}" if self.boot_sha else "") + f", boot_id {self.boot_id[:8]}")
+
+
+def verify_boot(dev, want: Want) -> VerifiedBoot:
+    """Verify the booted phone, in this order: the adb guard (serial and
+    product); the boot status (boot completed, boot_id, uptime), read
+    first so that settle's boot_id check covers every read below; the
+    running slot; both build IDs; the boot-partition hash when ``want``
+    asks for it. Any failed read or mismatch raises (NotVerified,
+    GuardError, TimeoutError); then nothing can be settled."""
+    dev.guard()
+    st = dev.boot_status()
+    if st is None or not st.completed or not st.boot_id:
+        raise NotVerified(f"{dev.serial}: cannot read a completed boot (boot_id, sys.boot_completed, uptime)")
+    slot = (dev.getprop("ro.boot.slot_suffix") or "").lstrip("_")
+    if slot not in SLOTS:
+        raise NotVerified(f"cannot read the running slot ({slot!r})")
+    if slot != want.slot:
+        raise SlotMismatch(f"the phone runs slot {slot}, not slot {want.slot}")
+    ids = partition_build_ids(dev)
+    if want.build_ids is not None and tuple(ids) != tuple(want.build_ids):
+        raise NotVerified(f"build IDs system={ids[0]} vendor={ids[1]}, expected {'/'.join(want.build_ids)}")
+    sha = None
+    if want.boot_sha or want.hash_boot:
+        sha = boot_partition_sha(dev, slot, want.boot_bytes)
+        if want.boot_sha and sha != want.boot_sha:
+            raise NotVerified(f"boot_{slot} hash {sha[:12]} differs from the expected {want.boot_sha[:12]}")
+    return VerifiedBoot(dev.serial, st.boot_id, st.host_wall - st.uptime, slot, tuple(ids), sha, dev, _SEAL)
+
+
+# --- the obligation -----------------------------------------------------------
+
+def armed_want(e: dict) -> Want:
+    """The identity the phone had when this obligation was armed (R8-1)."""
+    x = e.get("extra") or {}
+    ids = x.get("build_ids")
+    if x.get("slot") not in SLOTS or not ids or len(ids) != 2 or not all(ids):
+        raise RuntimeError("the fb_mode obligation has no recorded slot and build IDs, so no boot can be "
+                           f"verified against it; check the phone, then: fastboot -s {x.get('serial')} oem "
+                           "fb_mode_clear, and flash a build (a verified dev or batch flash settles it)")
+    return Want(x["slot"], (ids[0], ids[1]))
+
+
+def arm(dev, slot: str, build_ids: tuple[str, str], j: jmod.Journal | None = None) -> dict:
+    """Journal the obligation with the identity of the phone it is armed
+    on (fsynced), then ``fastboot oem fb_mode_set``. The phone must be in
+    fastboot. Refuses with an obligation already pending: that one must be
+    settled first."""
     j = j or journal()
+    Want(slot, tuple(build_ids))                    # validates
+    if pending(j) is not None:
+        raise RuntimeError("an fb_mode obligation is already pending; settle it first (phone-qa recover)")
+    e = j.record(jmod.HOST, KIND, KEY, "clear",
+                 extra={"serial": dev.serial, "armed_at": now_iso(), "slot": slot,
+                        "build_ids": list(build_ids), "cleared_at": None})
+    dev.fb_mode_set()
+    return e
+
+
+def _mark_cleared(j: jmod.Journal) -> bool:
+    """After a successful fb_mode_clear: stamp the pending entry with the
+    host time. Returns True if an obligation is pending."""
     e = pending(j)
-    if e is not None:
-        j.resolve(e)
+    if e is None:
+        return False
+    j.annotate(e, cleared_at=time.time())
+    return True
 
 
-def disarm(dev, j: jmod.Journal | None = None) -> None:
-    """``fastboot oem fb_mode_clear``, then resolve the obligation. The
-    phone must be in fastboot. A failed clear leaves the entry pending."""
-    j = j or journal()
-    dev.fb_mode_clear()
-    settle(j)
-
-
-def clear_in_fastboot(dev, j: jmod.Journal | None = None) -> bool:
-    """For code already in fastboot (flash, rescue, rollback): send
-    ``fb_mode_clear`` (harmless when nothing is set) and **don't** resolve.
-    Returns True if an obligation is pending; the caller calls ``settle``
-    once the phone is on the slot it meant (R5-1).
+def clear(dev, j: jmod.Journal | None = None) -> bool:
+    """For code already in fastboot (flash, rescue, rollback, the sysrq
+    control): send ``fb_mode_clear`` (harmless when nothing is set) and
+    stamp the entry cleared; **never** resolve. Returns True if an
+    obligation is pending; the caller settles it with a VerifiedBoot of
+    the boot that follows.
 
     A failed clear with nothing pending is logged and ignored, so it never
     aborts a rescue or rollback (review round 5). With an obligation
-    pending it raises ClearFailed: the caller still sets the fallback slot
-    active, then halts. A GuardError always propagates."""
+    pending it raises ClearFailed. A GuardError always propagates."""
     from .device import GuardError
     j = j or journal()
     owed = pending(j) is not None
@@ -94,52 +249,79 @@ def clear_in_fastboot(dev, j: jmod.Journal | None = None) -> bool:
         if owed:
             raise ClearFailed(f"fastboot oem fb_mode_clear failed with an fb_mode obligation pending: {e}") from e
         log(f"warning: fastboot oem fb_mode_clear failed ({e}); no fb_mode obligation is pending, so going on")
-    return owed
+        return False
+    return _mark_cleared(j)
 
 
-class WrongSlot(RuntimeError):
-    """fastboot reports another slot active than the one the caller may
-    boot (R6-8). Raised before anything is cleared or booted. The caller
-    says what to do: the right advice differs for a promotion and a batch
-    preflight (R7-2)."""
-
-    def __init__(self, serial: str, active: str, want: str):
-        self.active, self.want = active, want
-        super().__init__(f"{serial} is in fastboot with slot {active or '?'} active, not slot {want}; not "
-                         "booting it")
+class NotSettled(RuntimeError):
+    """settle refused: the proof doesn't show a boot after the clear."""
 
 
-def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, slot: str | None = None,
-            verify=None, j: jmod.Journal | None = None) -> str | None:
+def settle(proof: VerifiedBoot, j: jmod.Journal | None = None) -> bool:
+    """The one way an fb_mode obligation is resolved (R8-1). Returns True if
+    one was. Refuses (TypeError, NotSettled) unless ``proof`` is a
+    VerifiedBoot of this phone, the entry was stamped cleared, the
+    verified boot began after that clear, and the phone's boot_id, read
+    again now, is still the proof's (no reboot since, so every read of
+    verify_boot was of this boot)."""
+    if not isinstance(proof, VerifiedBoot) or proof._seal is not _SEAL:
+        raise TypeError("fbmode.settle needs a VerifiedBoot from fbmode.verify_boot")
+    j = j or journal()
+    e = pending(j)
+    if e is None:
+        return False
+    x = e.get("extra") or {}
+    if x.get("serial") not in (None, proof.serial):
+        raise NotSettled(f"the obligation is for {x.get('serial')}, the proof for {proof.serial}")
+    cleared = x.get("cleared_at")
+    if cleared is None:
+        raise NotSettled("fb_mode_clear was never confirmed for this obligation; not resolving it")
+    if proof.booted_at < cleared:
+        raise NotSettled("the verified boot began before fb_mode was cleared; not resolving the obligation")
+    now = proof.dev.boot_id()
+    if now != proof.boot_id:
+        raise NotSettled(f"boot_id is {now[:8] or '?'}, not the verified boot's {proof.boot_id[:8]}: the phone "
+                         "rebooted after the check; not resolving the obligation")
+    j._settle_fb_mode(e)
+    log(f"fb_mode obligation settled: verified {proof.describe()}")
+    return True
+
+
+@dataclass(frozen=True)
+class Recovery:
+    """What recover did (``what``, None if nothing) and the proof of the
+    boot it verified, if any."""
+    what: str | None
+    proof: VerifiedBoot | None
+
+
+def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, want: Want | None = None,
+            j: jmod.Journal | None = None) -> Recovery:
     """Clear a leftover fb_mode. Call it under the device lock, before the
     adb guard (the phone may be sitting in fastboot). It boots the
     **active** slot, so slot recovery must not use it (R5-1).
 
     - Obligation pending, phone in Android: ``adb reboot bootloader``
       (guarded), clear, then boot Android unless ``boot`` is False.
-    - Phone in fastboot: clear; then boot Android if ``boot`` is True, or if
-      ``boot`` is None and an obligation was pending.
-    - Neither: nothing.
+    - Phone in fastboot: clear; then boot Android if ``boot`` is True, or
+      if ``boot`` is None and an obligation was pending.
+    - Neither: nothing, except that with ``want`` the phone is verified
+      as it is.
 
-    Before a boot it reads the active slot. With ``slot`` (R6-8), it boots
-    only that slot: another active slot raises WrongSlot before anything
-    is cleared or booted.
-
-    After a boot, and before the entry is resolved (R7-1), the booted phone
-    must pass the guard and run the slot it meant to boot (``slot``, or
-    the slot fastboot reported active): a bootloader that fell back to the
-    other slot raises. ``verify`` (no arguments) then runs the caller's
-    build check; it raises on a mismatch or a failed read. The entry is
-    resolved only after all of that, or right after the clear when the
-    phone stays in fastboot (``boot`` False, or nothing to boot). Returns
-    a description of what it did, or None. Raises (GuardError,
-    TimeoutError, RuntimeError) if it could not finish; the obligation
-    then stays pending for the next recovery."""
+    The phone must match ``want``, or with no ``want`` the identity the
+    obligation was armed with (R8-1). Before a boot it reads the active
+    slot: an unreadable slot raises SlotUnreadable and another slot
+    WrongSlot, both before anything is cleared (R6-8, R8-2). After the
+    boot, verify_boot checks the phone, and only then does settle resolve
+    the obligation. With ``boot`` False (a dev flash) it clears and never
+    settles: the flash settles with a proof of the slot it writes. Raises
+    if it could not finish; the obligation then stays pending."""
     j = j or journal()
     e = pending(j)
     in_fb = dev.in_fastboot()
     if e is None and not in_fb:
-        return None
+        return Recovery(None, verify_boot(dev, want) if want is not None else None)
+    expect = want if want is not None else (armed_want(e) if e is not None else None)
     took = False
     if not in_fb:
         st = dev.state()
@@ -151,33 +333,38 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, slot: s
         dev.wait_fastboot(120)
         took = True
     will_boot = boot is True or (boot is None and (took or e is not None))
+    active = None
     if will_boot:
-        active = dev.getvar("current-slot").lstrip("_")
-        if slot is not None and active != slot:
-            raise WrongSlot(dev.serial, active, slot)
-        want = slot or active
-        if want not in ("a", "b"):
-            raise RuntimeError(f"cannot read the active slot in fastboot ({active!r}); not booting")
+        got = dev.getvar("current-slot")
+        active = got.lstrip("_")
+        if active not in SLOTS:
+            raise SlotUnreadable(dev.serial, got)
+        if expect is not None and active != expect.slot:
+            raise WrongSlot(dev.serial, active, expect.slot)
     dev.fb_mode_clear()
+    _mark_cleared(j)
     what = ("cleared a pending fb_mode obligation" if e is not None else
             "found the phone in fastboot; cleared fb_mode")
-    if will_boot:
-        dev.reboot_fastboot()
-        dev.wait_for_device(boot_timeout)
-        dev.wait_boot_completed(boot_timeout)
-        # R7-1: the guarded slot check and the caller's build check come
-        # before the entry is resolved. fastboot may report a slot active
-        # that the bootloader then falls back from.
-        dev.guard()
-        running = dev.getprop("ro.boot.slot_suffix").lstrip("_")
-        if running != want:
-            raise RuntimeError(f"fastboot booted slot {want}, but the phone runs slot {running or '?'} (the "
-                               "bootloader fell back, or the slot can't be read)")
-        if verify is not None:
-            verify()
-        what += f" and booted Android on slot {want}"
+    if not will_boot:
+        what += "; the phone stays in fastboot" + ("; the obligation stays pending until a verified boot"
+                                                   if e is not None else "")
+        log(f"fb_mode recovery: {what}")
+        return Recovery(what, None)
+    dev.reboot_fastboot()
+    dev.wait_for_device(boot_timeout)
+    dev.wait_boot_completed(boot_timeout)
+    proof = None
+    if expect is not None:
+        proof = verify_boot(dev, expect)
+        settle(proof, j)
+        what += f" and booted Android, verified: {proof.describe()}"
     else:
-        what += "; the phone stays in fastboot"
-    settle(j)
+        # Nothing was pending and the caller wants no proof: only check the
+        # phone booted the slot fastboot reported.
+        dev.guard()
+        running = (dev.getprop("ro.boot.slot_suffix") or "").lstrip("_")
+        if running != active:
+            raise RuntimeError(f"fastboot booted slot {active}, but the phone runs slot {running or '?'}")
+        what += f" and booted Android on slot {active}"
     log(f"fb_mode recovery: {what}")
-    return what
+    return Recovery(what, proof)
