@@ -93,13 +93,15 @@ class RebootGuard(unittest.TestCase):
         self.assertEqual(sum("sysrq" in " ".join(c) for c in fake.cmds), 2)
 
     def test_read_only_mentions_of_the_trigger_are_allowed(self):
-        """R5-9: only writes to sysrq-trigger are refused."""
+        """R5-9, R7-4: the allowlisted read-only forms pass; writes don't."""
         fake = FakeRun()
-        reads = ("ls -l /proc/sysrq-trigger", "test -e /proc/sysrq-trigger && echo yes",
-                 "stat -c %a /proc/sysrq-trigger", "grep -c sysrq-trigger /init.rc")
+        reads = ("ls -l /proc/sysrq-trigger", "test -e /proc/sysrq-trigger", "[ -e /proc/sysrq-trigger ]",
+                 "stat -c %a /proc/sysrq-trigger", "stat /mnt/cp/sysrq-trigger",
+                 "grep -c sysrq-trigger /init.rc", "cat /proc/sysrq-trigger")
         writes = ("echo b>/proc/sysrq-trigger", "echo b >> /proc/sysrq-trigger", "echo b 1>'/proc/sysrq-trigger'",
                   "dd if=/dev/zero of=/proc/sysrq-trigger bs=1 count=1", "printf b | tee -a /proc/sysrq-trigger",
-                  "su -c 'echo b > /proc/sysrq-trigger'", "cp /data/local/tmp/b /proc/sysrq-trigger")
+                  "su -c 'echo b > /proc/sysrq-trigger'", "cp /data/local/tmp/b /proc/sysrq-trigger",
+                  "test -e /proc/sysrq-trigger && echo yes")
         with mock.patch.object(device, "run", fake):
             for cmd in reads:
                 Device().sh(cmd)
@@ -109,18 +111,19 @@ class RebootGuard(unittest.TestCase):
         self.assertEqual(len(fake.cmds), len(reads))
 
     def test_copy_judged_on_its_destination(self):
-        """R6-9: a cp/mv/ln/install with the trigger only as its source is
-        allowed; one onto the trigger, or into /proc from a file named
-        sysrq-trigger, is refused."""
+        """R6-9, R7-4: a cp with /proc/sysrq-trigger only as its source is
+        allowed (the control); one onto the trigger, into /proc, or with a
+        trigger-named source other than /proc/sysrq-trigger is refused."""
         fake = FakeRun()
         allowed = ("cp /proc/sysrq-trigger /data/local/tmp/x", "cp -p /proc/sysrq-trigger /sdcard/",
-                   "ln -s /proc/sysrq-trigger /data/local/tmp/t", "su -c 'cp /proc/sysrq-trigger /tmp/x'",
+                   "su -c 'cp /proc/sysrq-trigger /tmp/x'", "su root -c 'cp /proc/sysrq-trigger /tmp/x'",
                    "cp -t /tmp /proc/sysrq-trigger")
         refused = ("cp /data/local/tmp/b /proc/sysrq-trigger", "install -m 200 b /proc/sysrq-trigger",
                    "su -c 'cp /tmp/b /proc/sysrq-trigger'", "cp /tmp/sysrq-trigger /proc",
                    "cp /tmp/sysrq-trigger /proc/", "cp -t /proc /tmp/sysrq-trigger",
                    "cd /proc && cp /tmp/sysrq-trigger .", "mv b /proc/sysrq-trigger",
-                   "cp --target-directory=/proc sysrq-trigger", "cp 'unbalanced /proc/sysrq-trigger")
+                   "cp --target-directory=/proc sysrq-trigger", "cp 'unbalanced /proc/sysrq-trigger",
+                   "ln -s /proc/sysrq-trigger /data/local/tmp/t", "cp /proc/sysrq-trigger /proc")
         with mock.patch.object(device, "run", fake):
             for cmd in allowed:
                 Device().sh(cmd)
@@ -128,6 +131,27 @@ class RebootGuard(unittest.TestCase):
                 with self.assertRaises(GuardError, msg=cmd):
                     Device().sh(cmd)
         self.assertEqual(len(fake.cmds), len(allowed), fake.cmds)
+
+    def test_sysrq_guard_fails_closed(self):
+        """R7-4, R7-9: trailing shell syntax after a copy onto the trigger,
+        a subshell, a comment, a chain, or any command outside the
+        allowlist is refused. Each of these passed the round-6 parser."""
+        fake = FakeRun()
+        refused = ("cp /tmp/b /proc/sysrq-trigger 2>/dev/null", "cp /tmp/b /proc/sysrq-trigger # note",
+                   "(cp /tmp/sysrq-trigger /proc)", "{ cp /tmp/sysrq-trigger /proc; }",
+                   "cp /proc/sysrq-trigger /tmp/x; cp /tmp/b /proc/sysrq-trigger",
+                   "cp /tmp/b /proc/sysrq-trigger || true", "cp /tmp/b $(echo /proc/sysrq-trigger)",
+                   "cp /tmp/b `echo /proc/sysrq-trigger`", "sh -c 'cp /tmp/b /proc/sysrq-trigger'",
+                   "busybox cp /tmp/b /proc/sysrq-trigger", "cp /tmp/sysrq-trigger /pro?",
+                   "cp /tmp/sysrq-trigger ~", "toybox cp /tmp/sysrq-trigger /proc")
+        with mock.patch.object(device, "run", fake):
+            for cmd in refused:
+                with self.assertRaises(GuardError, msg=cmd):
+                    Device().sh(cmd)
+            for args in (("push", "/tmp/b", "/proc/sysrq-trigger"), ("shell", "cp", "/tmp/b", "/proc/sysrq-trigger")):
+                with self.assertRaises(GuardError, msg=args):
+                    Device().adb(*args)
+        self.assertEqual(fake.cmds, [])
 
     def test_sysrq_reboot_after_the_guard_and_as_root(self):
         class Root(FakeRun):

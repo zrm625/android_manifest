@@ -167,34 +167,59 @@ def _is_reboot(args: tuple) -> bool:
 SYSRQ_REBOOT = "sync; echo b > /proc/sysrq-trigger"
 
 
-# Ways a shell command writes a file (R5-9): a redirection (>, >>, >|,
-# 1>), tee or dd of=, with the sysrq-trigger path (possibly quoted) as the
-# target. A copy, move or link is judged on its destination (R6-9, below).
-_SYSRQ_WRITE = re.compile(
-    r"""(?:\d?>>?\|?\s*['"]?\S*sysrq-trigger)"""
-    r"""|(?:\btee\b[^|;&\n]*sysrq-trigger)"""
-    r"""|(?:\bof=['"]?\S*sysrq-trigger)""")
-_SYSRQ_COPY = re.compile(r"""\b(?:cp|mv|ln|install)\b[^|;&\n]*sysrq-trigger[^|;&\n]*""")
-_DIRLIKE = re.compile(r"""^(?:\.{1,2}|(?:.*/)?proc)$""")
+# The sysrq guard fails closed (R7-4): a command that mentions sysrq-trigger
+# is refused unless it is one of a few read-only forms. reboot_sysrq() is
+# the only way to write the trigger.
+_SYSRQ_META = set("<>|&;#`$(){}*?~\\\n\r!")
+_SYSRQ_READERS = ("ls", "stat", "cat", "grep")
+TRIGGER = "/proc/sysrq-trigger"
 
 
-def _copy_onto_trigger(segment: str) -> bool:
-    """Does this cp/mv/ln/install command write the sysrq trigger (R6-9)?
-    Only its destination counts: the last operand, or the -t directory. It
-    writes the trigger if the destination names sysrq-trigger, or if it may
-    be /proc (``/proc``, ``.``, ``..``) and a source is named
-    sysrq-trigger. ``cp /proc/sysrq-trigger /tmp/x`` (the trigger only as a
-    source) is allowed. Anything that can't be parsed counts as a write."""
-    for text in (segment, segment.rstrip("'\" ")):
-        try:
-            argv = shlex.split(text)
-            break
-        except ValueError:
-            continue
-    else:
+def _sysrq_read_only(cmd: str, depth: int = 0) -> bool:
+    """Is this shell command one of the allowed read-only forms that
+    mention sysrq-trigger (R7-4)? Pure.
+
+    No shell syntax at all: no redirection, comment, ``;``, ``&``, ``|``,
+    backtick, ``$``, brackets of a subshell or group, glob or ``~``. Then
+    one of:
+
+    - ``ls``, ``stat``, ``cat`` or ``grep`` with any options and operands
+      (none of them can write a file without a redirection);
+    - ``test -e PATH`` or ``[ -e PATH ]``;
+    - ``cp [options] SRC... DEST`` (or ``cp -t DIR SRC...``) where every
+      mention of sysrq-trigger is a source equal to /proc/sysrq-trigger,
+      and the destination neither mentions it nor may be /proc (``proc``,
+      ``.``, ``..``);
+    - ``su [user] -c CMD`` with CMD one of the above.
+
+    Everything else that mentions sysrq-trigger is refused, including
+    anything shlex can't split."""
+    if any(c in _SYSRQ_META for c in cmd):
+        return False
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    name = argv[0]
+    if name == "su" and depth == 0:
+        rest = argv[1:]
+        if rest and not rest[0].startswith("-"):
+            rest = rest[1:]            # su root -c ...
+        if len(rest) == 2 and rest[0] == "-c":
+            return _sysrq_read_only(rest[1], depth + 1)
+        return False
+    if name == "[":
+        return len(argv) == 4 and argv[1] == "-e" and argv[3] == "]"
+    if any("[" in t or "]" in t for t in argv):
+        return False
+    if name == "test":
+        return len(argv) == 3 and argv[1] == "-e"
+    if name in _SYSRQ_READERS:
         return True
-    if not argv or Path(argv[0]).name not in ("cp", "mv", "ln", "install"):
-        return True
+    if name != "cp":
+        return False
     operands, target_dir, it = [], None, iter(argv[1:])
     for tok in it:
         if tok == "--":
@@ -203,41 +228,42 @@ def _copy_onto_trigger(segment: str) -> bool:
         if tok in ("-t", "--target-directory"):
             target_dir = next(it, None)
             if target_dir is None:
-                return True
+                return False
         elif tok.startswith("--target-directory="):
             target_dir = tok.split("=", 1)[1]
         elif tok.startswith("-t") and len(tok) > 2:
             target_dir = tok[2:]
         elif tok.startswith("-") and tok != "-":
-            continue
+            if "sysrq-trigger" in tok:
+                return False
         else:
             operands.append(tok)
     if target_dir is None:
         if len(operands) < 2:
-            return True
+            return False
         dest, sources = operands[-1], operands[:-1]
     else:
         dest, sources = target_dir, operands
-    if "sysrq-trigger" in dest:
-        return True
-    return bool(_DIRLIKE.match(dest.rstrip("/") or "/")) and any(
-        Path(src.rstrip("/")).name == "sysrq-trigger" for src in sources)
+    tail = Path(dest.rstrip("/") or "/").name
+    if "sysrq-trigger" in dest or tail in ("proc", ".", "..", ""):
+        return False
+    return all(src == TRIGGER for src in sources if "sysrq-trigger" in src)
 
 
 def _is_sysrq(args: tuple) -> bool:
-    """A write to the sysrq trigger (review rounds 4 and 5): a redirection,
-    tee, dd of= or a copy onto /proc/sysrq-trigger. Read-only mentions
-    (ls, stat, test -e, grep), a copy with the trigger only as its source
-    (R6-9), and other uses of the word, such as /proc/sys/kernel/sysrq, are
-    allowed (R5-9). Indirect targets (``t=/proc/sysrq-trigger; echo b >
-    $t``, a symlink written later) are out of scope: the threat model is
-    accidental breakage, not a crafted command (DESIGN, round 6)."""
+    """Could this adb call write the sysrq trigger? It fails closed (R7-4):
+    a call that mentions sysrq-trigger anywhere is refused unless it is
+    ``adb shell`` (or ``exec-out``) with a command _sysrq_read_only allows.
+    Other mentions of the word, such as /proc/sys/kernel/sysrq, are not
+    affected. Indirect targets (a variable, a glob, a symlink written
+    later) are out of scope: the threat model is accidental breakage, not
+    a crafted command (DESIGN, round 6)."""
     cmd = " ".join(str(a) for a in args)
     if "sysrq-trigger" not in cmd:
         return False
-    if _SYSRQ_WRITE.search(cmd):
+    if not args or str(args[0]) not in ("shell", "exec-out"):
         return True
-    return any(_copy_onto_trigger(m.group(0)) for m in _SYSRQ_COPY.finditer(cmd))
+    return not _sysrq_read_only(" ".join(str(a) for a in args[1:]))
 
 
 class Device:
