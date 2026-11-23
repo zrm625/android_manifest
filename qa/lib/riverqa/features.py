@@ -444,7 +444,8 @@ def expected_cameras(run) -> tuple[list[int] | None, str]:
 
 APPROVAL_URL_RE = re.compile(r"^https://github\.com/(zrm625/[A-Za-z0-9._-]+)/pull/(\d+)"
                              r"#(issuecomment|pullrequestreview)-(\d+)$")
-APPROVAL_LINE_RE = re.compile(r"(?im)^\s*approve camera set:\s*([0-9][0-9,\s]*)$")
+# One line only: [ \t] instead of \s, so neither side can run into the next line.
+APPROVAL_LINE_RE = re.compile(r"(?im)^[ \t]*approve camera set:[ \t]*([0-9][0-9, \t]*?)[ \t]*\r?$")
 APPROVER = "zrm625"
 
 
@@ -900,6 +901,10 @@ def mtp_interface_count(root: Path = Path("/sys/bus/usb/devices")) -> list[str]:
     return out
 
 
+def usb_reconnect_failed(timed_out: bool, state_after: str) -> bool:
+    return timed_out or state_after != "device"
+
+
 def check_usb(run) -> Result:
     cid = "hardware.usb"
     dev = run.dev
@@ -930,13 +935,15 @@ def check_usb(run) -> Result:
         except TimeoutError:
             pass   # the switch drops the connection the command came in on
         time.sleep(3)
+        reconnect_timeout = False
         try:
             dev.wait_for_device(60)
         except TimeoutError:
-            pass
-        if dev.state() != "device":
+            reconnect_timeout = True
+        if usb_reconnect_failed(reconnect_timeout, dev.state()):
             # Caught here, not raised: losing adb is a FAIL, and the restore
-            # below decides whether the run must halt (A10).
+            # below decides whether the run must halt (A10). A timeout stays
+            # a FAIL even if adb answers the very next probe (review round 2).
             mtp_error = "adb did not come back within 60 s after switching to MTP"
         elif host_run(["pgrep", "-x", "gvfsd"], timeout=10).returncode == 0:
             listed, how = gio_list(run, dev.serial, token)
@@ -1410,6 +1417,12 @@ def app_crashed(run, pkg, since_tags) -> list[str]:
     return hits
 
 
+def vpn_launch_ok(top_after: str, package: str) -> bool:
+    """Launched only if the app's own activity is on top (after any VPN
+    dialog was dismissed). A VPN dialog on top doesn't count."""
+    return top_after.startswith(package + "/")
+
+
 def launch_and_watch(run, cid, key, start_cmd, accept_vpn_dialog=False) -> Result:
     from . import bootsig
     dev = run.dev
@@ -1422,12 +1435,18 @@ def launch_and_watch(run, cid, key, start_cmd, accept_vpn_dialog=False) -> Resul
     dev.sh(start_cmd)
     time.sleep(4)
     top = top_activity(dev)
-    opened = top.startswith(f["package"]) or (accept_vpn_dialog and top.startswith("com.android.vpndialogs"))
-    resumed = opened
     d = {"top": top}
-    if top.startswith("com.android.vpndialogs"):
+    if accept_vpn_dialog and top.startswith("com.android.vpndialogs"):
+        # The VPN consent dialog is the system's, not the app's: the app
+        # counts as launched only if its own activity is resumed once the
+        # dialog is dismissed (never accepted). Review round 2.
         d["vpn_dialog"] = "shown; dismissed, never accepted"
         dev.sh("input keyevent KEYCODE_BACK")
+        time.sleep(2)
+        top = top_activity(dev)
+        d["top_after_dialog"] = top
+    opened = vpn_launch_ok(top, f["package"])
+    resumed = opened
     run.sideload[key]["launch"] = opened
     time.sleep(10)
     crashed = app_crashed(run, f["package"], tags0)

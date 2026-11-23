@@ -141,6 +141,43 @@ class Alarm(unittest.TestCase):
         self.assertEqual(F.alarm_verdict(polls, eff)[0], FAIL)
 
 
+class SmallItems(unittest.TestCase):
+    """Review round 2, section 9."""
+
+    def test_approval_line_does_not_span_lines(self):
+        self.assertEqual(F.APPROVAL_LINE_RE.findall("approve camera set: 0,1,2\n"), ["0,1,2"])
+        self.assertEqual(F.APPROVAL_LINE_RE.findall("x\r\napprove camera set: 0, 2 \r\nmore"), ["0, 2"])
+        # The set on the next line, or a second line of digits, must not count.
+        self.assertEqual(F.APPROVAL_LINE_RE.findall("approve camera set:\n0,1,2\n"), [])
+        self.assertEqual(F.APPROVAL_LINE_RE.findall("approve camera set: 0,1\n2\n"), ["0,1"])
+        self.assertEqual(F.APPROVAL_LINE_RE.findall("\n\napprove camera set: 0\n"), ["0"])
+
+    def test_usb_reconnect_timeout_stays_a_fail(self):
+        self.assertTrue(F.usb_reconnect_failed(True, "device"))
+        self.assertTrue(F.usb_reconnect_failed(False, ""))
+        self.assertFalse(F.usb_reconnect_failed(False, "device"))
+
+    def test_vpn_dialog_alone_is_not_a_launch(self):
+        self.assertFalse(F.vpn_launch_ok("com.android.vpndialogs/.ConfirmDialog", "com.tailscale.ipn"))
+        self.assertTrue(F.vpn_launch_ok("com.tailscale.ipn/.MainActivity", "com.tailscale.ipn"))
+        self.assertFalse(F.vpn_launch_ok("com.tailscale.ipnx/.Main", "com.tailscale.ipn"))
+
+    def test_build_counts_untracked_files_as_dirty(self):
+        build = Path(__file__).resolve().parents[2] / "scripts" / "build"
+        line = next(l for l in build.read_text().splitlines() if l.startswith("dirty()"))
+        self.assertNotIn("-uno", line)
+        with tempfile.TemporaryDirectory() as d:
+            env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null")
+            for cmd in (["git", "init", "-q", d], ["git", "-C", d, "-c", "user.email=t@t", "-c", "user.name=t",
+                                                   "commit", "-q", "--allow-empty", "-m", "x"]):
+                subprocess.run(cmd, check=True, env=env)
+            run = lambda: subprocess.run(["bash", "-c", line + '\ndirty "$1"', "x", d], capture_output=True,
+                                         text=True, env=env).stdout.strip()
+            self.assertEqual(run(), "")
+            Path(d, "new-input.mk").write_text("x")
+            self.assertEqual(run(), "+dirty")
+
+
 class Usb(unittest.TestCase):
     def test_interface_symlinks_are_resolved(self):
         with tempfile.TemporaryDirectory() as d:

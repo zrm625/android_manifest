@@ -117,6 +117,17 @@ class EarlyReboot(unittest.TestCase):
         self.assertEqual(reboots.inject_reboot_before_completion(d, 5), "early-reboot")
         self.assertEqual(d.reboots, 1)
 
+    def test_waits_for_the_phone_to_drop_off_usb(self):
+        d = self.Dev(False)
+        w = mock.Mock()
+        w.mark.return_value = 7
+        self.assertEqual(reboots.inject_reboot_before_completion(d, 5, w), "early-reboot")
+        w.wait_gone.assert_called_once_with(7, 120)
+        # A reboot that never drops off USB is not an injection.
+        w.wait_gone.side_effect = TimeoutError("still on USB")
+        with self.assertRaises(TimeoutError):
+            reboots.inject_reboot_before_completion(self.Dev(False), 5, w)
+
     def test_missed_if_already_completed(self):
         d = self.Dev(True)
         self.assertEqual(reboots.inject_reboot_before_completion(d, 5), "early-reboot-missed")

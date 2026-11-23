@@ -221,7 +221,7 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             planned -= 1
             rec.control = "extra-pass-unmarked"
         if inject_early_reboot:
-            rec.control = inject_reboot_before_completion(dev, boot_timeout)
+            rec.control = inject_reboot_before_completion(dev, boot_timeout, w)
         st = dev.wait_boot_completed(boot_timeout)
         rec.completed_wall = st.host_wall
         rec.boot_id, rec.uptime = st.boot_id, st.uptime
@@ -238,11 +238,13 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             w.stop()
 
 
-def inject_reboot_before_completion(dev: Device, seconds: float) -> str:
+def inject_reboot_before_completion(dev: Device, seconds: float, watcher: UsbWatcher | None = None) -> str:
     """Control only (extra-reboot-*): as soon as adb answers and
     sys.boot_completed is still unset, `adb reboot` (guarded), with no leaving
-    marker. Returns "early-reboot", or "early-reboot-missed" if boot
-    completed first; the caller records which in batch.json."""
+    marker, then wait for the phone to drop off USB, so the boot that was
+    just rebooted can't be the one wait_boot_completed() sees complete
+    (review round 2). Returns "early-reboot", or "early-reboot-missed" if
+    boot completed first; the caller records which in batch.json."""
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         if dev.state() == "device":
@@ -250,7 +252,10 @@ def inject_reboot_before_completion(dev: Device, seconds: float) -> str:
             if st is not None:
                 if st.completed:
                     return "early-reboot-missed"
+                mark = watcher.mark() if watcher is not None else None
                 dev.reboot_adb()
+                if watcher is not None:
+                    watcher.wait_gone(mark, 120)
                 return "early-reboot"
         time.sleep(0.3)
     return "early-reboot-missed"

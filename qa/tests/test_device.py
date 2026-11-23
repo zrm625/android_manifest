@@ -85,6 +85,26 @@ class RebootGuard(unittest.TestCase):
                 Device().reboot_adb()
         self.assertEqual(fake.reboots(), [])
 
+    def test_empty_serialno_is_refused(self):
+        fake = FakeRun(props={"ro.serialno": ""})
+        with mock.patch.object(device, "run", fake):
+            with self.assertRaises(GuardError):
+                Device().reboot_adb()
+            with self.assertRaises(GuardError):
+                Device().guard()
+        self.assertEqual(fake.reboots(), [])
+
+    def test_kmsg_checks_every_copy(self):
+        seen = []
+
+        def run(cmd, timeout, input=None, text=True, env=None):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 1 if len(seen) > 1 else 0, "", "")
+        with mock.patch.object(device, "run", run):
+            self.assertTrue(Device().kmsg("RQM:1:2"))
+            self.assertFalse(Device().kmsg("RQM:1:2"))
+        self.assertIn(" && ", seen[0][-1])
+
     def test_adb_reboot_after_the_guard(self):
         fake = FakeRun()
         with mock.patch.object(device, "run", fake):

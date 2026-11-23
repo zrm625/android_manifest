@@ -203,7 +203,9 @@ class Device:
         if codename != CODENAME:
             raise GuardError(f"{self.serial} is {codename!r}, not {CODENAME}. Refusing.")
         serialno = self.getprop("ro.serialno")
-        if serialno and serialno != self.serial:
+        if not serialno:
+            raise GuardError(f"adb -s {self.serial}: ro.serialno is empty or unreadable. Refusing.")
+        if serialno != self.serial:
             raise GuardError(f"adb -s {self.serial} reached a phone with serial {serialno}. Refusing.")
 
     def wait_for_device(self, seconds: float = 120) -> None:
