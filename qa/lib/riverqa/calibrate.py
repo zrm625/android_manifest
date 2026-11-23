@@ -397,6 +397,22 @@ def recover_fb_mode(dev) -> int | None:
     return None
 
 
+def refuse_unstamped(dev) -> int | None:
+    """R9-3: calibration needs a stamped build: the sysrq extra pass arms
+    fb_mode with the running build's IDs and verifies the boot against
+    them. Checked in Android before any calibration reboot (after
+    recover_fb_mode, which reboots only a phone left in fastboot or with an
+    obligation pending). Guards first. Returns 1 to refuse, else None."""
+    try:
+        fbmode.running_identity(dev)
+    except GuardError:
+        raise
+    except (RuntimeError, TimeoutError) as e:      # Unstamped, or an unreadable slot
+        log(f"error: {e}")
+        return 1
+    return None
+
+
 def boot_timing_main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="phone-qa boot-timing")
     ap.add_argument("--normal", type=int, default=4, help="normal reboots per path to set A (default 4)")
@@ -430,9 +446,10 @@ def prove_main() -> int:
                 return 2
             dev = Device(SERIAL)
             rc = recover_fb_mode(dev)       # resume from fastboot or a leftover fb_mode (R4-3)
+            if rc is None:
+                rc = refuse_unstamped(dev)
             if rc is not None:
                 return rc
-            dev.guard()
             dev.root()
             data.setdefault("controls", {})
             w = UsbWatcher(dev.serial).start()
@@ -462,9 +479,10 @@ def run(n_normal: int, reuse: bool = False) -> int:
     # Calibration resumes from a phone sitting in fastboot or left with
     # fb_mode set by a killed run (review round 4).
     rc = recover_fb_mode(dev)
+    if rc is None:
+        rc = refuse_unstamped(dev)
     if rc is not None:
         return rc
-    dev.guard()
     dev.root()
     old = reboots.load_timing()
     data = {"measured_at": now_iso(), "rules_version": CALIBRATION_RULES,

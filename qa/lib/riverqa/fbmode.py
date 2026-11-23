@@ -92,6 +92,28 @@ def partition_build_ids(dev) -> tuple[str | None, str | None]:
     return (sysp.split("=", 1)[1] if "=" in sysp else None, venp.split("=", 1)[1] if "=" in venp else None)
 
 
+class Unstamped(RuntimeError):
+    """The running build has no River build-ID stamps (R9-3)."""
+
+    def __init__(self):
+        super().__init__("running build is unstamped; dev-flash a build from this tree first (`flash stripped`)")
+
+
+def running_identity(dev) -> tuple[str, tuple[str, str]]:
+    """In Android: the adb guard, then the running slot and both build IDs.
+    Raises RuntimeError on an unreadable slot (also a getprop that gives
+    nothing, R9-9) and Unstamped on a build without both stamps. It
+    changes nothing on the phone."""
+    dev.guard()
+    slot = (dev.getprop("ro.boot.slot_suffix") or "").lstrip("_")
+    if slot not in SLOTS:
+        raise RuntimeError(f"cannot read the running slot ({slot!r})")
+    ids = partition_build_ids(dev)
+    if not all(ids):
+        raise Unstamped()
+    return slot, (ids[0], ids[1])
+
+
 def boot_partition_sha(dev, slot: str, nbytes: int | None = None) -> str:
     """SHA-256 of boot_<slot> as root: the whole partition, or its first
     nbytes. A short read raises."""

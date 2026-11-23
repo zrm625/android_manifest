@@ -4,6 +4,7 @@ rollback and slot rescue from DESIGN.md ("The batch sequence", step 2)."""
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -387,6 +388,23 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     return EXIT_OK
 
 
+def first_run_proof(dev: Device) -> fbmode.VerifiedBoot:
+    """Before the first baseline (no slot-state.json): a VerifiedBoot of the
+    running slot with its whole boot partition hashed (R9-1). With an
+    obligation pending, recovery verifies the armed identity and settles
+    with this proof. With none, a phone found in fastboot is booted
+    (nothing to settle), and the running build is verified as it is. It
+    must be stamped: the bootstrap starts with a dev flash of a build from
+    this tree (R9-3)."""
+    e = fbmode.pending()
+    if e is not None:
+        want = dataclasses.replace(fbmode.armed_want(e), hash_boot=True)
+        return fbmode.recover(dev, BOOT_TIMEOUT, boot=True, want=want).proof
+    fbmode.recover(dev, BOOT_TIMEOUT, boot=True)
+    slot, ids = fbmode.running_identity(dev)
+    return fbmode.verify_boot(dev, fbmode.Want(slot, ids, hash_boot=True))
+
+
 def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
     batch = stage.load(batch_id)
     bdir = batch_dir(batch_id)
@@ -418,18 +436,21 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
     # obligation and is what the pair is reserved with (R8-1).
     if st is None:
         # First-run transition (a baseline, before any slot-state.json): the
-        # running slot becomes a provisional known_good_slot, its boot hash
-        # read live. Generic recovery verifies against the armed identity.
+        # running slot becomes a provisional known_good_slot. R9-1: its slot
+        # and boot hash come from the proof, never from a read after the
+        # settle. A hash timeout halts with the obligation pending and no
+        # slot-state.json written.
         try:
-            fbmode.recover(dev, BOOT_TIMEOUT, boot=True)
+            proof = first_run_proof(dev)
+        except fbmode.Unstamped as e:      # R9-3: nothing pending, nothing written
+            log(f"error: {e}")
+            return EXIT_ERROR
         except (RuntimeError, TimeoutError) as e:
-            return recovery_halt(RuntimeError(f"fb_mode recovery failed: {e}"))
-        dev.guard()
-        current = running_slot(dev)
-        live = fbmode.boot_partition_sha(dev, current)
-        st = slots.first_run(current, live, now_iso())
+            return recovery_halt(RuntimeError(f"the running slot could not be verified: {e}"))
+        live = proof.boot_sha
+        st = slots.first_run(proof.slot, live, now_iso())
         save_state(st)
-        log(f"First run: slot {current} is the provisional known-good slot (boot {live[:12]})")
+        log(f"First run: slot {proof.slot} is the provisional known-good slot ({proof.describe()})")
     else:
         kg = st["known_good_slot"]
         saved = (st.get("known_good") or {}).get("boot_sha256")

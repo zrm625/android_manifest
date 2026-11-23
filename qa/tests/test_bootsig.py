@@ -673,6 +673,7 @@ class CalibrationProvenance(unittest.TestCase):
         reboots.save_timing(old)
         with mock.patch.object(calibrate, "Device", lambda *a: Dev()), \
                 mock.patch.object(calibrate, "recover_fb_mode", return_value=None), \
+                mock.patch.object(calibrate, "refuse_unstamped", return_value=None), \
                 mock.patch.object(calibrate, "UsbWatcher"), \
                 mock.patch.object(calibrate, "boot_count_now", return_value=1), \
                 mock.patch.object(calibrate, "one", side_effect=one), \

@@ -7,6 +7,7 @@ from benchhome import bench_home
 from fakes import Boots
 from riverqa import fbmode, flashing, journal as jmod
 from riverqa.results import FAIL
+from riverqa.device import GuardError
 
 
 class Phone(Boots):
@@ -249,9 +250,10 @@ class Callers(unittest.TestCase):
                     mock.patch.object(p, "state", create=True, side_effect=lambda: "device" if p.where == "android"
                                       else ""):
                 # The first guard is fbmode.recover's own check of the
-                # booted phone (R7-1); the second is calibration's.
-                p.guard = mock.Mock(side_effect=[None, RuntimeError("stop here")])
-                with self.assertRaises(RuntimeError):
+                # booted phone (R7-1); the second is calibration's (R9-3:
+                # in refuse_unstamped, which lets a GuardError through).
+                p.guard = mock.Mock(side_effect=[None, GuardError("stop here")])
+                with self.assertRaises(GuardError):
                     calibrate.run(1)
             self.assertEqual(p.calls[:3], [("fb_mode_clear",), ("reboot_fastboot", None), ("boot_completed",)])
             self.assertEqual(p.guard.call_count, 2)

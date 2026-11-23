@@ -41,7 +41,7 @@ from dataclasses import asdict, dataclass, field
 
 from . import bootsig, fbmode
 from .core import bench_path, log, read_json, write_json
-from .device import Device, UsbWatcher, fastboot_ids_seen
+from .device import Device, GuardError, UsbWatcher, fastboot_ids_seen
 from .results import FAIL, INFO, PASS, UNVERIFIED, worst
 
 TIMING_FILE = "qa/boot-timing.json"
@@ -306,12 +306,14 @@ def arm_bootloader_stop(dev: Device, boot_timeout: float) -> None:
     is the injected bootloader pass. It starts from Android: the obligation
     records the slot and both build IDs read there (R8-1), and recovery
     verifies the phone against them."""
-    dev.guard()
-    slot = dev.getprop("ro.boot.slot_suffix").lstrip("_")
-    ids = fbmode.partition_build_ids(dev)
-    if slot not in fbmode.SLOTS or not all(ids):
-        raise RuntimeError(f"cannot arm fb_mode: running slot {slot!r}, build IDs {ids[0]}/{ids[1]} (an "
-                           "unstamped build can't be verified after the stop)")
+    try:
+        slot, ids = fbmode.running_identity(dev)
+    except GuardError:
+        raise
+    except fbmode.Unstamped as e:
+        raise RuntimeError(f"cannot arm fb_mode: {e} (an unstamped build can't be verified after the stop)") from e
+    except RuntimeError as e:     # R9-9: also a getprop that gives nothing
+        raise RuntimeError(f"cannot arm fb_mode: {e}") from e
     dev.reboot_adb("bootloader")
     dev.wait_fastboot(120)
     fbmode.arm(dev, slot, ids)   # journaled before the set (review round 4)
