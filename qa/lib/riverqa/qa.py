@@ -1249,8 +1249,11 @@ def cmd_recover(argv: list[str]) -> int:
     (a pending obligation, or the phone found in fastboot) and boot Android
     (review round 4). The obligation is settled only once the booted phone
     is verified against the slot and build IDs it was armed with (R8-1);
-    otherwise it halts (exit 3) with the obligation pending. The rest of
-    the journal is restored by the next phone-qa run's preflight."""
+    otherwise it halts (exit 3) with the obligation pending. An obligation
+    with a recorded slot but no usable build IDs (the unstamped sentinel)
+    is cleared and its slot booted to completion, and it stays pending
+    with exit 0: only a dev flash's verified boot settles it (R13-2). The
+    rest of the journal is restored by the next phone-qa run's preflight."""
     from . import fbmode
     if argv:
         print("usage: phone-qa recover")
@@ -1272,7 +1275,8 @@ def cmd_recover(argv: list[str]) -> int:
     elif fbmode.pending() is not None:
         # R13-2: booted, but the obligation has no build IDs to verify.
         log("Next: a dev flash (flash stripped, with --wipe if the phone ran a build signed with other keys) "
-            "writes the other slot and settles the obligation once that boot is verified.")
+            "writes its target slot (the other slot, or with a known-good slot the non-known-good one) and "
+            "settles the obligation once that boot is verified.")
     return 0
 
 

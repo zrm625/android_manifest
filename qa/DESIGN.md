@@ -2633,3 +2633,13 @@ no-clear assertion, the README wording). m2: before the first baseline a
 "run the flash again". m3: the not-booted advice from Android says to
 reboot to the bootloader before `fastboot --set-active`. Tests:
 `test_round12.R13GeminiMinors`.
+
+## Round 14 follow-ups (Opus minors)
+
+An AST test pins `boot_only_ok` to its one caller, `qa.cmd_recover`.
+`Device.slot_boot_state`'s parser has unit tests (success, failed call,
+missing key, empty suffix). The `cmd_recover` and `fbmode.recover`
+docstrings, the `--no-reboot` help and recover's "Next:" message describe
+the boot-only path. README step 0 runs `phone-qa recover` before the
+reboot when an obligation is pending. `test_round12`'s main guard is at
+the end of the file.

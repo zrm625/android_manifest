@@ -991,7 +991,9 @@ Usage:
   --wipe       Factory reset (fastboot erase userdata; river's bootloader rejects -w).
   --no-reboot  Stay in the bootloader after flashing. Refused before the first
                baseline while an fb_mode obligation is pending: run
-               phone-qa recover first.
+               phone-qa recover first (for an obligation with no usable build
+               IDs it boots the slot and leaves the obligation pending; a dev
+               flash that boots then settles it).
   --batch ID   Flash a staged batch ($BENCH_HOME/batches/ID). Checks every image hash
                before writing, fixes the slot pair in slot-state.json and batch.json
                before the first write, records the first boot's boot_id, signals and

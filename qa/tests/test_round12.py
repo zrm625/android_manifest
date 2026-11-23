@@ -119,8 +119,6 @@ class R12_2TimeoutAdvice(unittest.TestCase):
                     self.assertNotIn("erase userdata", err)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class R13FollowUps(unittest.TestCase):
@@ -208,3 +206,47 @@ class R13GeminiMinors(unittest.TestCase):
             rc, err = dev_flash(p, reboot=booting_reboot)
             self.assertEqual(rc, flashing.EXIT_ERROR, err)
             self.assertIn("adb -s ZY225DPT7F reboot bootloader, then fastboot", err)
+
+
+class R14OpusMinors(unittest.TestCase):
+    def test_boot_only_ok_has_one_caller(self):
+        """Opus round 14 (m1): only phone-qa recover passes boot_only_ok."""
+        import ast
+        from pathlib import Path
+        lib = Path(flashing.__file__).parent
+        users = set()
+        for f in sorted(lib.glob("*.py")):
+            tree = ast.parse(f.read_text())
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for c in ast.walk(fn):
+                    if isinstance(c, ast.Call) and any(k.arg == "boot_only_ok" for k in c.keywords):
+                        users.add((f.stem, fn.name))
+        self.assertEqual(users, {("qa", "cmd_recover")})
+
+    def test_slot_boot_state_parser(self):
+        """Opus round 14 (m2): the real parser on success, a failed call, a
+        missing key and an empty suffix."""
+        from unittest import mock
+        from riverqa.device import Device
+        cases = [((0, "S=_a\nC=1\n", ""), ("_a", True)),
+                 ((0, "S=_b\nC=\n", ""), ("_b", False)),
+                 ((0, "S=\nC=1\n", ""), ("", True)),
+                 ((1, "S=_a\n", "error: closed"), RuntimeError),
+                 ((0, "S=_a\n", ""), RuntimeError),
+                 ((0, "", ""), RuntimeError)]
+        for ret, want in cases:
+            with self.subTest(ret=ret):
+                d = Device.__new__(Device)
+                d.serial = "ZY225DPT7F"
+                with mock.patch.object(Device, "sh_rc", return_value=ret):
+                    if want is RuntimeError:
+                        with self.assertRaises(RuntimeError):
+                            d.slot_boot_state()
+                    else:
+                        self.assertEqual(d.slot_boot_state(), want)
+
+
+if __name__ == "__main__":
+    unittest.main()

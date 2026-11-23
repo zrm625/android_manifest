@@ -390,8 +390,12 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, want: W
     boot, verify_boot checks the phone, and only then does settle resolve
     the obligation. With ``boot`` False (a dev flash) it clears and never
     settles: the flash settles with a proof of the slot it writes. Only a
-    path that boots reads the armed identity (R9-2). Raises if it could
-    not finish; the obligation then stays pending."""
+    path that boots reads the armed identity (R9-2). With
+    ``boot_only_ok`` (phone-qa recover only, R13-2), an entry with a
+    recorded slot but no usable build IDs is cleared, its slot booted to
+    completion and checked, and the obligation stays pending: no proof, no
+    settle. Raises if it could not finish; the obligation then stays
+    pending."""
     j = j or journal()
     e = pending(j)
     in_fb = dev.in_fastboot()
