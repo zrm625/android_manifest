@@ -18,6 +18,15 @@ class Parse(unittest.TestCase):
     def test_sigkill_and_ctl_stop_are_not_problems(self):
         self.assertEqual(ev.service_problems(DMESG), ([], []))
 
+    def test_lazy_service_clean_exits_are_not_a_loop(self):
+        d = "\n".join(f"[ {i}.0] init: Service 'artd' (pid {i}) exited with status 0 oneshot service took 1.0 seconds"
+                      for i in range(5))
+        self.assertEqual(ev.service_problems(d), ([], []))
+
+    def test_abnormal_exits_loop(self):
+        d = "\n".join(f"[ {i}.0] init: Service 'foo' (pid {i}) exited with status 1" for i in range(3))
+        self.assertEqual(ev.service_problems(d), ([], ["foo x3"]))
+
     def test_crash_signal_and_loop(self):
         d = DMESG + "\n".join(f"[ 2{i}.0] init: Service 'cameraserver' (pid 3{i}) received signal 6"
                               for i in range(3))

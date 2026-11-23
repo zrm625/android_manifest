@@ -22,7 +22,7 @@ from .results import FAIL, PASS, UNVERIFIED
 CRASH_SIGNALS = (4, 6, 7, 8, 11)
 SERVICE_SIG_RE = re.compile(r"init: Service '([^']+)' \(pid \d+\) received signal (\d+)")
 STOP_RE = re.compile(r"Processed ctl\.stop for '([^']+)'")
-DIED_RE = re.compile(r"init: Service '([^']+)' \(pid \d+\) (?:exited|received signal)")
+DIED_RE = re.compile(r"init: Service '([^']+)' \(pid \d+\) (?:exited with status (\d+)|received signal (\d+))")
 # First-boot allowlist. Calibration may need entries here; each one is written
 # down with its reason and never applied quietly. Empty on purpose.
 FIRST_BOOT_ALLOW: dict[str, str] = {}
@@ -31,9 +31,11 @@ FIRST_BOOT_ALLOW: dict[str, str] = {}
 def service_problems(dmesg: str) -> tuple[list[str], list[str]]:
     """(crashed services, services restarting in a loop) from dmesg.
 
-    SIGKILL is normal for lazy HALs and is not a crash. A death right after a
-    ctl.stop was asked for on purpose (Overlay Manager stops idmap2d after
-    each use) is not a restart. Three or more deaths is a loop."""
+    SIGKILL is normal for lazy HALs and is not a crash. A clean exit (status
+    0) is how lazy AIDL services such as artd go idle; they are started again
+    on demand, so it is not a restart either. A death right after a ctl.stop
+    was asked for on purpose (Overlay Manager stops idmap2d after each use) is
+    not a restart. Three or more abnormal deaths is a loop."""
     crashed = sorted({f"{m.group(1)} (signal {m.group(2)})" for m in SERVICE_SIG_RE.finditer(dmesg)
                       if int(m.group(2)) in CRASH_SIGNALS})
     stopped: dict[str, bool] = {}
@@ -46,7 +48,8 @@ def service_problems(dmesg: str) -> tuple[list[str], list[str]]:
         m = DIED_RE.search(line)
         if m:
             name = m.group(1)
-            if stopped.get(name):
+            clean = m.group(2) == "0" or m.group(3) == "9"
+            if stopped.get(name) or clean:
                 stopped[name] = False
                 continue
             deaths[name] = deaths.get(name, 0) + 1
