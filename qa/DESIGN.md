@@ -166,8 +166,15 @@ owns the whole sequence and holds one lock across all of it.
    **Recovery checks GitHub first.** At the start of any batch, if a pair is
    still unresolved, the runner looks up that exact batch's merge and tag
    state with `gh` and `git ls-remote` for the tag in every repo:
-   - If every PR is merged and every repo has the tag, the batch is promoted.
-   - If none are, it is rolled back.
+   - The batch is promoted only with proof for every repo of its tested
+     commit set (`batch.json` `commit_set`): for a repo with a PR, the PR's
+     head is the tested commit, the PR is merged and the tag points at its
+     merge commit; for a repo without a PR, the tag points at exactly the
+     tested commit. A stale or incomplete `prs`/`tag_repos` record halts.
+   - Before any merge or tag action the runner records `merge_started` in
+     `batch.json` (`flash --merge-started`). If nothing is merged or tagged
+     and there is no `merge_started`, the run stopped before merging and the
+     batch is rolled back. With `merge_started` it halts.
    - If only some are, the runner halts and notifies Zak.
    - Pairs that never have PRs (baseline before it passes, calibration,
      experiments) always roll back.
@@ -619,7 +626,7 @@ before the next starts:
    | Location off | FAIL (GPS) |
    | Software decoder forced | FAIL (video) |
    | `input text` instead of taps | FAIL (keyboard) |
-   | Torch LED disabled below the HAL for the whole capture, even though the request still asks for the torch. Use `led:switch_*`, or `led:flash_*`/`led:torch_*` brightness 0 if the HAL doesn't rewrite it. | FAIL, because the two stills show no difference |
+   | Torch LED disabled below the HAL for the whole capture, even though the request still asks for the torch. A `led:switch_*` write alone doesn't hold: the torch request's next positive brightness write re-enables the switch (`leds-qpnp-flash-v2.c:1753`). So `max_brightness` is set to 0 on every `led:torch_*`/`led:flash_*` node (the LED core clamps the camera's trigger writes to it) and read back right after the capture; the control qualifies only if it still reads 0 then. | FAIL, because the two stills show no difference |
    | Bad NTP server, set **after** a successful sync, then reset with `reset_server_config_for_tests` | FAIL (time) |
    | Wi-Fi off | FAIL |
    | Host Bluetooth adapter rfkilled; the harness never powers the adapter itself | UNVERIFIED, because it's a fixture problem and not the batch's fault |
@@ -636,7 +643,7 @@ before the next starts:
    | `boot_id` changed | FAIL |
    | Alarm checked 1 minute early | FAIL |
    | `navigation_mode` 0, or HOME pointed elsewhere | FAIL (gestures) |
-   | Camera set changed in `batch.json` | UNVERIFIED |
+   | Camera set changed in `batch.json` | UNVERIFIED (and a batch with an approved `camera_set_change` is never eligible) |
    | An extra reboot planted before boot completes (first boot and a bench boot) | FAIL |
    | An extra bootloader pass with no kernel session (`fastboot reboot bootloader`, then `fastboot reboot` straight away), inside a planned reboot. The clock starts at the disconnect that begins the injected pass, and those enumerations are marked planned. | FAIL, through the uptime check itself |
    | Tag pushed, then the host killed before `slot-state.json` was updated | Recovery promotes the batch and does not roll back |
@@ -851,14 +858,28 @@ reset, mapped onto host time:
    marker's own printk timestamp back from `dmesg` straight away. That pairs
    host time with printk time. `/proc/uptime` (`CLOCK_BOOTTIME`) is not used
    for the pairing, because printk uses `local_clock`. A write that takes
-   longer than 0.3 s is retried; if it can't be bracketed or read back, the
-   boot has no pairing and its uptime signal is UNVERIFIED.
+   longer than 0.3 s is retried. Every attempt writes a new marker with its
+   own nonce, and the write's exit status is checked (all copies chained with
+   `&&`). A failed write is never paired and never becomes the leaving
+   marker, and the readback looks for that attempt's nonce only, so a retry
+   can't pair an older write's printk time with a newer host interval. If no
+   write can be bracketed and read back, the boot has no pairing and its
+   uptime signal is UNVERIFIED.
 2. **Bit flips can't move the anchor later.** At the next boot completion,
-   the previous kernel's log in pstore gives the reset time: the last
-   timestamp after the marker that ends 3 consecutive non-decreasing stamps
-   spanning at most 1 s. A flipped stamp that still parses (120 → 128,
-   41.1 → 45.1) breaks the run, so it is ignored, and the anchor can only
-   move earlier. The anchor must not precede the marker. Its host time must
+   the previous kernel's log in pstore gives the reset time: the **earliest**
+   stamp of the last run of 3 consecutive non-decreasing stamps after the
+   marker that spans at most 1 s. A flipped stamp that leaves the window
+   (120 → 128, 41.1 → 45.1) breaks the run. One that stays inside it
+   (110.000000 → 110.400000 after 109.7 and 109.9) can end a run, but the
+   run's first stamp is a true stamp or, if it is the flipped one, no later
+   than the true stamp after it. So one flip never moves the anchor past the
+   true last stamp. The marker's own timestamp in pstore (tolerant parse)
+   must match the live readback within 50 ms; otherwise the readback and the
+   log are not the same write, and the result is UNVERIFIED. The gap from the
+   marker to the reset is measured inside pstore, from that pstore stamp, so
+   both values come from one log on one clock; the live/pstore difference is
+   added to the pairing's uncertainty. The anchor must not precede the
+   marker. Its host time must
    fall between the USB disconnect and the disconnect plus the largest
    shutdown tail calibration measured, allowing for the pairing's
    uncertainty. Of the possible host times, the earliest is used. Anything
@@ -876,9 +897,22 @@ reset, mapped onto host time:
 
 **Calibration.** Step 1 (`phone-qa boot-timing`) sets A on the adb path only
 from reboots that got an anchor, and records their shutdown tails
-(disconnect to reset); the largest is the bound in rule 2. The proofs are as
-before: a normal boot must pass and an injected extra pass must be rejected
-by the uptime check itself, both on the anchored clock.
+(disconnect to reset); the largest is the bound in rule 2. The bound must
+include the first adb reboot after a wipe, which is every batch's first bench
+boot and has the longest tail. So step 1 runs straight after `flash --wipe`,
+its first adb reboot is that reboot (one `SYSTEM_BOOT` in dropbox), and the
+bound is set only if that reboot got an anchor. Otherwise the adb path has no
+bound and its uptime signal stays UNVERIFIED. A later boot with a slower tail
+is UNVERIFIED, never PASS. The proofs are as before: a normal boot must pass
+and an injected extra pass must be rejected by the uptime check itself, both
+on the anchored clock. `phone-qa controls --boot-timing` runs the proofs
+again with the recorded A and bound, so they can be renewed under the final
+harness version (README, "Order of qualification").
+
+**Reading pstore.** The boot judge reads pstore through a binary-safe read
+that carries the remote status (base64 over the shell protocol, with a size
+check against `stat` and a closing count). A failed or partial read makes the
+chain UNVERIFIED and the boot's combined verdict UNVERIFIED on every path.
 
 **Cost.** The adb-path uptime signal now depends on a readable pstore log,
 so it is less independent of the kernel-log chain than before. The boot count
@@ -886,4 +920,29 @@ is still independent of both.
 
 **Phone runs still needed.** Re-run step 1 on the phone: a normal first boot
 after a wipe, later adb boots, and both injected controls on each path.
+
+## Code review round 2: changes to the amendment and the design
+
+Council code review round 2 (Opus and Gemini approved, Sol objected) asked
+for the A1 changes above (earliest corroborated stamp, the pstore marker
+check, one verified write per attempt, the gap measured in pstore, the
+first-after-wipe tail) and these:
+
+- **A7, camera-set changes are manual.** A batch whose `batch.json` has
+  `camera_set_change` is never eligible: "camera set change: Zak merges by
+  hand". Removing a camera is removing a must-work item, which needs Zak.
+  `hardware.cameras` still verifies the approval and the new set, and the
+  result stays in the report as evidence.
+- **C1, promotion bound to the tested commit set,** and `merge_started` for
+  recovery (see "Recovery checks GitHub first").
+- **Controls credited only for their own fault.** The extra-reboot controls
+  need the injected boot's own signal record (row key and `boot_id`) to be
+  rejected; a missed injection never matches; `bt-rfkill` needs a valid
+  powered-adapter report replaced by the stub; the torch control is held at
+  `max_brightness` 0; every mode except `control` fails on a control
+  override.
+- **A8 gestures** need `isConnected=true` and `mBound=true` for Perch;
+  `mIsEnabled` alone doesn't count. **A9 alarm** samples carry dumpsys's own
+  status; an unreadable sample is no evidence; absence needs a successful
+  sample finished by target − 10 s.
 
