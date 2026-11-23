@@ -3,6 +3,7 @@ and verifies what it did."""
 
 from __future__ import annotations
 
+import re
 import shlex
 import time
 
@@ -34,7 +35,10 @@ def _bt_enabled(run, e):
         dev.sh("cmd bluetooth_manager enable; cmd bluetooth_manager wait-for-state:STATE_ON", timeout=30)
     else:
         dev.sh("cmd bluetooth_manager disable; cmd bluetooth_manager wait-for-state:STATE_OFF", timeout=30)
-    on = "enabled: true" in dev.sh("dumpsys bluetooth_manager")
+    r = dev.read("dumpsys bluetooth_manager")
+    if not r.ok or "enabled:" not in r.out:
+        return False, f"bluetooth state unreadable (exit {r.rc})"
+    on = "enabled: true" in r.out
     return on == (e["original"] == "true"), f"bluetooth {'on' if on else 'off'}"
 
 
@@ -98,6 +102,8 @@ def _usb_functions(run, e):
     run.dev.wait_for_device(60)
     rc, out, err = run.dev.sh_rc("svc usb getFunctions")
     now = (out + err).strip()
+    if rc != 0:
+        return False, f"usb functions unreadable (exit {rc}: {now!r})"
     return now == orig.strip(), f"usb functions {now!r}"
 
 
@@ -117,59 +123,98 @@ BAD_NTP_HOST = "192.0.2.1"   # the bad-ntp control's server (TEST-NET-1)
 
 
 def _ntp(run, e):
-    """Reset the test server config, then verify the dump no longer names
-    the control's server."""
+    """Reset the test server config, then verify the dump says so directly:
+    NtpTrustedTime prints mNtpConfigForTests=null once no test config is
+    set (review round 2), and the control's server is gone."""
     rc, out, err = run.dev.sh_rc("cmd network_time_update_service reset_server_config_for_tests")
     r = run.dev.read("dumpsys network_time_update_service")
-    ok = rc == 0 and r.ok and bool(r.out.strip()) and BAD_NTP_HOST not in r.out
-    return ok, f"NTP server config {'reset' if ok else 'NOT verified reset'} (exit {rc}, dump exit {r.rc})"
+    cleared = r.ok and re.search(r"^\s*mNtpConfigForTests=null\s*$", r.out, re.M) is not None
+    ok = rc == 0 and cleared and BAD_NTP_HOST not in r.out
+    return ok, (f"NTP test config {'cleared' if ok else 'NOT verified cleared'} (exit {rc}, dump exit {r.rc}, "
+                f"mNtpConfigForTests=null {'seen' if cleared else 'not seen'})")
 
 
 def _wifi(run, e):
     run.dev.sh(f"cmd wifi set-wifi-enabled {e['original']}")
     time.sleep(5)
-    on = "Wifi is enabled" in run.dev.sh("cmd wifi status")
+    r = run.dev.read("cmd wifi status")
+    if not r.ok or not re.search(r"Wifi is (enabled|disabled)", r.out):
+        return False, f"wifi state unreadable (exit {r.rc})"
+    on = "Wifi is enabled" in r.out
     return on == (e["original"] == "enabled"), f"wifi {'enabled' if on else 'disabled'}"
 
 
 def _sysfs(run, e):
     run.dev.sh(f"echo {shlex.quote(str(e['original']))} > {shlex.quote(e['key'])}")
-    now = run.dev.sh(f"cat {shlex.quote(e['key'])}").strip()
-    return now == str(e["original"]), f"{e['key']}={now}"
+    r = run.dev.read(f"cat {shlex.quote(e['key'])}")
+    now = r.out.strip()
+    return r.ok and now == str(e["original"]), f"{e['key']}={now if r.ok else 'unreadable'}"
 
 
 def _package(run, e):
     if e["key"] == "river.qa":
         return True, "helper is uninstalled last, by cleanup"
     run.dev.sh(f"pm uninstall {e['key']}", timeout=60)
-    gone = e["key"] not in run.dev.sh(f"pm list packages {e['key']}")
+    r = run.dev.read(f"pm list packages {e['key']}", timeout=60)
+    if not r.ok:
+        return False, f"{e['key']}: package list unreadable (exit {r.rc}), not proof it is gone"
+    gone = f"package:{e['key']}" not in r.out.split()
     return gone, f"{e['key']} {'uninstalled' if gone else 'still installed'}"
+
+
+def live_alarms(dump: str) -> str | None:
+    """The part of `dumpsys alarm` that lists live alarms: the pending
+    alarms and the user-blocked background alarms, up to "Pending alarms per
+    uid". The removal history further down names cleared alarms and is not
+    included (review round 2). None if the dump doesn't have that shape."""
+    end = dump.find("Pending alarms per uid")
+    if end < 0:
+        return None
+    m = re.search(r"^\s*\d+ pending alarms:|^\s*Pending user blocked background alarms:", dump, re.M)
+    if m is None or m.start() > end:
+        return None
+    return dump[m.start():end]
 
 
 def _alarm(run, e):
     # A dismissed alarm stays in DeskClock's database; the test phone has no
     # alarms of its own, so clear DeskClock. Verified: pm clear printed
-    # Success and dumpsys alarm lists nothing for DeskClock afterwards.
+    # Success and no live alarm belongs to DeskClock afterwards.
     run.dev.sh("am force-stop com.android.deskclock")
     rc, out, _ = run.dev.sh_rc("pm clear com.android.deskclock")
     r = run.dev.read("dumpsys alarm")
-    left = r.out.count("com.android.deskclock") if r.ok else None
+    live = live_alarms(r.out) if r.ok else None
+    left = live.count("com.android.deskclock") if live is not None else None
     ok = rc == 0 and "Success" in out and left == 0
-    return ok, f"DeskClock {'cleared' if ok else 'NOT cleared'} (pm clear: {out.strip() or rc}, alarm entries {left})"
+    return ok, (f"DeskClock {'cleared' if ok else 'NOT cleared'} (pm clear: {out.strip() or rc}, "
+                f"live alarm entries {'unreadable' if left is None else left})")
 
 
 def _marker(run, e):
     run.dev.sh(f"rm -f {shlex.quote(e['key'])}")
-    gone = run.dev.sh(f"[ -e {shlex.quote(e['key'])} ] && echo yes || echo no").strip() == "no"
-    return gone, f"{e['key']} {'removed' if gone else 'still there'}"
+    r = run.dev.read(f"[ -e {shlex.quote(e['key'])} ] && echo yes || echo no")
+    gone = r.ok and r.out.strip() == "no"
+    return gone, f"{e['key']} {'removed' if gone else 'still there or unreadable'}"
+
+
+def _proc_stat(run, pid) -> str | None:
+    """/proc/<pid>/stat, "" if the process is gone, None if unreadable."""
+    r = run.dev.read(f"if [ -e /proc/{int(pid)} ]; then cat /proc/{int(pid)}/stat; else echo __GONE__; fi")
+    if not r.ok:
+        return None
+    return "" if r.out.strip() == "__GONE__" else r.out
 
 
 def _watchdog(run, e):
     pid, ex = e["key"], e.get("extra") or {}
     st = run.dev.boot_status()
-    if not st or st.boot_id != ex.get("boot_id"):
+    if not st:
+        return False, "cannot read boot_id: not proof the watchdog is from an earlier boot"
+    if st.boot_id != ex.get("boot_id"):
         return True, "watchdog belonged to an earlier boot"
-    stat = run.dev.sh(f"cat /proc/{pid}/stat 2>/dev/null")
+    stat = _proc_stat(run, pid)
+    if stat is None:
+        return False, f"/proc/{pid} unreadable: not proof the watchdog is gone"
     if not stat:
         return True, "watchdog already gone"
     start = stat.rsplit(")", 1)[1].split()[19]
@@ -177,8 +222,9 @@ def _watchdog(run, e):
         return True, "PID reused by another process; not killing"
     run.dev.sh(f"kill {pid}")
     time.sleep(0.5)
-    alive = bool(run.dev.sh(f"cat /proc/{pid}/stat 2>/dev/null"))
-    return not alive, f"watchdog {pid} {'killed' if not alive else 'still alive'}"
+    after = _proc_stat(run, pid)
+    gone = after == ""
+    return gone, f"watchdog {pid} {'killed' if gone else 'still alive or unreadable'}"
 
 
 def _bond(run, e):
@@ -194,8 +240,10 @@ def _bond(run, e):
     ok_host = True
     if phone_addr:
         host_run(["bluetoothctl", "remove", phone_addr], timeout=20)
-        info = host_run(["bluetoothctl", "info", phone_addr], timeout=20).stdout
-        ok_host = "Paired: yes" not in info
+        # The list of known devices, with its status: a failed listing is not
+        # proof the bond is gone.
+        r = host_run(["bluetoothctl", "devices"], timeout=20)
+        ok_host = r.returncode == 0 and phone_addr.upper() not in (r.stdout or "").upper()
     return ok_phone and ok_host, f"bond removed: phone {ok_phone}, host {ok_host}"
 
 
@@ -207,8 +255,11 @@ def _bt_discoverable(run, e):
 
 def _adb_reverse(run, e):
     run.dev.adb("reverse", "--remove", f"tcp:{e['key']}", timeout=20)
-    left = run.dev.adb("reverse", "--list", timeout=20).stdout
-    return f"tcp:{e['key']} " not in left, f"adb reverse tcp:{e['key']} removed"
+    r = run.dev.adb("reverse", "--list", timeout=20)
+    if r.returncode != 0:
+        return False, f"adb reverse --list failed (exit {r.returncode}): not proof tcp:{e['key']} is gone"
+    gone = f"tcp:{e['key']} " not in (r.stdout or "")
+    return gone, f"adb reverse tcp:{e['key']} {'removed' if gone else 'still there'}"
 
 
 def _gvfs(run, e):
@@ -216,7 +267,10 @@ def _gvfs(run, e):
         host_run(["gio", "mount", "-u", e["key"]], timeout=90)
     except TimeoutError:
         pass
-    left = e["key"].rstrip("/") in host_run(["gio", "mount", "-l"], timeout=20).stdout
+    r = host_run(["gio", "mount", "-l"], timeout=20)
+    if r.returncode != 0:
+        return False, f"gio mount -l failed (exit {r.returncode}): not proof {e['key']} is unmounted"
+    left = e["key"].rstrip("/") in (r.stdout or "")
     return not left, f"{e['key']} {'still mounted' if left else 'unmounted'}"
 
 
@@ -255,6 +309,13 @@ def recover_journal(run) -> tuple[list, list, list]:
             continue  # uninstalled last
         ok, msg = restore_entry(run, e)
         (done if ok else failed).append(msg)
+    # Entries created during recovery (a hidden_api_policy whose restore
+    # failed, for one) get one more pass.
+    planned = {x["id"] for x in restore}
+    for e in [x for x in run.journal.entries if x["id"] not in planned
+              and not (x["kind"] == "package" and x["key"] == "river.qa")]:
+        ok, msg = restore_entry(run, e)
+        (done if ok else failed).append(msg)
     helper_left = run.journal.find(jmod.RESOURCE, "package", "river.qa")
     if helper_left and not failed:
         from . import helper
@@ -262,7 +323,11 @@ def recover_journal(run) -> tuple[list, list, list]:
             done.append("helper uninstalled")
         else:
             failed.append("helper still installed")
-    left = [e for e in run.journal.entries if e["id"] in {x["id"] for x in restore}]
-    if left and not failed:
-        failed.append(f"{len(left)} entries still unresolved: " + ", ".join(f"{e['kind']} {e['key']}" for e in left))
+    # Reread the whole journal from disk: preflight goes on only if it is
+    # empty, whatever created the entries (review round 2).
+    left = jmod.Journal(run.journal.path, run.journal.qa_home).entries
+    if left:
+        failed.append(f"journal not empty after recovery ({len(left)} entries): " +
+                      ", ".join(f"{e['kind']} {e['key']}" for e in left))
+    run.journal.entries = left
     return done, drop, failed

@@ -85,6 +85,14 @@ class FakeRun:
         return None
 
 
+def alarm_dump(live="", history=""):
+    """`dumpsys alarm` in the shape AlarmManagerService prints it."""
+    pending = f"1 pending alarms: \n  {live}\n" if live else ""
+    return ("Current Alarm Manager state:\n  Settings:\n\n" + pending +
+            "\nPending user blocked background alarms: \n  none\n\nPending alarms per uid: []\n\n"
+            "Removal history:\n" + history + "\nAlarm Stats:\n")
+
+
 class Handlers(unittest.TestCase):
     """Each restoration is verified before its entry is resolved (C4)."""
 
@@ -97,19 +105,86 @@ class Handlers(unittest.TestCase):
         return ok, msg, left
 
     def test_alarm_needs_success_and_no_alarm_left(self):
-        good = FakeShell({r"^pm clear": (0, "Success\n"), r"^dumpsys alarm$": (0, "Alarm Stats:\n")})
+        good = FakeShell({r"^pm clear": (0, "Success\n"), r"^dumpsys alarm$": (0, alarm_dump())})
         self.assertEqual(self.restore(good, "alarm", "river-qa-1", where=j.RESOURCE)[::2], (True, 0))
-        failed = FakeShell({r"^pm clear": (1, "Failed\n"), r"^dumpsys alarm$": (0, "")})
+        failed = FakeShell({r"^pm clear": (1, "Failed\n"), r"^dumpsys alarm$": (0, alarm_dump())})
         self.assertEqual(self.restore(failed, "alarm", "river-qa-1", where=j.RESOURCE)[::2], (False, 1))
         still = FakeShell({r"^pm clear": (0, "Success\n"),
-                           r"^dumpsys alarm$": (0, "RTC_WAKEUP #0: Alarm{1 com.android.deskclock}\n")})
+                           r"^dumpsys alarm$": (0, alarm_dump(live="RTC_WAKEUP #0: Alarm{1 com.android.deskclock}"))})
         self.assertEqual(self.restore(still, "alarm", "river-qa-1", where=j.RESOURCE)[::2], (False, 1))
         unreadable = FakeShell({r"^pm clear": (0, "Success\n"), r"^dumpsys alarm$": (1, "")})
         self.assertFalse(self.restore(unreadable, "alarm", "river-qa-1", where=j.RESOURCE)[0])
+        # Exit 0 but not an alarm dump: no proof either.
+        odd = FakeShell({r"^pm clear": (0, "Success\n"), r"^dumpsys alarm$": (0, "Alarm Stats:\n")})
+        self.assertFalse(self.restore(odd, "alarm", "river-qa-1", where=j.RESOURCE)[0])
+
+    def test_cleared_alarm_in_the_removal_history_does_not_block(self):
+        dump = alarm_dump(history="  u0a50:\n    #1: rtc_wakeup, com.android.deskclock, removed by pm clear\n")
+        dev = FakeShell({r"^pm clear": (0, "Success\n"), r"^dumpsys alarm$": (0, dump)})
+        self.assertEqual(self.restore(dev, "alarm", "river-qa-1", where=j.RESOURCE)[::2], (True, 0))
+        self.assertIsNone(restore.live_alarms("Removal history:\n"))
+
+    def test_failed_reads_are_never_proof_of_absence(self):
+        # pm list packages failed: the package is not proven uninstalled.
+        dev = FakeShell({r"^pm list packages": (1, "")})
+        self.assertEqual(self.restore(dev, "package", "com.example", where=j.RESOURCE)[::2], (False, 1))
+        dev = FakeShell({r"^pm list packages": (0, "package:com.example.other\n")})
+        self.assertEqual(self.restore(dev, "package", "com.example", where=j.RESOURCE)[::2], (True, 0))
+        # adb reverse --list failed.
+        dev = FakeShell()
+        dev.adb = lambda *a, timeout=20: unittest.mock.Mock(returncode=1, stdout="")
+        self.assertEqual(self.restore(dev, "adb_reverse", "8080", where=j.RESOURCE)[::2], (False, 1))
+        dev.adb = lambda *a, timeout=20: unittest.mock.Mock(returncode=0, stdout="")
+        self.assertEqual(self.restore(dev, "adb_reverse", "8080", where=j.RESOURCE)[::2], (True, 0))
+        # Wi-Fi and Bluetooth state unreadable while restoring "off".
+        dev = FakeShell({r"^cmd wifi status": (1, "")})
+        with unittest.mock.patch.object(restore.time, "sleep", lambda s: None):
+            self.assertFalse(self.restore(dev, "wifi", "wifi", "disabled")[0])
+        dev = FakeShell({r"^dumpsys bluetooth_manager": (1, "")})
+        self.assertFalse(self.restore(dev, "bt_enabled", "bt", "false")[0])
+        # The marker check itself failed.
+        dev = FakeShell({r"^\[ -e": (1, "")})
+        self.assertFalse(self.restore(dev, "marker_file", "/data/local/tmp/x", where=j.RESOURCE)[0])
+        # Host bond listing failed.
+        with unittest.mock.patch.object(restore, "_needs_helper", lambda run: True), \
+                unittest.mock.patch("riverqa.helper.instrument",
+                                    lambda *a, **k: unittest.mock.Mock(get=lambda k, d=None: "10")), \
+                unittest.mock.patch.object(restore, "host_run",
+                                           lambda cmd, timeout: unittest.mock.Mock(returncode=1, stdout="")):
+            with tempfile.TemporaryDirectory() as d:
+                run = FakeRun(FakeShell({r"hidden_api_policy": (0, "1\n")}), d)
+                e = run.journal.record(j.RESOURCE, "bt_bond", "AA:BB", None, extra={"phone_addr": "CC:DD"})
+                self.assertFalse(restore.restore_entry(run, e)[0])
+
+    def test_watchdog_unreadable_is_not_gone(self):
+        from riverqa.device import BootStatus
+
+        class Dev(FakeShell):
+            def boot_status(self):
+                return BootStatus("B", True, 1.0, 0.0, 0.0)
+        def restore_wd(dev):
+            with tempfile.TemporaryDirectory() as d:
+                run = FakeRun(dev, d)
+                e = run.journal.record(j.RESOURCE, "watchdog", "123", None, extra={"boot_id": "B", "start": "9"})
+                return restore.restore_entry(run, e)[0]
+        self.assertFalse(restore_wd(Dev({r"/proc/": (1, "")})))
+        self.assertTrue(restore_wd(Dev({r"/proc/": (0, "__GONE__\n")})))
+
+        class NoStatus(FakeShell):
+            def boot_status(self):
+                return None
+        self.assertFalse(restore_wd(NoStatus()))
 
     def test_ntp_is_verified(self):
-        good = FakeShell({r"dumpsys network_time_update_service": (0, "mServerConfig=ntp://time.android.com\n")})
+        good = FakeShell({r"dumpsys network_time_update_service":
+                          (0, "mServerConfig=ntp://time.android.com\n  mNtpConfigForTests=null\n")})
         self.assertTrue(self.restore(good, "ntp", "ntp")[0])
+        # The bad host is gone but a test config is still set.
+        other = FakeShell({r"dumpsys network_time_update_service":
+                           (0, "  mNtpConfigForTests=NtpConfig{mServerUris=[ntp://198.51.100.1]}\n")})
+        self.assertFalse(self.restore(other, "ntp", "ntp")[0])
+        silent = FakeShell({r"dumpsys network_time_update_service": (0, "mServerConfig=ntp://time.android.com\n")})
+        self.assertFalse(self.restore(silent, "ntp", "ntp")[0])
         stuck = FakeShell({r"dumpsys network_time_update_service": (0, "server=ntp://192.0.2.1\n")})
         self.assertEqual(self.restore(stuck, "ntp", "ntp")[::2], (False, 1))
         unreadable = FakeShell({r"dumpsys network_time_update_service": (1, "")})
@@ -144,7 +219,7 @@ class Handlers(unittest.TestCase):
                 unittest.mock.patch.object(restore, "_needs_helper", lambda run: True), \
                 unittest.mock.patch("riverqa.helper.instrument", instrument), \
                 unittest.mock.patch.object(restore, "host_run",
-                                           lambda cmd, timeout: unittest.mock.Mock(stdout="Paired: no\n")):
+                                           lambda cmd, timeout: unittest.mock.Mock(returncode=0, stdout="")):
             run = FakeRun(dev, d)
             e = run.journal.record(j.RESOURCE, "bt_bond", "AA:BB", None, extra={"phone_addr": "CC:DD"})
             ok, _ = restore.restore_entry(run, e)
@@ -152,6 +227,23 @@ class Handlers(unittest.TestCase):
             self.assertEqual(run.journal.entries, [])   # its own policy entry was restored too
         self.assertEqual(seen, ["1"])
         self.assertEqual(state["policy"], "null")
+
+    def test_recovery_rereads_the_whole_journal(self):
+        # A handler leaves a new entry behind (as a failed hidden_api_policy
+        # restore would): preflight must not go on.
+        dev = FakeShell({r"^pm clear": (0, "Success\n"), r"^dumpsys alarm$": (0, alarm_dump())})
+        with tempfile.TemporaryDirectory() as d:
+            run = FakeRun(dev, d)
+            run.journal.record(j.RESOURCE, "alarm", "river-qa-1", None)
+            real = restore.HANDLERS["alarm"]
+
+            def leaky(run_, e):
+                run_.journal.record(j.PHONE, "setting", "global/hidden_api_policy", "0")
+                return real(run_, e)
+            with unittest.mock.patch.dict(restore.HANDLERS, {"alarm": leaky}):
+                done, drop, failed = restore.recover_journal(run)
+            self.assertTrue(any("journal not empty" in f for f in failed), failed)
+            self.assertEqual(len(j.Journal(run.journal.path, run.journal.qa_home).entries), 1)
 
     def test_recovery_reports_anything_left(self):
         dev = FakeShell({r"^pm clear": (1, "Failed\n")})
