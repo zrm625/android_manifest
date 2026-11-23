@@ -239,8 +239,9 @@ def check_images(images_dir: Path, expected: dict | None) -> dict:
 
 
 class WipeFailed(RuntimeError):
-    """``fastboot erase userdata`` failed after ``--set-active``: the target
-    slot is active and unwiped (R10-5)."""
+    """``fastboot erase userdata`` failed or timed out after
+    ``--set-active`` (R10-5), or ``--set-active`` itself timed out (R11-2):
+    the target slot is, or may be, active and its wipe is not confirmed."""
 
 
 def write_images(dev: Device, images_dir: Path, target: str, wipe: bool, attempt: dict,
@@ -257,12 +258,21 @@ def write_images(dev: Device, images_dir: Path, target: str, wipe: bool, attempt
     for name in IMAGES:
         log(f"  flash {name}_{target}")
         dev.fastboot_ok("flash", f"{name}_{target}", str(images_dir / f"{name}.img"), timeout=600)
-    dev.fastboot_ok(f"--set-active={target}", timeout=60)
+    try:
+        dev.fastboot_ok(f"--set-active={target}", timeout=60)
+    except TimeoutError as e:
+        # R11-2: a timeout leaves it unknown whether slot target is active.
+        raise WipeFailed(f"fastboot --set-active={target} timed out; slot {target} may be active"
+                         + ("" if not wipe else " and userdata was not erased") + f": {e}") from e
     if wipe:
         # Not fastboot -w: river's bootloader also tries to erase a metadata
         # partition the phone doesn't have, and fails.
         log("  erase userdata")
-        r = dev.fastboot("erase", "userdata", timeout=300)
+        try:
+            r = dev.fastboot("erase", "userdata", timeout=300)
+        except TimeoutError as e:
+            # R11-2: slot target is active; whether userdata was erased is unknown.
+            raise WipeFailed(f"fastboot erase userdata timed out; the wipe status is unknown: {e}") from e
         if r.returncode != 0:
             raise WipeFailed(f"fastboot erase userdata failed: {(r.stderr or r.stdout).strip()[-300:]}")
         seq = journal.record_wipe(qa_home(), attempt["attempt_id"], "flash")
@@ -336,6 +346,14 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         target = slots.other(current)
     else:
         return recovery_halt(fbmode.SlotUnreadable(dev.serial, got, source))
+    if st is None and owed is not None and fbmode.armed_slot(owed) is None and source != "getprop":
+        # R11-1: an entry from before round 8 records no slot, so nothing
+        # says which slot still boots. Only a phone found running Android
+        # proves its active slot boots, making the other slot a safe target.
+        return recovery_halt(RuntimeError(
+            f"slot {current} is active but the phone is in fastboot, and the pending fb_mode obligation records "
+            "no slot; with no known-good slot yet, nothing shows which slot still boots. Not writing either"),
+            advice=armed_way_back(owed, current))
     if st is None and owed is not None and fbmode.armed_slot(owed) == target:
         # R10-3: before the first baseline the armed slot is the only slot
         # known to boot. Refused before anything is cleared or written.
@@ -377,9 +395,12 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
             return recovery_halt(e, advice=f"The fb_mode obligation stays pending. Clear it by hand (fastboot -s "
                                  f"{SERIAL} oem fb_mode_clear), then run the flash again.")
         if isinstance(e, WipeFailed):
-            # R10-5: slot target is active and unwiped; always a halt.
-            return recovery_halt(RuntimeError(f"the dev flash of slot {target} stopped after --set-active: {e}"),
-                                 advice=f"Slot {target} is active and userdata was not erased. " + (
+            # R10-5, R11-2: slot target is (or may be) active and its wipe is
+            # not confirmed; always a halt.
+            return recovery_halt(RuntimeError(f"the dev flash of slot {target} stopped at --set-active or the "
+                                              f"wipe: {e}"),
+                                 advice=f"Slot {target} is, or may be, active, and its userdata wipe is not "
+                                 "confirmed. " + (
                                      way_back(target) if fbmode.pending() is not None else
                                      f"Erase it by hand (fastboot -s {SERIAL} erase userdata, then fastboot -s "
                                      f"{SERIAL} reboot), or go back with fastboot -s {SERIAL} --set-active={back}."))
@@ -451,15 +472,24 @@ def armed_way_back(e: dict | None, active: str | None) -> str:
     (it needs slot-state.json). ``active`` is the active slot if known."""
     slot = fbmode.armed_slot(e or {})
     if slot is None:
-        return ("The fb_mode obligation stays pending. It records no slot (armed before round 8): a dev flash that "
-                "boots (flash stripped, without --no-reboot) settles it once it has verified the slot it writes.")
+        # R11-1: the entry doesn't say which slot still boots, so no flash
+        # is advised until the operator has found one by hand and left it
+        # active (a dev flash then writes the other slot).
+        return ("The fb_mode obligation stays pending. It records no slot (armed before round 8), so the harness "
+                "can't tell which slot still boots, and it advises no flash until you have found one. In fastboot: "
+                f"fastboot -s {SERIAL} oem fb_mode_clear, then for a slot X, fastboot -s {SERIAL} --set-active=X "
+                f"and fastboot -s {SERIAL} reboot, and check that X reaches Android. If one does, leave it active "
+                "and run flash stripped (without --no-reboot): it writes the other slot and settles the "
+                "obligation once that boot is verified. If no slot boots, stop and tell Zak: don't flash.")
     if active == slot:
         first = ""
     elif active:
-        first = f"set slot {slot} active by hand (fastboot -s {SERIAL} --set-active={slot}), then "
+        first = (f"set slot {slot} active by hand (from Android, adb -s {SERIAL} reboot bootloader first; then "
+                 f"fastboot -s {SERIAL} --set-active={slot}), then ")
     else:
         first = (f"if fastboot -s {SERIAL} getvar current-slot reports another slot, set slot {slot} active by "
-                 f"hand (fastboot -s {SERIAL} --set-active={slot}), then ")
+                 f"hand (from Android, adb -s {SERIAL} reboot bootloader first; then fastboot -s {SERIAL} "
+                 f"--set-active={slot}), then ")
     try:
         fbmode.armed_want(e)
         then = (f"run phone-qa recover: it boots slot {slot}, verifies it against the armed identity and settles "

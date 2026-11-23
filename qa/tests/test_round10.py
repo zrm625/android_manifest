@@ -378,9 +378,39 @@ class R10_5EraseFailure(unittest.TestCase):
                     p.fastboot = fastboot
                     rc, err = dev_flash(p, *argv, reboot=reboot)
                     self.assertEqual(rc, flashing.EXIT_HALT, err)
-                    self.assertIn("Slot b is active and userdata was not erased", err)
+                    self.assertIn("Slot b is, or may be, active, and its userdata wipe is not confirmed", err)
                     self.assertIn("--set-active=a", err)
                     self.assertEqual(p.active, "b")
+
+
+class R11_2WriteTimeouts(unittest.TestCase):
+    def test_set_active_or_erase_timeout_halts(self):
+        """Sol round 11: a timeout of --set-active or of the erase raised
+        TimeoutError past WipeFailed. At 0fb68fa: exit 1, and with
+        --no-reboot no way back."""
+        for step in ("set-active", "erase"):
+            for argv, reboot in ((("--wipe", "--no-reboot"), None), (("--wipe",), booting_reboot)):
+                for st in (True, False):
+                    with self.subTest(step=step, argv=argv, state=st), bench_home():
+                        if st:
+                            state(pair_kind=None)
+                        p = R9Phone(where="fastboot", active="a", bootable=("a", "b"))
+                        real, real_ok = p.fastboot, p.fastboot_ok
+
+                        def fastboot(*args, timeout=120, real=real, step=step):
+                            if step == "erase" and args[:2] == ("erase", "userdata"):
+                                raise TimeoutError("fastboot erase userdata: timed out after 300 s")
+                            return real(*args, timeout=timeout)
+
+                        def fastboot_ok(*args, timeout=300, real_ok=real_ok, step=step):
+                            if step == "set-active" and args[:1] == ("--set-active=b",):
+                                raise TimeoutError("fastboot --set-active=b: timed out after 60 s")
+                            return real_ok(*args, timeout=timeout)
+                        p.fastboot, p.fastboot_ok = fastboot, fastboot_ok
+                        rc, err = dev_flash(p, *argv, reboot=reboot)
+                        self.assertEqual(rc, flashing.EXIT_HALT, err)
+                        self.assertIn("Slot b is, or may be, active, and its userdata wipe is not confirmed", err)
+                        self.assertIn("--set-active=a", err)
 
 
 class R10_6Minors(unittest.TestCase):

@@ -153,13 +153,37 @@ class Round9Majors(unittest.TestCase):
         At 100df60 recover(boot=False) asked for the armed identity first
         and halted (3)."""
         with bench_home():
-            p = R9Phone(where="fastboot", active="a", bootable=("a", "b"), builds={"a": BID, "b": DEV_BID})
+            # R11-1: with no slot recorded, only a phone found in Android
+            # shows which slot boots, so the case starts there.
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), builds={"a": BID, "b": DEV_BID})
             legacy_entry()
             rc, err = dev_flash(p, reboot=booting_reboot)
             self.assertEqual(rc, flashing.EXIT_OK, err)
             self.assertIsNone(fbmode.pending())
             self.assertEqual([c[2] for c in flashes(p.calls)][:1], ["boot_b"])
-            self.assertEqual(order(p.calls)[:1], ["clear"])
+            self.assertEqual([o for o in order(p.calls) if o != "reboot_adb bootloader"][:1], ["clear"])
+
+    def test_legacy_obligation_in_fastboot_writes_nothing(self):
+        """Sol round 11: no slot-state.json, an entry from before round 8,
+        slot b active in fastboot after an interrupted flash, and only slot a
+        boots. At 0fb68fa the dev flash wrote all four a partitions. Now it
+        halts before any clear or write, and its advice names no flash until
+        a slot is shown to boot."""
+        with bench_home():
+            p = R9Phone(where="fastboot", active="b", bootable=("a",), builds={"a": BID})
+            legacy_entry()
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+            self.assertEqual(flashes(p.calls), [])
+            self.assertNotIn("clear", order(p.calls))
+            self.assertIsNotNone(fbmode.pending())
+            self.assertIn("check that X reaches Android", err)
+            self.assertIn("If no slot boots, stop and tell Zak", err)
+            for argv in (("--no-reboot",),):
+                rc, err = dev_flash(p, *argv)
+                self.assertEqual(rc, flashing.EXIT_ERROR, err)
+                self.assertIn("advises no flash until you have found one", err)
+            self.assertEqual(flashes(p.calls), [])
 
     def test_recover_reads_the_armed_identity_only_to_boot(self):
         with bench_home():
