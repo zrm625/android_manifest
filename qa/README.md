@@ -102,6 +102,31 @@ The steps run in this order (DESIGN.md, "Calibration and bootstrap"):
    qualify for the current harness version, every run reports
    `eligible: false` with "controls not qualified".
 
+## Known issue: the uptime clock on the adb reboot path
+
+Found during the first baseline (`baseline-1`, 2026-11-23); it needs a
+council decision before the baseline can close.
+
+The design starts the uptime clock at the first USB disconnect after the
+reboot command, assuming that leaves Android's shutdown out. On river the USB
+gadget drops several seconds before the kernel resets, so the measured
+"bootloader pass" on the `adb reboot` path still includes a variable shutdown
+tail: 16.4-16.7 s during step 1 on the Perch build, but 20.6 s for the first
+reboot after a wipe and 14.8 s later on the baseline build. An injected extra
+bootloader pass adds only 2.3-4.3 s, so no allowance A separates them, and
+bench boot 1 of `baseline-1` FAILed `health.boot_signals` on uptime alone
+(its kernel-log chain and boot count were clean). The `fastboot` path is
+stable (10.01-10.08 s), because its clock starts at the bootloader's own
+reboot.
+
+Measured alternative (`$BENCH_HOME/qa/anchor-experiment.json`): anchor the
+clock at the old kernel's reset instead. Read a (host time, uptime) pair when
+the leaving marker is written, take the last timestamp in the previous
+kernel's pstore log, and map it to host time. That pass was 10.003-10.012 s
+on three adb reboots, and an injected pass measured 13.80 s. The cost: the
+uptime signal then depends on a readable pstore log, which makes it less
+independent of the kernel-log chain.
+
 ## One-time host setup
 
 - **Firewall for the Wi-Fi check.** The Wi-Fi check fetches a page from a

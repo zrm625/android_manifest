@@ -58,7 +58,7 @@ class BootRecord:
     boot_id: str = ""
     uptime: float = 0.0
     elapsed: float = 0.0                # host seconds from clock start to the status read
-    host_boot_seconds: float = 0.0      # from the reboot command to boot completed
+    host_boot_seconds: float = 0.0      # reboot command (after any image writes) to boot completed
     bootloader_pass: float = 0.0        # elapsed - uptime
     control: str | None = None
     usb_events: list = field(default_factory=list)
@@ -144,6 +144,7 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             planned += 1
             if in_fastboot is not None:
                 in_fastboot()
+                t_cmd = time.monotonic()  # time the boot, not the image writes
             if inject_extra_pass:
                 mark2 = w.mark()
                 dev.fastboot_ok("reboot", "bootloader", timeout=60)
