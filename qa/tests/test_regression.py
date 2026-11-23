@@ -107,14 +107,38 @@ class KnownGood(unittest.TestCase):
         self.assertEqual(lower["ram_reference"]["tag"], "kg-1")
 
     def test_running_minimum(self):
-        k = {"latest": {}, "ram_reference": {"median_mb": 1200.0, "seed": None, "tag": "a"}}
-        k2 = rg.update_on_tag(k, "b", "b", {}, ["r"], [row(1199)] * 3, [0])
-        self.assertEqual(k2["ram_reference"]["median_mb"], 1199.0)
-        k3 = rg.update_on_tag(k2, "c", "c", {}, ["r"], [row(1205)] * 3, [0])
+        # At or below 1,050 MB every batch is judged on three boots.
+        k = {"latest": {}, "ram_reference": {"median_mb": 1000.0, "seed": None, "tag": "a"}}
+        k2 = rg.update_on_tag(k, "b", "b", {}, ["r"], [row(999)] * 3, [0])
+        self.assertEqual(k2["ram_reference"]["median_mb"], 999.0)
+        k3 = rg.update_on_tag(k2, "c", "c", {}, ["r"], [row(1005)] * 3, [0])
         self.assertEqual(k3["ram_reference"]["tag"], "b")
-        k4 = rg.update_on_tag(k3, "d", "d", {}, ["r"], [row(1000)], [0])  # one boot never changes it
+        k4 = rg.update_on_tag(k3, "d", "d", {}, ["r"], [row(900)], [0])  # one boot never changes it
         self.assertEqual(k4["ram_reference"]["tag"], "b")
         self.assertEqual(k4["latest"]["tag"], "d")  # latest always replaced
+
+
+
+class ReferenceFollowsTheVerdict(unittest.TestCase):
+    def test_sol_one_boot_verdict_never_moves_the_reference(self):
+        """R5-4: reference 1,230 MB (not the seed), rows 1,200 / 1,150 /
+        1,150. Boot 1 is within 10 MB and above 1,050 MB, sizes did not grow:
+        the verdict judges boot 1 alone, so the 1,150 median it ignored must
+        not become the reference."""
+        k = kg(1230.0)
+        rows = [row(1200), row(1150), row(1150)]
+        v = rg.evaluate(rows, k)
+        self.assertFalse(v.details["three_boots_required"])
+        self.assertIsNone(v.details["median_mb"])
+        after = rg.update_on_tag(k, "kg-2", "b2", {}, ["r"], rows, [0])
+        self.assertEqual(after["ram_reference"]["median_mb"], 1230.0)
+
+    def test_three_boot_verdict_moves_it(self):
+        k = kg(1230.0)
+        rows = [row(1250), row(1150), row(1150)]                 # boot 1 > ref + 10: three boots
+        self.assertTrue(rg.evaluate(rows, k).details["three_boots_required"])
+        self.assertEqual(rg.update_on_tag(k, "kg-2", "b2", {}, ["r"], rows, [0])["ram_reference"]["median_mb"],
+                         1150.0)
 
 
 if __name__ == "__main__":

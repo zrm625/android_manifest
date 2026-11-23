@@ -63,6 +63,19 @@ def sizes_grew(system_kb: int, vendor_kb: int, known_good: dict | None) -> bool:
     return int(system_kb) > int(latest["system_used_kb"]) or int(vendor_kb) > int(latest["vendor_used_kb"])
 
 
+def ram_decision(boot_rows: list[dict], known_good: dict | None) -> tuple[bool, list[str], float | None]:
+    """The one RAM schedule decision, shared by the verdict and the
+    reference update (R5-4): (three boots required, why, median MB or
+    None). The median exists only when needs_three_boots fires and three
+    rows were measured; otherwise RAM is bench boot 1 alone and the other
+    rows count for nothing."""
+    b1 = boot_rows[0]
+    grew = sizes_grew(int(b1["system_used_kb"]), int(b1["vendor_used_kb"]), known_good)
+    required, why = needs_three_boots(mb(b1["used_ram_kb"]), known_good, grew)
+    med = median3([mb(r["used_ram_kb"]) for r in boot_rows[:3]]) if required else None
+    return required, why, med
+
+
 @dataclass
 class Verdict:
     state: str
@@ -92,7 +105,7 @@ def evaluate(boot_rows: list[dict], known_good: dict | None) -> Verdict:
     latest = (known_good or {}).get("latest")
     sys_kb, ven_kb = int(b1["system_used_kb"]), int(b1["vendor_used_kb"])
     grew = sizes_grew(sys_kb, ven_kb, known_good)
-    required, why = needs_three_boots(boot1_mb, known_good, grew)
+    required, why, med = ram_decision(boot_rows, known_good)
     details["three_boots_required"] = required
     details["three_boots_why"] = why
     # The charter's schedule (review round 4): one boot, three when a
@@ -100,7 +113,6 @@ def evaluate(boot_rows: list[dict], known_good: dict | None) -> Verdict:
     # its RAM row counts only when the three-boot rule applies; otherwise
     # the RAM verdict is bench boot 1 (adb) alone. The median then mixes
     # the adb boot with sysrq boots (DESIGN.md, R4-4).
-    med = median3([mb(r["used_ram_kb"]) for r in boot_rows[:3]]) if required else None
     details["median_mb"] = None if med is None else round(med, 1)
     details["ram_rows"] = ([f"{r.get('run_id')}#{r.get('boot')}" for r in boot_rows[:3]] if med is not None
                            else [f"{b1.get('run_id')}#{b1.get('boot')}"])
@@ -162,9 +174,11 @@ def baseline_record(tag: str | None, batch_id: str, commit_set: dict, run_ids: l
 
 def update_on_tag(known_good: dict, tag: str, batch_id: str, commit_set: dict, run_ids: list[str],
                   boot_rows: list[dict], cameras: list[int]) -> dict:
-    """known-good.json after a clean tag (the tester calls this)."""
-    rams = [mb(r["used_ram_kb"]) for r in boot_rows[:3]]
-    med = median3(rams)
+    """known-good.json after a clean tag (the tester calls this). The RAM
+    reference moves only on a median the verdict itself used (R5-4): when
+    the verdict judged RAM on bench boot 1 alone, the other rows never move
+    it, and one boot never changes it."""
+    _required, _why, med = ram_decision(boot_rows, known_good)
     b1 = boot_rows[0]
     out = dict(known_good)
     out["latest"] = {
