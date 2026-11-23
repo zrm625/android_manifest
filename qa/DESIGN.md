@@ -1015,3 +1015,10 @@ tail, otherwise UNVERIFIED; the silent tail) and these:
   The extra-reboot controls need the injection's `boot_id` to be present
   and equal to the injected row's. An injected reboot that is never seen to
   drop off USB is recorded as missed, so its control is unqualified.
+- **Enumerating the diagnostics.** The binary read's remote script checks
+  that the directory exists, is readable and lists before it expands the
+  glob. A missing or unreadable directory fails, and so does a glob that
+  matches nothing (marked as "no match"; only `pstore/*` takes that as an
+  empty pstore, because the directory was proven readable first). The glob
+  is expanded once, and a listed file that vanishes before it is read fails
+  the read; it is never skipped.

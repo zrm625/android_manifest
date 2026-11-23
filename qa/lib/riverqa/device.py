@@ -70,26 +70,45 @@ class FilesRead:
     ok: bool
     files: list
     why: str = ""
+    no_match: bool = False      # the directory was listed and the glob matched nothing
 
     @property
     def data(self) -> bytes:
         return b"".join(b for _p, b in self.files)
 
 
+B64_EXIT = {3: "a listed file vanished or could not be stat'ed", 4: "base64 failed",
+            5: "the directory is missing or unreadable", 6: "listing the directory failed",
+            7: "no file matches"}
+
+
 def b64_script(glob: str) -> str:
     """The remote side of read_files. ``glob`` is expanded by the shell, so
-    it must be a harness constant, never outside input."""
-    if not re.fullmatch(r"[A-Za-z0-9_./*-]+", glob):
+    it must be a harness constant, never outside input; wildcards are
+    allowed only in its last component.
+
+    Review round 3: the directory must exist, be readable and list (exit
+    5 or 6), and a glob that matches nothing exits 7, so neither reads as
+    an empty result. The glob is expanded once; a listed file that vanishes
+    before it is read makes stat fail (exit 3), never a quiet skip."""
+    if not re.fullmatch(r"/[A-Za-z0-9_./*-]+", glob):
         raise ValueError(f"unsafe glob {glob!r}")
-    return ('n=0; for f in ' + glob + '; do [ -e "$f" ] || continue; n=$((n+1)); '
+    d = glob.rsplit("/", 1)[0] or "/"
+    if "*" in d:
+        raise ValueError(f"wildcards only in the last component: {glob!r}")
+    return (f'd={d}; [ -d "$d" ] && [ -r "$d" ] || exit 5; ls "$d" >/dev/null || exit 6; '
+            f'set -- {glob}; if [ $# -eq 1 ] && [ "$1" = \'{glob}\' ] && [ ! -e "$1" ]; then exit 7; fi; '
+            'n=0; for f in "$@"; do n=$((n+1)); '
             's=$(stat -c %s "$f") || exit 3; echo "__FILE__ $s $f"; base64 "$f" || exit 4; echo "__EOF__"; '
             'done; echo "__RC__ $n"')
 
 
 def parse_b64_dump(rc: int, text: str, err: str = "") -> FilesRead:
     """Parse b64_script's output. Pure."""
+    if rc == 7:
+        return FilesRead(False, [], B64_EXIT[7], no_match=True)
     if rc != 0:
-        return FilesRead(False, [], f"remote exit {rc}: {err.strip()[-200:]}")
+        return FilesRead(False, [], f"remote exit {rc} ({B64_EXIT.get(rc, 'failed')}): {err.strip()[-200:]}")
     lines = text.replace("\r", "").split("\n")
     files, cur, size, chunks = [], None, 0, []
     for line in lines:

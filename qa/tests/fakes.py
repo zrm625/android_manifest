@@ -50,6 +50,8 @@ class FakeShell:
             return parse_b64_dump(rc, files)
         if isinstance(files, bytes):
             files = [(glob.replace("*", "0"), files)] if files else []
+        if rc == 0 and not files:
+            return parse_b64_dump(7, "")       # the real script: the glob matched nothing
         text = "".join(f"__FILE__ {len(b)} {p}\n" + base64.encodebytes(b).decode() + "__EOF__\n"
                        for p, b in files) + f"__RC__ {len(files)}\n"
         return parse_b64_dump(rc, text)

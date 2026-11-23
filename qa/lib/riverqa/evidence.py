@@ -119,9 +119,12 @@ def read_pstore(dev, pattern: str = "*") -> tuple[bool, bytes, str]:
     """(ok, bytes, why) for /sys/fs/pstore/<pattern>, through the checked
     binary read (Device.read_files): a remote failure, a partial read or a
     failure on any one file is not a clean read (review round 2). With
-    pattern "*" an empty pstore is a clean, empty read; a named pattern
-    that matches nothing is not."""
+    pattern "*" an empty pstore is a clean, empty read, but only once the
+    directory itself was proven readable and listed (review round 3); a
+    named pattern that matches nothing is not."""
     r = dev.read_files(f"/sys/fs/pstore/{pattern}", timeout=60)
+    if pattern == "*" and r.no_match:
+        return True, b"", ""
     if not r.ok:
         return False, r.data, f"reading /sys/fs/pstore/{pattern} failed: {r.why}"
     if pattern != "*" and not r.files:

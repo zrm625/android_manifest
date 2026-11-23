@@ -133,5 +133,87 @@ class RebootGuard(unittest.TestCase):
         self.assertEqual(r.err.strip(), "error: closed")
 
 
+class B64ScriptOnHost(unittest.TestCase):
+    """b64_script run for real by the host's sh against a scratch directory
+    (review round 3). No phone."""
+
+    def read(self, glob):
+        import subprocess
+        from riverqa.device import b64_script, parse_b64_dump
+        r = subprocess.run(["sh", "-c", b64_script(glob)], capture_output=True, text=True, timeout=30)
+        return parse_b64_dump(r.returncode, r.stdout, r.stderr)
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = self.tmp.name
+        self.addCleanup(self.tmp.cleanup)
+
+    def write(self, name, data):
+        with open(f"{self.d}/{name}", "wb") as f:
+            f.write(data)
+
+    def test_reads_every_match(self):
+        self.write("console-ramoops-0", b"\x00\xffabc\n" * 100)
+        self.write("dmesg-ramoops-0", b"x")
+        r = self.read(f"{self.d}/*")
+        self.assertTrue(r.ok, r.why)
+        self.assertEqual(sorted(p.rsplit("/", 1)[1] for p, _ in r.files), ["console-ramoops-0", "dmesg-ramoops-0"])
+        self.assertEqual(self.read(f"{self.d}/console-ramoops*").data, b"\x00\xffabc\n" * 100)
+
+    def test_missing_directory_fails(self):
+        r = self.read(f"{self.d}/nope/*")
+        self.assertFalse(r.ok)
+        self.assertFalse(r.no_match)
+        self.assertIn("missing or unreadable", r.why)
+
+    def test_unreadable_directory_fails(self):
+        import os
+        if os.geteuid() == 0:
+            self.skipTest("root reads any directory")
+        os.mkdir(f"{self.d}/locked")
+        os.chmod(f"{self.d}/locked", 0)
+        self.addCleanup(os.chmod, f"{self.d}/locked", 0o700)
+        r = self.read(f"{self.d}/locked/*")
+        self.assertFalse(r.ok)
+        self.assertFalse(r.no_match)
+
+    def test_no_match_fails_but_is_marked(self):
+        r = self.read(f"{self.d}/console-ramoops*")
+        self.assertFalse(r.ok)
+        self.assertTrue(r.no_match)
+        r = self.read(f"{self.d}/*")
+        self.assertFalse(r.ok)
+        self.assertTrue(r.no_match)
+
+    def test_file_that_vanishes_after_the_listing_fails(self):
+        # A dangling link is listed by the glob but can't be read: the old
+        # script's `[ -e ]` skipped it quietly and reported a clean read.
+        import os
+        self.write("console-ramoops-0", b"abc")
+        os.symlink(f"{self.d}/gone", f"{self.d}/console-ramoops-1")
+        r = self.read(f"{self.d}/console-ramoops*")
+        self.assertFalse(r.ok)
+        self.assertFalse(r.no_match)
+
+    def test_wildcard_only_in_the_last_component(self):
+        from riverqa.device import b64_script
+        for bad in ("/sys/fs/*/x", "relative/*", "/sys/fs/pstore/$(id)"):
+            with self.assertRaises(ValueError):
+                b64_script(bad)
+
+
+class ReadPstoreNoMatch(unittest.TestCase):
+    def test_empty_pstore_is_clean_only_for_star(self):
+        from fakes import FakeShell
+        from riverqa import evidence
+        dev = FakeShell({}, {})
+        self.assertEqual(evidence.read_pstore(dev, "*"), (True, b"", ""))
+        self.assertFalse(evidence.read_pstore(dev, "console-ramoops*")[0])
+        # A missing directory (exit 5) is never an empty pstore.
+        dev = FakeShell({}, {r"pstore": (5, [])})
+        self.assertFalse(evidence.read_pstore(dev, "*")[0])
+
+
 if __name__ == "__main__":
     unittest.main()
