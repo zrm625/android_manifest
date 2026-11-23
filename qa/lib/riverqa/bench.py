@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import evidence, flashing, reboots, stage
-from .core import BENCH_HOME, SERIAL, batch_dir, bench_path, log, now_iso, write_json
+from .core import BENCH_HOME, SERIAL, batch_dir, bench_path, log, now_iso, read_json, write_json
 from .device import Device, GuardError
 from .lock import DeviceLock, LockError
 
@@ -20,7 +20,9 @@ COLUMNS = ["run_id", "env", "boot", "host_boot_seconds", "uptime_at_boot_complet
            "cpu_idle_pct", "lineage_version", "fingerprint",
            # Added for phone-qa (DESIGN.md): identity and per-boot health binding.
            "build_date_utc", "vendor_date_utc", "bootimage_date_utc", "slot", "batch", "build_id",
-           "boot_id", "signals", "evidence"]
+           "boot_id", "signals", "evidence",
+           # The flash attempt a batch row belongs to (B1): a reflash starts over.
+           "flash_attempt"]
 
 
 def csv_path() -> Path:
@@ -93,8 +95,23 @@ def used_ram_kb(dev: Device) -> str:
     return ""
 
 
-def bench_boots_in_batch(batch_id: str) -> int:
-    return sum(1 for r in read_rows() if r.get("batch") == batch_id)
+def attempt_rows(batch: dict, rows: list[dict] | None = None) -> list[dict]:
+    """The device.csv rows of this batch's current flash attempt, in order:
+    the runs listed in batch["bench_runs"], from batch["flash_attempt"]."""
+    rows = read_rows() if rows is None else rows
+    runs, att = batch.get("bench_runs") or [], batch.get("flash_attempt")
+    return [r for r in rows if r.get("batch") == batch["batch"] and r.get("run_id") in runs
+            and att and r.get("flash_attempt") == att]
+
+
+def current_attempt(batch: dict) -> dict | None:
+    """The flash record's latest attempt, if it booted and is the attempt
+    batch.json names. Bench rows only ever bind to that attempt."""
+    frec = read_json(batch_dir(batch["batch"]) / "flash.json", {}) or {}
+    atts = frec.get("attempts") or []
+    if not atts or atts[-1].get("result") != "booted" or atts[-1].get("attempt_id") != batch.get("flash_attempt"):
+        return None
+    return atts[-1]
 
 
 USAGE = """\
@@ -161,9 +178,17 @@ def run(a) -> int:
         if rc != 0:
             return rc
     batch = stage.load(a.batch) if a.batch else None
+    attempt = None
+    if batch:
+        attempt = current_attempt(batch)
+        if attempt is None:
+            log(f"error: {a.batch} has no booted flash attempt matching batch.json's flash_attempt "
+                f"({batch.get('flash_attempt')}); flash it first")
+            return 1
     migrate_header(csv_path())
     run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{a.env}"
-    done_before = bench_boots_in_batch(a.batch) if batch else 0
+    # Only this flash attempt's boots count (B1).
+    done_before = len(attempt_rows(batch)) if batch else 0
     if batch:
         batch.setdefault("bench_runs", []).append(run_id)
         stage.save(batch)
@@ -214,6 +239,7 @@ def run(a) -> int:
             "build_date_utc": props[0].strip(), "vendor_date_utc": props[1].strip(),
             "bootimage_date_utc": props[2].strip(), "slot": props[3].strip().lstrip("_"),
             "batch": a.batch or "", "build_id": sys_id or "", "boot_id": rec.boot_id,
+            "flash_attempt": attempt["attempt_id"] if attempt else "",
         }
         if batch:
             expected = 1 + done_before + i  # the first boot after the wipe, then each bench boot

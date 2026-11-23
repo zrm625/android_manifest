@@ -11,7 +11,7 @@ import traceback
 from pathlib import Path
 
 from . import bootsig, evidence, flashing, journal as jmod, reboots, regression, stage
-from .bench import read_rows
+from .bench import attempt_rows
 from .core import (BENCH_HOME, CODENAME, QA_DIR, SCRIPTS_DIR, SERIAL, batch_dir, bench_path, log, new_id,
                    now_iso, read_json, sha256_file, write_json, append_jsonl)
 from .controls import active as control_active
@@ -47,7 +47,11 @@ WATCHED_PROCS = {
 
 def harness_version() -> str:
     """Content hash of phone-qa, the riverqa sources, the helper sources, the
-    thresholds, the allowance A and the known-good seed."""
+    fixtures pins, the thresholds, the whole paths and chain blocks of
+    boot-timing.json (the allowance A and its proofs) and the known-good
+    calibration seed (B3). The seed is the immutable calibration_seed field,
+    never ram_reference, so retiring the seed at the first tag doesn't change
+    the version and silently disqualify the controls."""
     h = hashlib.sha256()
     files = [SCRIPTS_DIR / "phone-qa", THRESHOLDS_JSON, FIXTURES_JSON]
     files += sorted((QA_DIR / "lib" / "riverqa").rglob("*.py"))
@@ -57,11 +61,9 @@ def harness_version() -> str:
             h.update(str(f.relative_to(QA_DIR.parent)).encode())
             h.update(f.read_bytes())
     timing = reboots.load_timing()
-    h.update(json.dumps({p: (timing.get("paths") or {}).get(p, {}).get("A") for p in reboots.PATHS},
-                        sort_keys=True).encode())
+    h.update(json.dumps({"paths": timing.get("paths"), "chain": timing.get("chain")}, sort_keys=True).encode())
     kg = read_json(KNOWN_GOOD, {}) or {}
-    ref = kg.get("ram_reference") or {}
-    h.update(json.dumps(ref if ref.get("seed") else None, sort_keys=True).encode())
+    h.update(json.dumps(kg.get("calibration_seed"), sort_keys=True).encode())
     return h.hexdigest()[:16]
 
 
@@ -91,8 +93,12 @@ def record_calibration(run: "Run", code: int) -> None:
     write_json(CALIBRATION_FILE, data)
 
 
+# RIVERQA_* variables that configure the host rather than break the run.
+NOT_CONTROL_ENV = {"RIVERQA_KEYSTORE"}
+
+
 def control_overrides() -> list[str]:
-    found = [k for k in os.environ if k.startswith("RIVERQA_")]
+    found = [k for k in os.environ if k.startswith("RIVERQA_") and k not in NOT_CONTROL_ENV]
     if CONTROL_OVERRIDE.exists():
         found.append(str(CONTROL_OVERRIDE))
     return found
@@ -124,13 +130,16 @@ class Run:
         self.logcat_file = None
         self.logcat_dead: str | None = None
         self.logcat_restarts: list = []
+        self.bootcount_expected: int | None = None
 
     def _flash_attempt(self) -> dict | None:
         if not self.batch_id:
             return None
         frec = read_json(batch_dir(self.batch_id) / "flash.json", {}) or {}
-        booted = [a for a in frec.get("attempts", []) if a.get("result") == "booted"]
-        return booted[-1] if booted else None
+        atts = frec.get("attempts") or []
+        # Only the latest attempt counts, and only if it booted: an earlier
+        # attempt's boot is not the build on the phone.
+        return atts[-1] if atts and atts[-1].get("result") == "booted" else None
 
     def add(self, r: Result) -> Result:
         self.results[r.id] = r
@@ -140,6 +149,8 @@ class Run:
 
     def wanted(self, cid: str) -> bool:
         grp = cid.split(".", 1)[0]
+        if grp == "preflight":
+            return True   # --only and --skip never drop preflight (C5)
         if self.only and cid not in self.only and grp not in self.only:
             return False
         if cid in self.skip or grp in self.skip:
@@ -337,6 +348,54 @@ def hal_deaths(dev: Device) -> str | None:
     return m.group(1) if m else None
 
 
+def boot_count_verdict(n: int, expected: int) -> tuple[str, str]:
+    if n == expected:
+        return PASS, f"{n} SYSTEM_BOOT entries = first boot + {expected - 1} bench boots"
+    if n > expected:
+        return FAIL, f"{n} SYSTEM_BOOT entries, expected {expected}: the phone booted again after the last bench boot"
+    return UNVERIFIED, f"{n} SYSTEM_BOOT entries, expected {expected}"
+
+
+def continuity_verdict(rows: list[dict], live_boot_id: str | None, system_boots: int | None) -> tuple[str, str, int]:
+    """Was there a reset between the last bench boot and this run (B2)? The
+    live boot_id must be the last bench row's, and dropbox must hold exactly
+    one SYSTEM_BOOT for the first boot plus one per bench boot of this flash
+    attempt. Returns (state, summary, expected count)."""
+    expected = 1 + len(rows)
+    if not rows:
+        return UNVERIFIED, "no bench rows for this flash attempt", expected
+    if live_boot_id is None or system_boots is None:
+        return UNVERIFIED, "cannot read the boot_id or dropbox", expected
+    if live_boot_id != rows[-1].get("boot_id"):
+        return FAIL, (f"boot_id {live_boot_id[:8]} is not the last bench boot's ({str(rows[-1].get('boot_id'))[:8]}): "
+                      "the phone reset after the bench"), expected
+    st, msg = boot_count_verdict(system_boots, expected)
+    return st, f"boot_id is the last bench boot's; {msg}", expected
+
+
+def system_boot_count(dev: Device) -> int | None:
+    ok, dump, _ = evidence.checked_read(dev, "dropbox", "dumpsys dropbox")
+    return bootsig.dropbox_tags(dump).count("SYSTEM_BOOT") if ok else None
+
+
+def check_continuity(run: Run) -> Result:
+    if run.batch is None:
+        return Result("preflight.continuity", UNVERIFIED, NO_BATCH)
+    st = run.dev.boot_status()
+    state, msg, expected = continuity_verdict(batch_rows(run), st.boot_id if st else None,
+                                              system_boot_count(run.dev))
+    run.bootcount_expected = expected
+    return Result("preflight.continuity", state, msg)
+
+
+def check_boot_count_now(run: Run) -> tuple[str, str]:
+    """The final re-check of the SYSTEM_BOOT count (B2)."""
+    n = system_boot_count(run.dev)
+    if n is None:
+        return UNVERIFIED, "dropbox unreadable for the boot count"
+    return boot_count_verdict(n, run.bootcount_expected)
+
+
 def check_helper(run: Run) -> Result:
     from .helperapk import ensure_helper
     try:
@@ -348,6 +407,9 @@ def check_helper(run: Run) -> Result:
 
 
 def preflight(run: Run, lock_result: Result) -> bool:
+    """False stops the run: nothing after preflight may run unless the
+    guards, the controls check, the fixtures, journal recovery and the helper
+    all passed (C5)."""
     run.add(lock_result)
     try:
         run.guard()
@@ -356,15 +418,27 @@ def preflight(run: Run, lock_result: Result) -> bool:
         run.add(Result("preflight.guards", FAIL, str(e)))
         return False
     run.dev.root()
+
+    def passed(cid: str) -> bool:
+        r = run.results.get(cid)
+        return r is not None and r.state == PASS
+
     run_check(run, "preflight.controls", check_controls)
+    if not passed("preflight.controls"):
+        return False
     if run.mode != "baseline":
         run_check(run, "preflight.fixtures", check_fixtures)
-        if run.results.get("preflight.fixtures") and run.results["preflight.fixtures"].state != PASS:
+        if not passed("preflight.fixtures"):
             return False  # a missing fixture: nothing else runs
     run_check(run, "preflight.journal", check_journal)
+    if not passed("preflight.journal"):
+        return False      # an unresolved recovery: stop
     if run.mode != "baseline":
         run_check(run, "preflight.helper", check_helper)
+        if not passed("preflight.helper"):
+            return False
         run_check(run, "preflight.snapshot", check_snapshot)
+    run_check(run, "preflight.continuity", check_continuity)
     return True
 
 
@@ -448,8 +522,10 @@ def check_low_ram(run: Run) -> Result:
 
 
 def batch_rows(run: Run) -> list[dict]:
-    runs = run.batch.get("bench_runs") or []
-    return [r for r in read_rows() if r.get("run_id") in runs]
+    """Bench rows of this batch's current flash attempt only (B1)."""
+    if run.batch.get("flash_attempt") != run.attempt_id():
+        return []
+    return attempt_rows(run.batch)
 
 
 def check_bench_rows(run: Run) -> Result:
@@ -468,6 +544,8 @@ def check_bench_rows(run: Run) -> Result:
             bad.append(f"{k}: dates differ")
         if r.get("slot") != slot:
             bad.append(f"{k}: slot {r.get('slot')} != {slot}")
+        if r.get("flash_attempt") != run.attempt_id():
+            bad.append(f"{k}: flash attempt {r.get('flash_attempt')!r} is not {run.attempt_id()}")
         if run.batch.get("build_id") and r.get("build_id") != run.batch["build_id"]:
             bad.append(f"{k}: build ID {r.get('build_id')}")
         comp = read_json(BENCH_HOME / (r.get("evidence") or "none") / "completion.json")
@@ -839,25 +917,31 @@ def finish(run: Run, required: list[str], gate: GateInputs | None = None) -> int
 
 def full_run(run: Run, lock_result: Result) -> int:
     from .features import cleanup_and_final, run_features
-    ok = preflight(run, lock_result)
-    if ok and run.mode != "baseline" and run.results.get("preflight.helper", Result("x", PASS, "")).state == PASS:
-        try:
-            identity(run)
-            health(run)
-            if run.mode != "baseline":
+    try:
+        ok = preflight(run, lock_result)
+        if run.mode == "baseline":
+            if ok:
+                try:
+                    identity(run)
+                    health(run)
+                except GuardError as e:
+                    run.halted = f"guard failed: {e}"
+                    log(f"HALT: {e}")
+                if not run.halted:
+                    baseline_close(run)
+            return finish(run, BASELINE_REQUIRED)
+        if ok:
+            try:
+                identity(run)
+                health(run)
                 run_features(run)
-        except GuardError as e:
-            run.halted = f"guard failed: {e}"
-            log(f"HALT: {e}")
-        finally:
-            if run.mode != "baseline":
+            except GuardError as e:
+                run.halted = f"guard failed: {e}"
+                log(f"HALT: {e}")
+            finally:
                 cleanup_and_final(run)
-    elif ok and run.mode == "baseline":
-        identity(run)
-        health(run)
-    if run.mode == "baseline":
-        baseline_close(run)
-        return finish(run, BASELINE_REQUIRED)
+    finally:
+        stop_logcat(run)   # every exit path (C5)
     ctrl_ok, ctrl_reason = controls_status(run.version)
     gate = GateInputs(mode=run.mode, full_set=not run.only and not run.skip,
                       experiment=(run.batch or {}).get("experiment"),
@@ -950,6 +1034,9 @@ def main(argv: list[str]) -> int:
             only += [x for x in next(it).split(",") if x]
         elif a == "--skip":
             skip += [x for x in next(it).split(",") if x]
+            if any(x == "preflight" or x.startswith("preflight.") for x in skip):
+                log("error: preflight cannot be skipped")
+                return 1
         elif a == "--wait":
             wait = True
         else:

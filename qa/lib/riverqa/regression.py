@@ -10,6 +10,10 @@ known-good.json has two separate records:
   at the first real tag: the reference becomes the lower of the two medians,
   with that value's provenance, and ``seed`` is cleared either way.
 
+- ``calibration_seed``: the baseline's 3-boot median and run IDs, written
+  once by --baseline and never changed. The harness version hashes this
+  field, so retiring the seed in ``ram_reference`` leaves the version alone.
+
 MB is used_ram_kb / 1024 throughout.
 """
 

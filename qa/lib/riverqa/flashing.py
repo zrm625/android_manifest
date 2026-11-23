@@ -285,13 +285,21 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
         return EXIT_HALT
     pair = slots.reserve(st, batch_id, kind, live, now_iso())
     save_state(st)
+    attempt_id = new_id("flash")
     batch["pair"] = dict(pair)
+    # A new flash attempt starts over (B1): earlier bench runs are archived
+    # and never count toward this attempt's boots or evidence.
+    if batch.get("bench_runs"):
+        batch.setdefault("prior_bench_runs", []).append({"flash_attempt": batch.get("flash_attempt"),
+                                                         "runs": batch["bench_runs"]})
+    batch["bench_runs"] = []
+    batch["flash_attempt"] = attempt_id
     stage.save(batch)
     target = pair["target"]
 
     flash_rec_path = bdir / "flash.json"
     frec = read_json(flash_rec_path, {"attempts": []})
-    attempt = {"attempt_id": new_id("flash"), "started_at": now_iso(), "target": target,
+    attempt = {"attempt_id": attempt_id, "started_at": now_iso(), "target": target,
                "fallback": pair["fallback"], "kind": kind, "image_sha256": hashes, "hashes_checked": True,
                "wipe": None, "first_boot": None, "result": "started"}
     frec["attempts"].append(attempt)
@@ -316,7 +324,7 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
             attempt["result"] = "rescued; batch failed"
             save_attempt()
             return EXIT_RESCUED
-        except (Halt, Unreachable) as h:
+        except (Halt, Unreachable, GuardError) as h:   # C7: a guard failure in rescue halts
             attempt["result"] = f"halt: {h}"
             save_attempt()
             log(f"HALT: {h}")
@@ -336,7 +344,7 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
             attempt["rescue"] = rollback(dev, st, f"bootloader fell back to slot {slot_now}", attempt["attempt_id"])
             save_attempt()
             return EXIT_RESCUED
-        except (Halt, Unreachable) as h:
+        except (Halt, Unreachable, GuardError) as h:
             log(f"HALT: {h}")
             return EXIT_HALT
     reboots.judge_signals(dev, rec)
@@ -445,7 +453,7 @@ def recover(runner=None, dev: Device | None = None) -> int:
         dev.guard() if dev.state() == "device" else None
         rollback(dev, st, f"recovery: {why}")
         return EXIT_OK
-    except (Halt, Unreachable) as h:
+    except (Halt, Unreachable, GuardError) as h:
         log(f"HALT: {h}")
         return EXIT_HALT
 
@@ -529,9 +537,13 @@ def main(argv: list[str]) -> int:
                     log("error: no slot-state.json")
                     return EXIT_ERROR
                 dev = Device(SERIAL)
-                if dev.state() == "device":
-                    dev.guard()
-                rollback(dev, st, "requested (flash --rollback)")
+                try:
+                    if dev.state() == "device":
+                        dev.guard()
+                    rollback(dev, st, "requested (flash --rollback)")
+                except GuardError as e:   # mid-rollback: the pipeline halts (C7)
+                    log(f"HALT: {e}")
+                    return EXIT_HALT
                 return EXIT_OK
             if a.recover:
                 return recover()

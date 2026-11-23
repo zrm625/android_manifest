@@ -1460,13 +1460,20 @@ def final_checks(run) -> None:
     from .qa import check_dropbox, check_services, diagnostic_reads, hal_deaths, logcat_check, proc_info, stop_logcat
     dev = run.dev
     snap = run.snapshot
+    from .device import GuardError
     logcat_check(run, "the final checks")
     stop_logcat(run)
     if not snap or dev.state() != "device":
         for cid in ("final.health", "final.processes", "final.hal_deaths", "final.boot_id", "final.settings"):
             run.add(Result(cid, UNVERIFIED, "no preflight snapshot or phone unreachable"))
         return
-    run.guard()
+    try:
+        run.guard()   # C6
+    except GuardError as e:
+        run.halted = run.halted or f"guard failed before the final checks: {e}"
+        for cid in ("final.health", "final.processes", "final.hal_deaths", "final.boot_id", "final.settings"):
+            run.add(Result(cid, FAIL, f"guard failed before the final checks: {e}"))
+        return
     parts = []
     db = check_dropbox(run, since=snap["dropbox"])
     parts.append((db.state, db.summary))
