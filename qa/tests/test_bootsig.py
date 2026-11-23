@@ -158,34 +158,57 @@ class Chain(unittest.TestCase):
 
 
 class Banner(unittest.TestCase):
-    """Review round 4 (Opus 2): the new-session check matches the banner
-    within 3 flips, like the marker."""
+    """Review rounds 4 and 5 (Opus 2, R5-10): the new-session check matches
+    the banner within 2 flips, at the start of a printk line."""
 
-    def session_after(self, banner: bytes) -> bytes:
-        return shutdown_log() + line(0.0, banner + b"4.9.337") + line(1.0, b"init")
+    def session_after(self, banner: bytes, prefix: bytes | None = None) -> bytes:
+        text = banner + b"4.9.337"
+        first = line(0.0, text) if prefix is None else prefix + text + b"\n"
+        return shutdown_log() + first + line(1.0, b"init")
 
     def test_damaged_banner_after_the_marker_fails(self):
         self.assertEqual(b.chain_verdict(self.session_after(b"Linux version "), MARKER)[0], FAIL)
         # The damage river's ramoops really does to the banner (every saved
-        # pstore log since baseline-1 starts with this): 2 flips.
+        # pstore log since baseline-1 starts with this): 2 flips, with the
+        # timestamp prefix damaged too.
         self.assertEqual(b.chain_verdict(self.session_after(b"Linu\xf8 ver\xf3ion "), MARKER)[0], FAIL)
-        for flips in ((0,), (0, 7), (2, 6, 13)):
+        self.assertEqual(b.chain_verdict(self.session_after(b"Linu\xf8 ver\xf3ion ", b"[    0.\xb000000] "),
+                                         MARKER)[0], FAIL)
+        self.assertEqual(b.chain_verdict(self.session_after(b"Linux version ", b"<5>[    0.p00000] "),
+                                         MARKER)[0], FAIL)
+        for flips in ((0,), (0, 7), (2, 13)):
             damaged = flip_bytes(b.BANNER, flips)
             self.assertEqual(b.chain_verdict(self.session_after(damaged), MARKER)[0], FAIL, flips)
-        # Four wrong characters is not a banner.
-        self.assertEqual(b.chain_verdict(self.session_after(flip_bytes(b.BANNER, (0, 3, 7, 11))), MARKER)[0],
-                         PASS)
+        # Three wrong characters is not a banner any more.
+        self.assertEqual(b.chain_verdict(self.session_after(flip_bytes(b.BANNER, (0, 3, 7))), MARKER)[0], PASS)
 
-    def test_every_three_flip_banner_is_found(self):
-        log = b"x" * 40
-        for flips in itertools.combinations(range(len(b.BANNER)), 3):
-            text = log + flip_bytes(b.BANNER, flips) + log
-            self.assertIn(40, b.banner_offsets(text), flips)
+    def test_minor_version_is_not_a_banner(self):
+        """Opus minor 3: "minor version " is 3 flips from "Linux version ",
+        and message text, not a line start."""
+        self.assertEqual(b.hamming(b"minor version ", b.BANNER), 3)
+        for text in (b"usb 1-1: config 1 interface 0 minor version 2", b"minor version 4.9.337",
+                     b"hid-generic: Linux version 4.9 driver"):
+            log = shutdown_log() + line(200.0, text)
+            self.assertEqual(b.banner_offsets(log[len(line(0.0, b"Linux version 4.9.337")):]), [], text)
+            self.assertEqual(b.chain_verdict(log, MARKER)[0], PASS, text)
+
+    def test_every_two_flip_banner_at_a_line_start_is_found(self):
+        pre = b"x" * 40 + b"\n[    1.000000] "
+        for flips in itertools.combinations(range(len(b.BANNER)), 2):
+            text = pre + flip_bytes(b.BANNER, flips) + b"4.9\n"
+            self.assertIn(len(pre), b.banner_offsets(text), flips)
 
     def test_damaged_banner_before_the_marker_passes(self):
         log = line(0.0, b"Linu\xf8 ver\xf3ion 4.9.337") + shutdown_log()[len(line(0.0, b"Linux version 4.9.337")):]
         self.assertEqual(b.banner_offsets(log), [len(b"[    0.000000] ")])
         self.assertEqual(b.chain_verdict(log, MARKER)[0], PASS)
+
+    def test_river_real_pstore_head(self):
+        """The first two lines of a real saved river pstore log
+        (pstore-nopass, 2026-11-23): the banner is found at its line start."""
+        real = (b"[    0.000000] Booting Linux on physical CPU 0x0\n[    0.\xb000000] Linu\xf8 ver\xf3ion "
+                b"4.9.337-perf (zik@a843a\xb888038d) (Android (")
+        self.assertEqual(b.banner_offsets(real), [real.index(b"Linu\xf8")])
 
     def test_fuzzy_offsets_matches_a_brute_force_scan(self):
         import random

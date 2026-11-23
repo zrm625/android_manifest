@@ -26,7 +26,7 @@ import secrets
 from .results import FAIL, PASS, UNVERIFIED
 
 MARKER_PREFIX = "RQM"
-BANNER = b"Linux version "   # a kernel session's first line; matched within MAX_MARKER_FLIPS (R4-7)
+BANNER = b"Linux version "   # a kernel session's first line; see banner_offsets (R4-7, R5-10)
 
 
 NONCE_HEX = 16           # 64 random bits (amendment A2.1)
@@ -95,12 +95,32 @@ def fuzzy_offsets(log: bytes, pattern: bytes, max_flips: int = MAX_MARKER_FLIPS)
     return sorted(hits)
 
 
+BANNER_FLIPS = 2         # river's real damage is 2 flips ("Linu\xf8 ver\xf3ion"); "minor version " is 3 (R5-10)
+BANNER_PREFIX_MAX = 24   # a printk prefix: "<6>" and/or "[%5lu.%06lu] " (15 bytes), with room for damage
+
+
+def _printk_line_start(log: bytes, off: int) -> bool:
+    """Does ``off`` sit where a printk line's text starts: at the start of
+    the log or of a line, after at most a short log-level / timestamp
+    prefix? The prefix may itself be damaged (river's real banner line reads
+    ``[    0.\xb000000] ``), so it is judged loosely: at most
+    BANNER_PREFIX_MAX bytes and at most BANNER_FLIPS ASCII letters (a flip
+    can turn a digit into a letter). Message text before the match, such as
+    ``usb 1-1: minor version``, has more letters."""
+    ls = log.rfind(b"\n", 0, off) + 1
+    prefix = log[ls:off]
+    if len(prefix) > BANNER_PREFIX_MAX:
+        return False
+    return sum(1 for c in prefix if 65 <= c <= 90 or 97 <= c <= 122) <= BANNER_FLIPS
+
+
 def banner_offsets(log: bytes) -> list[int]:
-    """Kernel session banners (``Linux version ``) within MAX_MARKER_FLIPS
-    wrong characters, like the marker (review round 4: on river the banner
-    at the start of every saved pstore log reads ``Linu\xf8 ver\xf3ion``,
-    which an exact match never found)."""
-    return fuzzy_offsets(log, BANNER)
+    """Kernel session banners: ``Linux version `` within BANNER_FLIPS wrong
+    characters, at the start of a printk line (R5-10). On river the banner
+    at the start of every saved pstore log reads ``Linu\xf8 ver\xf3ion``
+    (review round 4), which an exact match never found; the anchor keeps
+    ``minor version `` (3 flips away) and other message text out."""
+    return [o for o in fuzzy_offsets(log, BANNER, BANNER_FLIPS) if _printk_line_start(log, o)]
 
 
 def chain_verdict(pstore_log: bytes | None, marker: str | None) -> tuple[str, str]:
@@ -108,7 +128,8 @@ def chain_verdict(pstore_log: bytes | None, marker: str | None) -> tuple[str, st
 
     PASS: the previous kernel's log holds at least one copy of this
     attempt's marker (within MAX_MARKER_FLIPS) and no new kernel session
-    banner (also within MAX_MARKER_FLIPS) after the first copy. The nonce alone shows the log belongs to the
+    banner (banner_offsets: BANNER_FLIPS, at a printk line start) after
+    the first copy. The nonce alone shows the log belongs to the
     kernel that wrote this marker; printk stamps play no part. An extra
     kernel that ran past ramoops init replaces the log, so a readable log
     with no copy, or a new session after one, is a FAIL. No marker, or a
