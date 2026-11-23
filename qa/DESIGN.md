@@ -1701,3 +1701,88 @@ wipe).**
   `fb-mode-recovered`. The next reboot went straight to Android, and
   `phone-qa --quick` passed. The candidate-active case (rollback with slot b
   active) is covered by the unit tests, not on the phone: it wipes.
+
+## Code review round 6: changes to R5
+
+Status: specified 2026-11-23 from the round-6 code review of `e407aae`.
+Everything in round 5 stands except as changed here. Where this section and
+an earlier one disagree, this one wins.
+
+**R6-1. Slot recovery always halts on a failure.** Every failure of
+`flash --recover`, `flash --rollback` and rescue on the phone exits 3 with
+an `error:` line and a `HALT` line, never a traceback or exit 1, and never
+resolves the fb_mode obligation or the pair (`flashing.recovery_halt`):
+- `rollback` turns every failure before its reboot (a fastboot error such
+  as a failed `--set-active`, a timeout on the way to fastboot, a guard
+  failure, an unreachable phone) into `Halt`, so rescue's handler catches
+  it too. `clear_then_set_active` does the same for a failed
+  `--set-active`.
+- `flash --recover` with no pair, a dev slot active and a failed clear
+  with an obligation pending stays in fastboot, switches no slot, wipes
+  nothing and halts (round 5 let `ClearFailed` escape).
+- Before the first baseline (no `slot-state.json`), on the promote path,
+  and on the rollback path, any `RuntimeError` or `TimeoutError` halts.
+- `flash` turns a `TimeoutError` that still reaches its top level into a
+  halt when it runs `--recover` or `--rollback`, or when an fb_mode
+  obligation is pending.
+
+**R6-2. Calibration samples carry their provenance.** `CALIBRATION_RULES`
+is 3. `calibrate.run` stamps every sample that can set A (each normal
+reboot in `raw` and each `inject_measure`) with `rules_version` as it
+measures it, with full-precision bracket values (R5-8). A sample without
+the current stamp is never clean (`sample_problems`), so it can't set A.
+`--reuse-normals` reuses the stored normals only if the record is from this
+build, has the current `rules_version` and every normal carries the stamp
+(`reuse_problems`); otherwise it logs why and measures fresh normals.
+`record_problems` also lists every unstamped sample, so `controls
+--boot-timing` refuses such a record. Sol's case: a sample with a 0.5004 s
+gap stored as 0.500 s, reused, made A 14.8 s; it now isn't reused and A
+comes from fresh samples.
+
+**R6-3. More kernel-batch inputs, and "unparsable" is not "absent".**
+- The toolchain pins also cover `external/dtc` (it builds the host `dtc`
+  that `kernel.mk` passes as `DTC_EXT`, because `BoardConfigCommon.mk` sets
+  `BOARD_KERNEL_SEPARATED_DTBO`), `prebuilts/clang-tools` and
+  `prebuilts/rust` (on the kernel build's `PATH` in
+  `BoardConfigKernel.mk`). `prebuilts/tools-lineage` was already matched; a
+  test checks every one against the real `default.xml`.
+- The kernel's embedded config and the DTB appended to `Image.gz-dtb` are
+  each a hash, `ABSENT` (read completely, not there) or None (could not be
+  parsed). None in either image is a kernel batch; "absent in both" is not.
+  A gzip stream that is corrupt or cut short is None for both.
+- The appended DTB is compared: the bytes after the kernel's gzip stream
+  must be whole FDT blobs back to back (magic `d00dfeed`, `totalsize` at
+  least the 40-byte header, ending exactly at the end). On river it is one
+  316,706-byte blob, the same in baseline-1, baseline-2 and the current
+  stripped build. A raw (not gzip) kernel's end can't be told reliably, so
+  its DTB counts as unparsable. On the real images, baseline-2 against
+  baseline-1 is still not a kernel batch.
+
+**Smaller changes.**
+- **R6-4.** `device-bench --flash` recovers fb_mode with `boot=False` and
+  leaves the adb guard to `flash_dev`, which works from fastboot.
+- **R6-5.** The build-lock probe takes `$BENCH_HOME/.lock` shared
+  (`LOCK_SH|LOCK_NB`); the build holds it exclusive, so two device jobs
+  probing at once no longer see each other as a build.
+  `flash --merge-started` and `flash --promote`, which time nothing, skip
+  the probe (`DeviceLock(check_build=False)`).
+- **R6-6.** `boot_info` rejects `page_size + kernel_size` past the end of
+  the file; `IKCFG_ED` is searched after `IKCFG_ST`.
+- **R6-7.** The build-lock test closes its child's stdout; the suite runs
+  clean with `python3 -X dev` (no `ResourceWarning`).
+- **R6-8.** `flash --batch` and `flash --promote` that find the phone in
+  fastboot with nothing pending no longer leave it there for the next adb
+  guard (exit 1). `fbmode.recover(slot=...)` boots only the named slot:
+  `known_good_slot` for a batch flash, the pair's target for `--promote`.
+  If fastboot reports another slot active it raises before clearing or
+  booting, and the caller halts. `--promote` now does its host-side proof
+  first and touches the phone only after it; `flash --recover`'s promote
+  path goes through the same code.
+- **R6-9.** The sysrq guard judges `cp`/`mv`/`ln`/`install` on the
+  destination (the last operand, or `-t`): a copy with the trigger only as
+  its source is allowed. A destination that names `sysrq-trigger`, or one
+  that may be `/proc` (`/proc`, `.`, `..`) with a source named
+  `sysrq-trigger`, is refused, and so is anything that can't be parsed.
+  Indirect targets (`t=/proc/sysrq-trigger; echo b > $t`, or a symlink
+  written later) are out of scope: the threat model is accidental breakage
+  by agents that follow the rules, not crafted commands.

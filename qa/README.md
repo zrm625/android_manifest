@@ -101,7 +101,10 @@ The steps run in this order (DESIGN.md, "Calibration and bootstrap"):
    uptime gate; step 1 runs its chain control instead. The `sysrq` path's
    injected extra pass sets `fastboot oem fb_mode_set` for one boot and
    clears it again. Changing `boot-timing.json` changes the harness
-   version.
+   version. `--reuse-normals` reuses the stored normal reboots only if
+   they come from this build and every one carries the current
+   calibration-rules stamp (`rules_version` 3, full-precision brackets);
+   otherwise it says why and measures fresh ones.
 2. The baseline: build `river-22.2` HEAD with `scripts/build`, then:
 
    ```sh
@@ -261,12 +264,19 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   `flash --rollback`, `flash --recover` and rescue never boot the active
   slot (it may be the failed candidate): in fastboot they clear fb_mode, set
   the fallback active, then reboot, and resolve the obligation once the
-  fallback is verified. A dev flash clears it and stays in fastboot. If the
-  clear fails with an obligation pending, rollback still sets the fallback
-  active, then halts (exit 3).
+  fallback is verified. A dev flash (also `device-bench --flash`) clears it
+  and stays in fastboot. If the clear fails with an obligation pending,
+  rollback still sets the fallback active, then halts (exit 3). Any other
+  failure of `flash --recover`, `--rollback` or rescue on the phone (a
+  fastboot error, a timeout, a guard failure) also halts with exit 3 and an
+  `error:` line, and leaves the obligation pending.
+- **The phone found in fastboot.** `flash --batch` boots `known_good_slot`
+  from fastboot, and `flash --promote` the candidate slot; if fastboot
+  reports another slot active they halt (exit 3) instead of booting it.
 - **No device job during a build.** `flash`, `device-bench`, `phone-qa` and
   calibration refuse to start while a build holds `$BENCH_HOME/.lock`: a
-  build eats the timing brackets' headroom.
+  build eats the timing brackets' headroom. `flash --merge-started` and
+  `flash --promote` time nothing and may run during a build.
 - **Bench rows from before A2** have no `reboot_path`, so
   `health.boot_signals` is UNVERIFIED for them; bench the batch again.
 - **Camera-set approvals and the gh account.** The approval must be a
