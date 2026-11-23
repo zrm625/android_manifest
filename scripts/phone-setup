@@ -16,13 +16,15 @@
 # river-22.2 already default to most of this (and dark theme, low brightness,
 # no click sounds); the script sets them again so older images match too.
 #
-# Only the phone with serial $BENCH_DEVICE (default ZY225DPT7F) is touched.
+# Only the phone with serial $BENCH_DEVICE (default ZY225DPT7F) is touched. It
+# takes the shared device lock, or reuses it when BENCH_LOCK_TOKEN matches.
 set -euo pipefail
+source "$(dirname "$(realpath "$0")")/common.sh"
 
 SERIAL=${BENCH_DEVICE:-ZY225DPT7F}
 DEVICE_CODENAME=river
 
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 ssid_file='' psk_file='' extra_dim=1
 while (($#)); do
@@ -35,8 +37,10 @@ while (($#)); do
   shift
 done
 
+device_lock
 a() { adb -s "$SERIAL" "$@"; }
-# Read the whole output before filtering (see phone-check about SIGPIPE).
+# Read the whole output before filtering: closing a dumpsys pipe early sends
+# SIGPIPE to the service being dumped.
 sh_() { a shell "$@" 2>/dev/null | tr -d '\r'; }
 
 state=$(a get-state 2>/dev/null || true)

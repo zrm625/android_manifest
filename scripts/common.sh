@@ -19,3 +19,27 @@ elif command -v repo >/dev/null 2>&1; then
 else
   REPO="$TOP/.repo/repo/repo"
 fi
+
+BENCH_HOME=${BENCH_HOME:-/mnt/storage/lineageos-bench}
+
+# The shared device lock, $BENCH_HOME/.device-lock (see qa/lib/riverqa/lock.py).
+# With BENCH_LOCK_TOKEN set, reuse the lock only if the token matches the lock
+# file and someone holds it; otherwise take the lock for this script (fd 8).
+device_lock() {
+  local f=$BENCH_HOME/.device-lock
+  mkdir -p "$BENCH_HOME"
+  if [[ -n "${BENCH_LOCK_TOKEN:-}" ]]; then
+    [[ "$(tr -d '[:space:]' < "$f" 2>/dev/null)" == "$BENCH_LOCK_TOKEN" ]] \
+      || { echo "error: BENCH_LOCK_TOKEN does not match the device lock; refusing to run" >&2; exit 1; }
+    if flock -n "$f" true; then
+      echo "error: BENCH_LOCK_TOKEN is set but nobody holds the device lock; refusing to run" >&2; exit 1
+    fi
+    return 0
+  fi
+  exec 8<>"$f"
+  flock -n 8 || { echo "error: another device job holds $f" >&2; exit 1; }
+  BENCH_LOCK_TOKEN=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+  : > "$f"
+  printf '%s\n' "$BENCH_LOCK_TOKEN" > "$f"
+  export BENCH_LOCK_TOKEN
+}
