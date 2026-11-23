@@ -26,13 +26,14 @@ and record the result, but don't merge it. Zak decides whether it ships.
 ## Must-work list
 
 Every batch must pass all of these. "Auto" means adb does the check by itself.
-"Fixture" means a check that needs something on the desk.
+"Fixture" means a check that needs something on the desk. "Build check"
+means QA inspects the build output, not the phone.
 
 | Area | Feature | Check | Level |
 | --- | --- | --- | --- |
 | Radios | Wi-Fi | Connects after the wipe, loads a web page, and still works after the screen goes off and on. | auto |
 | | Bluetooth | Turns on, scans, and pairs with the workstation (`forge`). | fixture (have it) |
-| | NFC | NFC turns on and the NFC HAL answers. Reading a tag needs an NFC sticker on the phone's back, and we don't have one yet. Until then the tag read is a WARN. | auto; tag read is a fixture |
+| | NFC | The test phone is an XT1962-1 (US model) and has no NFC chip, so it can't turn NFC on. QA checks that the image still has the NFC stack: the HAL service, the NFC APEX, the Tag app, and the `sku_nfc` permission files. Reading a tag needs a phone that has NFC hardware. | build check |
 | | GPS | The GNSS HAL is up and reports satellites. | auto |
 | Hardware | Cameras | Each camera that is enabled in the build opens and takes a photo that isn't black. See [Cameras](#cameras). | auto |
 | | Speaker and mic | The speaker plays a tone and the mic picks it up. | auto |
