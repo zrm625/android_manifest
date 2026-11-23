@@ -174,7 +174,7 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
         raise ValueError(f"the {path} path has no uptime gate, so no extra-pass control")
     own_watcher = watcher is None
     w = watcher or UsbWatcher(dev.serial).start()
-    armed = False
+    armed = owed = False
     try:
         if path == "sysrq" and inject_extra_pass:
             armed = True
@@ -194,7 +194,9 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             if inject_extra_pass:
                 dev.wait_fastboot(120)                       # fb_mode: the bootloader stops
                 planned += 1
-                fbmode.disarm(dev)
+                # Clear now; resolve the obligation only once Android booted
+                # (R5-1), so a host killed in between leaves it for recovery.
+                owed = fbmode.clear_in_fastboot(dev)
                 armed = False
                 mark2 = w.mark()
                 dev.reboot_fastboot()
@@ -230,6 +232,8 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
         if inject_early_reboot:
             rec.control = inject_reboot_before_completion(dev, boot_timeout, w)
         st = completed_status(dev, boot_timeout)
+        if owed:
+            fbmode.settle()
         rec.completed_wall = st.host_wall
         rec.boot_id, rec.uptime = st.boot_id, st.uptime
         # Review round 4: the clock starts at the earliest possible

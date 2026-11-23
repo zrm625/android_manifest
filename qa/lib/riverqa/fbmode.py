@@ -9,11 +9,18 @@ host dies while it is set, every later boot stops in fastboot, so:
   durably, **before** it sends ``fb_mode_set``;
 - ``disarm`` sends ``fb_mode_clear`` and only then resolves the entry;
 - ``recover`` runs under the device lock before anything else touches the
-  phone (calibration, flash, phone-qa): with an entry pending, or with the
-  phone found in fastboot, it clears fb_mode, resolves the entry and, when
-  asked or when it had to take the phone out of Android, boots Android;
-- ``clear_in_fastboot`` is for code that is already in fastboot (flash,
-  rescue, rollback): ``fb_mode_clear`` is harmless when nothing is set.
+  phone (calibration, phone-qa, device-bench, flash builds): with an entry
+  pending, or with the phone found in fastboot, it clears fb_mode and, when
+  asked or when it had to take the phone out of Android, boots the active
+  slot. The entry is resolved only once that boot completed (or, with
+  ``boot=False``, once the clear succeeded), so a host that dies between
+  the clear and the boot leaves the entry for the next recovery
+  (review round 5, R5-1);
+- slot recovery (``flash --rollback``, ``flash --recover``, rescue) never
+  calls ``recover``: it must not boot the active slot, which may be the
+  failed candidate. It calls ``clear_in_fastboot`` while in fastboot, sets
+  the fallback slot active, reboots, verifies the slot, and only then calls
+  ``settle`` (R5-1).
 
 Every fastboot command goes through Device, which guards first.
 """
@@ -44,7 +51,14 @@ def arm(dev, j: jmod.Journal | None = None) -> dict:
     return e
 
 
-def _resolve(j: jmod.Journal) -> None:
+class ClearFailed(RuntimeError):
+    """``fb_mode_clear`` failed while an fb_mode obligation is pending."""
+
+
+def settle(j: jmod.Journal | None = None) -> None:
+    """Resolve the obligation, if any. Call it only once fb_mode was cleared
+    and the phone is where the caller meant it to be."""
+    j = j or journal()
     e = pending(j)
     if e is not None:
         j.resolve(e)
@@ -55,32 +69,50 @@ def disarm(dev, j: jmod.Journal | None = None) -> None:
     phone must be in fastboot. A failed clear leaves the entry pending."""
     j = j or journal()
     dev.fb_mode_clear()
-    _resolve(j)
+    settle(j)
 
 
 def clear_in_fastboot(dev, j: jmod.Journal | None = None) -> bool:
-    """If the phone is in fastboot: clear fb_mode (harmless when it is not
-    set) and resolve any obligation. True if it was in fastboot."""
-    if not dev.in_fastboot():
-        return False
-    disarm(dev, j)
-    return True
+    """For code already in fastboot (flash, rescue, rollback): send
+    ``fb_mode_clear`` (harmless when nothing is set) and **don't** resolve.
+    Returns True if an obligation is pending; the caller calls ``settle``
+    once the phone is on the slot it meant (R5-1).
+
+    A failed clear with nothing pending is logged and ignored, so it never
+    aborts a rescue or rollback (review round 5). With an obligation
+    pending it raises ClearFailed: the caller still sets the fallback slot
+    active, then halts. A GuardError always propagates."""
+    from .device import GuardError
+    j = j or journal()
+    owed = pending(j) is not None
+    try:
+        dev.fb_mode_clear()
+    except GuardError:
+        raise
+    except (RuntimeError, TimeoutError) as e:
+        if owed:
+            raise ClearFailed(f"fastboot oem fb_mode_clear failed with an fb_mode obligation pending: {e}") from e
+        log(f"warning: fastboot oem fb_mode_clear failed ({e}); no fb_mode obligation is pending, so going on")
+    return owed
 
 
 def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None,
             j: jmod.Journal | None = None) -> str | None:
     """Clear a leftover fb_mode. Call it under the device lock, before the
-    adb guard (the phone may be sitting in fastboot).
+    adb guard (the phone may be sitting in fastboot). It boots the
+    **active** slot, so slot recovery must not use it (R5-1).
 
     - Obligation pending, phone in Android: ``adb reboot bootloader``
-      (guarded), clear, resolve, boot Android.
-    - Phone in fastboot: clear and resolve; then boot Android if ``boot``
-      is True, or if ``boot`` is None and an obligation was pending.
+      (guarded), clear, then boot Android unless ``boot`` is False.
+    - Phone in fastboot: clear; then boot Android if ``boot`` is True, or if
+      ``boot`` is None and an obligation was pending.
     - Neither: nothing.
 
-    Returns a description of what it did, or None. Raises (GuardError,
-    TimeoutError, RuntimeError) if it could not finish; the obligation then
-    stays pending for the next recovery."""
+    The entry is resolved after the boot completed, or right after the
+    clear when the phone stays in fastboot. Returns a description of what it
+    did, or None. Raises (GuardError, TimeoutError, RuntimeError) if it
+    could not finish; the obligation then stays pending for the next
+    recovery."""
     j = j or journal()
     e = pending(j)
     in_fb = dev.in_fastboot()
@@ -96,13 +128,16 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None,
         dev.reboot_adb("bootloader")
         dev.wait_fastboot(120)
         took = True
-    disarm(dev, j)
+    dev.fb_mode_clear()
     what = ("cleared a pending fb_mode obligation" if e is not None else
             "found the phone in fastboot; cleared fb_mode")
-    if took or boot or (boot is None and e is not None):
+    if boot is True or (boot is None and (took or e is not None)):
         dev.reboot_fastboot()
         dev.wait_for_device(boot_timeout)
         dev.wait_boot_completed(boot_timeout)
         what += " and booted Android"
+    else:
+        what += "; the phone stays in fastboot"
+    settle(j)
     log(f"fb_mode recovery: {what}")
     return what

@@ -203,6 +203,9 @@ class _PromotePhone:
     def state(self):
         return "device"
 
+    def in_fastboot(self):
+        return False
+
     def root(self, seconds=60):
         pass
 

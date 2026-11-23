@@ -124,25 +124,43 @@ class Obligation(unittest.TestCase):
 
 
 class Callers(unittest.TestCase):
-    def test_to_fastboot_clears_fb_mode(self):
-        """Rescue and rollback reach fastboot through to_fastboot."""
+    def test_to_fastboot_never_clears_or_boots(self):
+        """R5-1: to_fastboot only gets to fastboot; the caller clears fb_mode
+        and sets the slot it wants first."""
         with bench_home():
             p = Phone("fastboot", fb=True)
             fbmode.arm(p)
             flashing.to_fastboot(p, 5)
-            self.assertFalse(p.fb)
-            self.assertIsNone(fbmode.pending())
+            self.assertEqual(p.calls, [("fb_mode_set",)])
+            self.assertIsNotNone(fbmode.pending())
 
-    def test_flash_preflight_recovers(self):
+    def test_generic_recovery_keeps_the_obligation_until_android_booted(self):
+        """R5-1: a host killed between the clear and the boot leaves the
+        entry, so the next recovery boots the phone."""
         with bench_home():
             p = Phone("fastboot")
             fbmode.arm(p)
-            with mock.patch.object(flashing, "Device", lambda *a: p), \
-                    mock.patch.object(flashing, "show_status", return_value=0), \
-                    mock.patch.object(flashing, "load_state", return_value=None):
-                flashing.main(["--rollback"])
-            self.assertIsNone(fbmode.pending())
+            p.reboot_fastboot = mock.Mock(side_effect=KeyboardInterrupt)    # killed here
+            with self.assertRaises(KeyboardInterrupt):
+                fbmode.recover(p, 10)
+            self.assertFalse(p.fb)
+            self.assertIsNotNone(fbmode.pending(), "resolved before the phone left fastboot")
+            del p.reboot_fastboot
+            self.assertIn("booted Android", fbmode.recover(p, 10))
             self.assertEqual(p.where, "android")
+            self.assertIsNone(fbmode.pending())
+
+    def test_boot_false_never_boots(self):
+        """R5-16: a dev flash recovers with boot=False and stays in fastboot,
+        even when it had to take the phone out of Android."""
+        with bench_home():
+            p = Phone("fastboot")
+            fbmode.arm(p)
+            p.where = "android"
+            self.assertIn("stays in fastboot", fbmode.recover(p, 10, boot=False))
+            self.assertEqual(p.calls[1:], [("reboot_adb", "bootloader"), ("fb_mode_clear",)])
+            self.assertEqual(p.where, "fastboot")
+            self.assertIsNone(fbmode.pending())
 
     def test_calibration_starts_from_fastboot(self):
         from riverqa import calibrate
