@@ -271,5 +271,45 @@ class R14GeminiMinors(unittest.TestCase):
             self.assertEqual((p.calls, p.boots), ([], []))
 
 
+class R14SolMinors(unittest.TestCase):
+    def test_boot_only_final_check_needs_one_completed_boot(self):
+        """Sol round 14: a same-slot restart between the completion wait
+        and the slot read. The final check reads slot and completion in one
+        call; not completed raises, exit 3, obligation pending."""
+        from test_round8 import arm_entry
+        from test_round10 import recover_cmd
+        with bench_home():
+            p = R9Phone(where="fastboot", active="a", bootable=("a", "b"), builds={"a": BID, "b": DEV_BID})
+            arm_entry("a", ids=("unstamped", "unstamped"))
+            p.slot_boot_state = lambda: ("_a", False)
+            rc, out = recover_cmd(p)
+            self.assertEqual(rc, 3, out)
+            self.assertIn("has not completed boot", out)
+            self.assertIsNotNone(fbmode.pending())
+
+    def test_unauthorized_state_and_message(self):
+        """Sol round 14: adb get-state exits nonzero with "unauthorized" on
+        stderr; Device.state keeps it, and the dev flash asks for the
+        USB-debugging prompt with nothing touched."""
+        import subprocess
+        from unittest import mock
+        from riverqa.device import Device
+        d = Device.__new__(Device)
+        d.serial = "ZY225DPT7F"
+        r = subprocess.CompletedProcess([], 1, "", "error: device unauthorized.\n")
+        with mock.patch.object(Device, "adb", return_value=r):
+            self.assertEqual(d.state(), "unauthorized")
+        r = subprocess.CompletedProcess([], 1, "", "error: no devices/emulators found\n")
+        with mock.patch.object(Device, "adb", return_value=r):
+            self.assertEqual(d.state(), "")
+        with bench_home():
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False)
+            p.state = lambda: "unauthorized"
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_ERROR, err)
+            self.assertIn("accept the USB-debugging prompt", err)
+            self.assertEqual(flashes(p.calls), [])
+
+
 if __name__ == "__main__":
     unittest.main()

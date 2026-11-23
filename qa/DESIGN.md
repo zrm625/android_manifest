@@ -2649,3 +2649,13 @@ fastboot (found in recovery, …)"; tests pin the boot-only edges (another
 slot active → `WrongSlot` before any clear; without `boot_only_ok` the
 entry is still refused with nothing touched). Its docstring and parser
 notes are the Opus follow-ups above.
+
+## Round 14: unanimous approval, and Sol's minors
+
+Round 14 (head `51bc797`): Opus 9, Gemini 9 and Sol 9 approve; none found
+a blocker or major anywhere in the harness. Sol's minors, folded in as a
+follow-up: the boot-only final check reads slot and boot completion with
+`slot_boot_state()` (one call, one boot); `Device.state()` returns
+`unauthorized` when `adb get-state` says so, and the dev flash then asks
+for the USB-debugging prompt instead of timing out; README and `phone-qa
+recover` help describe the boot-only path (exit 0, obligation pending).

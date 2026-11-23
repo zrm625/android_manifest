@@ -325,6 +325,15 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     # baseline (a guard failure only with an obligation pending), else exit
     # 1; Unreachable goes to main, which halts.
     found = dev.state()
+    if found == "unauthorized":
+        # Sol round 14: adb answers but the phone hasn't authorized this
+        # host. Nothing can read or reboot it, so ask for authorization.
+        msg = (f"{SERIAL} is connected but adb is unauthorized; accept the USB-debugging prompt on the phone "
+               "(tick \"Always allow\"), then run the flash again")
+        if owed is not None:
+            return recovery_halt(RuntimeError(msg), advice=pre_advice_for(owed, st, again))
+        log(f"error: {msg}.")
+        return EXIT_ERROR
     source = "getprop" if found == "device" else "fastboot"
     # R12-1: before the first baseline, what may be overwritten is decided
     # by the active slot alone, so it must be shown to boot: the phone found
@@ -332,7 +341,7 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     booted = False
     # Before the first baseline with an obligation pending, every halt gives
     # the R10-3/R11-1 way back, never flash --recover (Sol, round 12).
-    pre_advice = armed_way_back(owed, None, again) if st is None and owed is not None else None
+    pre_advice = pre_advice_for(owed, st, again)
     try:
         if source == "getprop":
             dev.guard()
@@ -500,6 +509,13 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         log(f"Note: known_good_slot is {st['known_good_slot']}; a batch flash first returns to it "
             "(flash --rollback).")
     return EXIT_OK
+
+
+def pre_advice_for(owed: dict | None, st: dict | None, again: str) -> str | None:
+    """The advice for a halt before any write: before the first baseline
+    with an obligation pending, the R10-3 way back; else recovery_halt's
+    default."""
+    return armed_way_back(owed, None, again) if st is None and owed is not None else None
 
 
 def armed_way_back(e: dict | None, active: str | None, again: str = "flash stripped") -> str:

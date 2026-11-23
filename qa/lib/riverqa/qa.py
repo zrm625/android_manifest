@@ -1136,6 +1136,9 @@ Usage:
                                        boot Android. The obligation is settled only once
                                        the booted phone matches the slot and build IDs it
                                        was armed on; otherwise exit 3 (HALT), still pending.
+                                       An obligation with a recorded slot but no usable
+                                       build IDs (unstamped): its slot is booted, exit 0,
+                                       and it stays pending until a dev flash settles it.
   phone-qa journal                     Show leftovers in the state journal.
   phone-qa helper                      Build (or verify) the river-qa helper APK.
   phone-qa version                     Print the harness version.

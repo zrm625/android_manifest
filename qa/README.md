@@ -81,7 +81,7 @@ with `flash --rollback`. Rollback wipes data, so run `phone-setup` after it.
 | `phone-qa controls --boot-timing` | The step-1 proofs again, under the current harness version. Refuses a `boot-timing.json` measured under older calibration rules, or whose samples don't give the stored A | n/a |
 | `phone-qa stage ID` | Copy a build's images into `$BENCH_HOME/batches/ID` | n/a |
 | `phone-qa helper` | Build or verify the helper APK | n/a |
-| `phone-qa recover` | Clear a leftover `fastboot oem fb_mode` (a journaled obligation, or the phone sitting in fastboot) and boot Android | n/a |
+| `phone-qa recover` | Clear a leftover `fastboot oem fb_mode` (a journaled obligation, or the phone sitting in fastboot) and boot Android. An obligation with no usable build IDs stays pending (exit 0) until a dev flash settles it | n/a |
 | `phone-qa journal` | Show anything the state journal still has to restore | n/a |
 | `phone-qa version` | The harness version (a content hash) | n/a |
 
@@ -350,8 +350,11 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
     another slot is active, set the armed slot active by hand first
     (from Android, `adb -s ZY225DPT7F reboot bootloader` first; then
     `fastboot -s ZY225DPT7F --set-active=<armed slot>`). For an entry
-    with the `unstamped` sentinel, which generic recovery refuses, the
-    advice is `flash stripped` with the armed slot active. Halts of a
+    with the `unstamped` sentinel, which generic recovery can't verify,
+    `phone-qa recover` clears fb_mode, boots the armed slot to completion
+    and exits 0 with the obligation still pending; then `flash stripped`
+    (keeping `--wipe` if you used it) writes the other slot and settles it
+    with its verified boot. Halts of a
     dev flash in this state never advise `flash --rollback` (it needs
     `slot-state.json`) or another flash.
     - Whatever is pending, a dev flash before the first baseline writes

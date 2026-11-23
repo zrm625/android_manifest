@@ -452,9 +452,12 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, want: W
     proof = None
     if boot_only is not None:
         dev.guard()
-        running = (dev.getprop("ro.boot.slot_suffix") or "").lstrip("_")
-        if running != boot_only:
-            raise RuntimeError(f"fastboot booted slot {boot_only}, but the phone runs slot {running or '?'}")
+        # Sol round 14: slot and boot completion from one call, one boot.
+        got, done = dev.slot_boot_state()
+        running = got.lstrip("_")
+        if running != boot_only or not done:
+            raise RuntimeError(f"fastboot booted slot {boot_only}, but the phone runs slot {running or '?'}"
+                               + ("" if done else " and has not completed boot"))
         what += (f" and booted Android on slot {boot_only}; the obligation, armed with no usable build IDs, stays "
                  "pending until a dev flash verifies the slot it writes")
         log(f"fb_mode recovery: {what}")

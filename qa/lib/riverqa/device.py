@@ -319,7 +319,12 @@ class Device:
             r = self.adb("get-state", timeout=10)
         except TimeoutError:
             return ""
-        return r.stdout.strip() if r.returncode == 0 else ""
+        if r.returncode == 0:
+            return r.stdout.strip()
+        # adb get-state exits nonzero for an unauthorized device, saying so
+        # on stderr; keep that, so callers can ask for authorization (Sol,
+        # round 14). Every other caller treats it like any non-device state.
+        return "unauthorized" if "unauthorized" in (r.stderr or "") else ""
 
     def getprop(self, name: str) -> str:
         return self.sh(f"getprop {shlex.quote(name)}").strip()
