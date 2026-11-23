@@ -424,6 +424,47 @@ class Calibration(unittest.TestCase):
         self.assertEqual(d["chain"]["sysrq"]["verdicts"], [PASS, UNVERIFIED])
         self.assertNotIn("proven", d["chain"]["sysrq"])
 
+    def test_renewal_needs_a_clean_current_record(self):
+        """R5-3: controls --boot-timing renews proofs only for a record the
+        current rules would set A from."""
+        from riverqa import calibrate
+        good = self.data()
+        calibrate.compute_paths(good)
+        good["rules_version"] = calibrate.CALIBRATION_RULES
+        self.assertEqual(calibrate.record_problems(good), [])
+        # A legacy-shaped record: an A, but no rules stamp and no bracketed samples.
+        legacy = self.data()
+        for r in legacy["raw"]["fastboot"] + legacy["raw"]["sysrq"] + list(legacy["inject_measure"].values()):
+            r.pop("disconnect_gap"), r.pop("status_read_s")
+        legacy["paths"] = {p: dict(good["paths"][p]) for p in good["paths"]}
+        probs = calibrate.record_problems(legacy)
+        self.assertTrue(any("calibration rules" in x for x in probs), probs)
+        self.assertTrue(any("sysrq: its samples give no A" in x for x in probs), probs)
+        legacy["rules_version"] = calibrate.CALIBRATION_RULES
+        self.assertTrue(calibrate.record_problems(legacy))
+        # A stored A that the samples don't give.
+        bent = self.data()
+        calibrate.compute_paths(bent)
+        bent["rules_version"] = calibrate.CALIBRATION_RULES
+        bent["paths"]["sysrq"]["A"] = 14.8
+        self.assertIn("stored A 14.8", " ".join(calibrate.record_problems(bent)))
+
+    def test_prove_main_refuses_a_legacy_record(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+        from riverqa import calibrate
+        legacy = self.data(sysrq=[raw(10.06, disconnect_gap=None), raw(10.07, disconnect_gap=None),
+                                  raw(10.08, disconnect_gap=None)])
+        calibrate.compute_paths(legacy)
+        legacy["paths"]["sysrq"]["A"] = 12.3
+        with bench_home(), mock.patch.object(reboots, "load_timing", return_value=legacy), \
+                mock.patch.object(calibrate, "Device", side_effect=AssertionError("touched the phone")), \
+                mock.patch.object(calibrate, "prove", side_effect=AssertionError("renewed")), \
+                redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(calibrate.prove_main(), 2)
+        self.assertIn("does not qualify for renewed proofs", err.getvalue())
+
     def test_qualified_needs_every_proof_and_the_adb_chain_control(self):
         from riverqa import calibrate
         d = {"paths": {"sysrq": dict(PROOFS), "fastboot": dict(PROOFS)},

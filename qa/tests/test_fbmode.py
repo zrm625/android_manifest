@@ -280,7 +280,8 @@ class FailedRecoveryExitsCleanly(unittest.TestCase):
                     p.wait_for_device = mock.Mock(side_effect=TimeoutError("no adb"))
                 with mock.patch.object(calibrate, "Device", lambda *a: p), redirect_stderr(io.StringIO()) as err:
                     self.assertEqual(calibrate.boot_timing_main([]), 1)
-                    with mock.patch.object(reboots, "load_timing", return_value={"paths": {"sysrq": {}}}):
+                    with mock.patch.object(reboots, "load_timing", return_value={"paths": {"sysrq": {}}}), \
+                            mock.patch.object(calibrate, "record_problems", return_value=[]):
                         self.assertEqual(calibrate.prove_main(), 1)
                 self.assertEqual(err.getvalue().count("error: fb_mode recovery failed"), 2, err.getvalue())
                 self.assertIsNotNone(fbmode.pending())

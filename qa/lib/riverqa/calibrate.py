@@ -131,6 +131,10 @@ def boot_count_now(dev: Device, settle_s: float = 60) -> int | None:
 
 
 MIN_CLEAN_NORMALS = 3   # clean normal reboots a path needs before it gets an A (review round 4)
+# The calibration rules a boot-timing.json was measured under. Bump it when
+# sample_problems or compute_paths change what a clean sample is or how A is
+# set. 2: round 4's bracketed clock and clean-sample rules (R4-1, R4-2).
+CALIBRATION_RULES = 2
 
 
 def sample_problems(r: dict, *, normal: bool) -> list[str]:
@@ -216,6 +220,32 @@ def compute_paths(data: dict) -> None:
         data["paths"][path] = dict(empty, A=a_val, why=why, extra_pass=round(extra, 3),
                                    extra_pass_flash_path=flash_pass, extra_pass_injected_increment=round(inc, 3),
                                    mean=round(statistics.mean(passes[path]), 3))
+
+
+def record_problems(data: dict) -> list[str]:
+    """Why a stored boot-timing.json can't have its proofs renewed by
+    controls --boot-timing, or [] (R5-3). It must be measured under the
+    current CALIBRATION_RULES, and compute_paths on its own samples must
+    give every gated path the same, non-null A: 3 clean, bracketed normal
+    reboots and a clean injected sample. A legacy record (no rules stamp,
+    unbracketed samples) never qualifies. Pure."""
+    import copy
+    why = []
+    if data.get("rules_version") != CALIBRATION_RULES:
+        why.append(f"measured under calibration rules {data.get('rules_version') or 'from before round 4'}, "
+                   f"not the current rules {CALIBRATION_RULES}")
+    again = {"raw": copy.deepcopy(data.get("raw") or {}),
+             "inject_measure": copy.deepcopy(data.get("inject_measure") or {}),
+             "paths": {}, "chain": {}}
+    compute_paths(again)
+    for path in reboots.GATED_PATHS:
+        want = (again["paths"].get(path) or {}).get("A")
+        have = ((data.get("paths") or {}).get(path) or {}).get("A")
+        if want is None:
+            why.append(f"{path}: its samples give no A ({again['paths'][path]['why']})")
+        elif have is None or abs(float(have) - float(want)) > 1e-9:
+            why.append(f"{path}: the stored A {have} is not the {want} its clean samples give")
+    return why
 
 
 def prove(dev: Device, w: UsbWatcher, data: dict) -> None:
@@ -328,6 +358,11 @@ def prove_main() -> int:
             if not data.get("paths"):
                 log("error: no boot-timing.json; run `phone-qa boot-timing` first")
                 return 2
+            problems = record_problems(data)
+            if problems:     # R5-3: never renew proofs for an A the current rules wouldn't set
+                log("error: boot-timing.json does not qualify for renewed proofs; run `phone-qa boot-timing`: "
+                    + "; ".join(problems))
+                return 2
             dev = Device(SERIAL)
             if not recover_fb_mode(dev):    # resume from fastboot or a leftover fb_mode (R4-3)
                 return 1
@@ -365,7 +400,8 @@ def run(n_normal: int, reuse: bool = False) -> int:
     dev.guard()
     dev.root()
     old = reboots.load_timing()
-    data = {"measured_at": now_iso(), "build": dev.getprop("ro.lineage.display.version"),
+    data = {"measured_at": now_iso(), "rules_version": CALIBRATION_RULES,
+            "build": dev.getprop("ro.lineage.display.version"),
             "build_date_utc": dev.getprop("ro.build.date.utc"), "raw": {p: [] for p in reboots.GATED_PATHS},
             "inject_measure": {}, "paths": {}, "chain": {}, "controls": {}}
     timing_none = {}  # no allowance while measuring
