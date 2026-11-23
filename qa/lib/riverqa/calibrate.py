@@ -115,9 +115,10 @@ def save_nopass_pstore(rec, log_bytes: bytes):
 def boot_count_now(dev: Device, settle_s: float = 60) -> int | None:
     """SYSTEM_BOOT entries in dropbox once the count has settled (it is
     written after BOOT_COMPLETED, so a settled count is at least 1; review
-    round 3). At the deadline, whatever was last read (possibly 0). Every
-    read is checked (review round 4); None if no read succeeded, so the
-    next sample records no boot count and is not clean."""
+    round 3). At the deadline, the last read's count (possibly 0). Every
+    read is checked (review round 4). If the last read failed the result is
+    None, never an older count (R5-14), so the next sample records no boot
+    count and is not clean."""
     from .evidence import checked_read
     end = time.monotonic() + settle_s
     last = None
@@ -125,7 +126,7 @@ def boot_count_now(dev: Device, settle_s: float = 60) -> int | None:
         ok, dump, _why = checked_read(dev, "dropbox", "dumpsys dropbox")
         n = bootsig.dropbox_tags(dump).count("SYSTEM_BOOT") if ok else None
         if (n is not None and n >= 1 and n == last) or time.monotonic() > end:
-            return n if n is not None else last
+            return n
         last = n
         time.sleep(3)
 

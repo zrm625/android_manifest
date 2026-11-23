@@ -564,6 +564,11 @@ class Calibration(unittest.TestCase):
         with mock.patch.object(calibrate.time, "sleep", lambda s: None), \
                 mock.patch.object(calibrate.time, "monotonic", lambda: next(clock)):
             self.assertIsNone(calibrate.boot_count_now(Dev(bad * 3)))
+        # R5-14: a good read, then failures to the deadline: unverified, not the stale count.
+        clock = itertools.count(0, 50)     # end at 60; the good read at 50, the failed one at 100
+        with mock.patch.object(calibrate.time, "sleep", lambda s: None), \
+                mock.patch.object(calibrate.time, "monotonic", lambda: next(clock)):
+            self.assertIsNone(calibrate.boot_count_now(Dev([(0, DROPBOX1, "")] + bad * 3)))
 
     def test_controls_boot_timing_command(self):
         from riverqa import calibrate, qa
