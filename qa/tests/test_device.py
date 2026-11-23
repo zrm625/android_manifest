@@ -92,6 +92,22 @@ class RebootGuard(unittest.TestCase):
                     Device().sh(cmd)
         self.assertEqual(sum("sysrq" in " ".join(c) for c in fake.cmds), 2)
 
+    def test_read_only_mentions_of_the_trigger_are_allowed(self):
+        """R5-9: only writes to sysrq-trigger are refused."""
+        fake = FakeRun()
+        reads = ("ls -l /proc/sysrq-trigger", "test -e /proc/sysrq-trigger && echo yes",
+                 "stat -c %a /proc/sysrq-trigger", "grep -c sysrq-trigger /init.rc")
+        writes = ("echo b>/proc/sysrq-trigger", "echo b >> /proc/sysrq-trigger", "echo b 1>'/proc/sysrq-trigger'",
+                  "dd if=/dev/zero of=/proc/sysrq-trigger bs=1 count=1", "printf b | tee -a /proc/sysrq-trigger",
+                  "su -c 'echo b > /proc/sysrq-trigger'", "cp /data/local/tmp/b /proc/sysrq-trigger")
+        with mock.patch.object(device, "run", fake):
+            for cmd in reads:
+                Device().sh(cmd)
+            for cmd in writes:
+                with self.assertRaises(GuardError, msg=cmd):
+                    Device().sh(cmd)
+        self.assertEqual(len(fake.cmds), len(reads))
+
     def test_sysrq_reboot_after_the_guard_and_as_root(self):
         class Root(FakeRun):
             def __call__(self, cmd, timeout, input=None, text=True, env=None):

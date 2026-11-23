@@ -167,11 +167,23 @@ def _is_reboot(args: tuple) -> bool:
 SYSRQ_REBOOT = "sync; echo b > /proc/sysrq-trigger"
 
 
+# Ways a shell command writes a file (R5-9): a redirection (>, >>, >|,
+# 1>), tee, dd of=, or a copy/move/link onto it. The target is the
+# sysrq-trigger path, possibly quoted.
+_SYSRQ_WRITE = re.compile(
+    r"""(?:\d?>>?\|?\s*['"]?\S*sysrq-trigger)"""
+    r"""|(?:\btee\b[^|;&\n]*sysrq-trigger)"""
+    r"""|(?:\bof=['"]?\S*sysrq-trigger)"""
+    r"""|(?:\b(?:cp|mv|ln|install)\b[^|;&\n]*sysrq-trigger)""")
+
+
 def _is_sysrq(args: tuple) -> bool:
-    """A write to the sysrq trigger (review round 4): any argument naming
-    /proc/sysrq-trigger, which only takes writes. Other uses of the word,
-    such as reading /proc/sys/kernel/sysrq, are allowed."""
-    return any("sysrq-trigger" in str(a) for a in args)
+    """A write to the sysrq trigger (review rounds 4 and 5): a redirection,
+    tee, dd of= or a copy onto /proc/sysrq-trigger. Read-only mentions
+    (ls, stat, test -e, grep) and other uses of the word, such as
+    /proc/sys/kernel/sysrq, are allowed (R5-9)."""
+    cmd = " ".join(str(a) for a in args)
+    return "sysrq-trigger" in cmd and _SYSRQ_WRITE.search(cmd) is not None
 
 
 class Device:
