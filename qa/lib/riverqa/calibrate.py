@@ -282,11 +282,15 @@ def unstamped_samples(data: dict) -> list[str]:
 
 def reuse_problems(old: dict, build_date_utc: str) -> list[str]:
     """Why ``--reuse-normals`` can't reuse a stored record's normal reboots,
-    or [] (R6-2): it must be from this build, written under the current
-    rules, and every normal sample on every gated path must carry the
+    or [] (R6-2): it must be from this build (a non-empty build date on
+    both sides, R7-10), written under the current rules, and every normal sample on every gated path must carry the
     current stamp (so its bracket values are full precision). Pure."""
     why = []
-    if old.get("build_date_utc") != build_date_utc:
+    if not build_date_utc or not old.get("build_date_utc"):
+        # R7-10: an empty date on either side can't tie the record to
+        # this build, even when both are empty.
+        why.append(f"build date unknown (stored {old.get('build_date_utc')!r}, this build {build_date_utc!r})")
+    elif old.get("build_date_utc") != build_date_utc:
         why.append(f"measured on build date {old.get('build_date_utc')}, not this build's {build_date_utc}")
     if old.get("rules_version") != CALIBRATION_RULES:
         why.append(f"written under calibration rules {old.get('rules_version') or 'unstamped'}, not "

@@ -690,6 +690,17 @@ class CalibrationProvenance(unittest.TestCase):
         self.assertEqual(len(normals), 8, "fresh normals were not measured")
         self.assertFalse(saved.get("reused_normals_from"))
 
+    def test_empty_build_date_is_never_reused(self):
+        """R7-10 (Gemini): an empty build_date_utc on either side, even on
+        both, fails closed (at 62f73de two empty dates matched)."""
+        from riverqa import calibrate
+        old = self.old_record(stamped=True)
+        self.assertEqual(calibrate.reuse_problems(old, self.BUILD), [])
+        for stored, now in (("", ""), (None, ""), ("", self.BUILD), (self.BUILD, "")):
+            with self.subTest(stored=stored, now=now):
+                why = calibrate.reuse_problems(dict(old, build_date_utc=stored), now)
+                self.assertTrue(any("build date unknown" in w for w in why), why)
+
     def test_proofs_are_judged_with_the_recorded_a(self):
         """R7-6: prove() judges its fresh reboots under the current rules,
         so allowance_for gives them the recorded A (no stored samples)."""
