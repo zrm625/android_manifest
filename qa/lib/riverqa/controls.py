@@ -7,10 +7,14 @@ records which check produced the verdict, not only the verdict.
 
 Kinds:
 - ``qa``: run phone-qa with RIVERQA_CONTROL=<name>; the named checks inject
-  the fault (see ``control_active()`` in the check code) and the control is
-  judged by the target check's state.
+  the fault (see ``control_active()`` in the check code) and set
+  ``run.control_injected``. A control qualifies only if that marker names it
+  and a target check reached the expected state (control_verdict). The two
+  extra-reboot controls inject during flash or device-bench (run them with
+  RIVERQA_CONTROL set); batch.json's ``control_injections`` records it.
 - ``step1``: proved by ``phone-qa boot-timing`` (the extra-pass controls).
-- ``host``: pure host logic with stubbed gh / git ls-remote.
+- ``host``: flash --recover against a scratch $BENCH_HOME with stubbed gh /
+  git ls-remote, judged by the slot-state.json it persists.
 - ``recovery``: kill a run mid-check, then run again; the journal must restore
   the phone and the next run must be clean.
 """
@@ -97,7 +101,8 @@ def show_controls(version: str) -> int:
 
 def apply_pre(run, name: str) -> None:
     """Mutate the run's view of its inputs for controls that break evidence
-    rather than the phone. Never touches files outside the run directory."""
+    rather than the phone. Never touches files outside the run directory.
+    Each mutation sets the injection marker."""
     if name == "wrong-batch-json":
         run.batch = copy.deepcopy(run.batch)
         run.batch["build_id"] = (run.batch.get("build_id") or "x") + "-other"
@@ -109,11 +114,12 @@ def apply_pre(run, name: str) -> None:
     elif name == "boot-hash-mismatch":
         run.batch = copy.deepcopy(run.batch)
         run.batch["images"]["boot"]["sha256"] = "0" * 64
-    elif name == "missing-median":
-        run.control_drop_rows_after = 1
     elif name == "camera-set-changed":
         run.batch = copy.deepcopy(run.batch)
         run.batch["cameras"]["set"] = [0, 1]
+    else:
+        return
+    run.control_injected = name
 
 
 def run_control(run, name: str, lock_result) -> int:
@@ -122,7 +128,9 @@ def run_control(run, name: str, lock_result) -> int:
     if kind == "host":
         ok, got = host_control(name)
         _store(run.version, name, {"at": now_iso(), "expected": expected, "got": got, "qualified": ok,
-                                   "check": "recovery decision (stubbed gh, git ls-remote)"})
+                                   "injected": True,
+                                   "check": "flash --recover, judged by the persisted slot-state.json "
+                                            "(stubbed gh, git ls-remote)"})
         print(f"control {name}: {got} -> {'qualified' if ok else 'NOT qualified'}")
         return 0 if ok else 1
     if kind == "step1":
@@ -139,35 +147,119 @@ def run_control(run, name: str, lock_result) -> int:
     return qa.full_run(run, lock_result)
 
 
+def control_verdict(name: str, results: dict, injected: str | None, code: int) -> tuple[bool, dict]:
+    """Did this control qualify? Only if its fault was really injected (the
+    run's marker names it) and a target check reached the expected state
+    (A1). Returns (qualified, record). Pure."""
+    kind, targets, expected, _ = CONTROLS[name]
+    marked = injected == name
+    if kind == "recovery":
+        j = results.get("preflight.journal")
+        det = (j.details if j else {}) or {}
+        restored = int(det.get("restored") or 0)
+        killed = det.get("killed_runs") or []
+        ok = marked and code == 0 and j is not None and j.state == PASS and restored > 0 and bool(killed)
+        return ok, {"expected": expected, "injected": marked, "exit": code, "restored": restored,
+                    "killed_runs": killed, "check": "preflight.journal + clean rerun",
+                    "targets": {"preflight.journal": {"state": j.state if j else "missing",
+                                                      "summary": j.summary if j else None}}}
+    tgt = {t: {"state": results[t].state if t in results else "missing",
+               "summary": results[t].summary if t in results else None} for t in targets}
+    hit = [t for t, v in tgt.items() if v["state"] == expected]
+    return marked and bool(hit), {"expected": expected, "injected": marked, "targets": tgt,
+                                  "check": ", ".join(hit) or "none"}
+
+
 def record_control(run, code: int) -> None:
     name = active()
     if not name:
         return
-    kind, targets, expected, _ = CONTROLS[name]
-    if kind == "recovery":
-        j_ok = run.results.get("preflight.journal")
-        ok = code == 0 and j_ok is not None and j_ok.state == PASS
-        got = {"exit": code, "journal": j_ok.summary if j_ok else None}
-        check = "preflight.journal + clean rerun"
-    else:
-        got = {t: run.results[t].state if t in run.results else "missing" for t in targets}
-        ok = any(s == expected for s in got.values())
-        check = ", ".join(t for t, s in got.items() if s == expected) or "none"
-    _store(run.version, name, {"at": now_iso(), "expected": expected, "got": got, "qualified": ok,
-                               "check": check, "run_id": run.run_id})
-    print(f"control {name}: expected {expected}, got {json.dumps(got)} -> {'qualified' if ok else 'NOT qualified'}")
+    ok, rec = control_verdict(name, run.results, getattr(run, "control_injected", None), code)
+    _store(run.version, name, {"at": now_iso(), "qualified": ok, "run_id": run.run_id, **rec})
+    why = "" if rec["injected"] else " (fault not injected)"
+    print(f"control {name}: expected {rec['expected']}, got "
+          f"{json.dumps({t: v['state'] for t, v in rec['targets'].items()})}{why} -> "
+          f"{'qualified' if ok else 'NOT qualified'}")
+
+
+class _PromotePhone:
+    """The phone as flash --promote sees it, for the host control: running
+    the candidate slot with the batch's build and a boot hash. Never adb."""
+
+    serial = "control"
+
+    def __init__(self, slot: str, build_id: str):
+        self.slot, self.build_id = slot, build_id
+
+    def guard(self):
+        pass
+
+    def state(self):
+        return "device"
+
+    def root(self, seconds=60):
+        pass
+
+    def getprop(self, name):
+        return f"_{self.slot}" if name == "ro.boot.slot_suffix" else ""
+
+    def sh(self, cmd, timeout=30):
+        if "ro.vendor.river.build_id" in cmd:
+            return f"ro.vendor.river.build_id={self.build_id}\n"
+        if "ro.river.build_id" in cmd:
+            return f"ro.river.build_id={self.build_id}\n"
+        if "sha256sum" in cmd:
+            return "c" * 64 + "  boot\n"
+        return "0\n" if cmd == "id -u" else ""
 
 
 def host_control(name: str) -> tuple[bool, str]:
-    from . import recovery, slots
-    batch = {"prs": [{"repo": "zrm625/android_manifest", "number": 1}], "tag": "known-good-x",
-             "tag_repos": ["https://github.com/zrm625/android_manifest"]}
+    """tag-pushed-host-killed: a batch whose PRs are merged and whose tag is
+    pushed at the merge commits, with the host killed before slot-state.json
+    was updated. Drive flash --recover itself, against a scratch $BENCH_HOME
+    with stubbed gh and git ls-remote, and judge the persisted slot-state.json:
+    the batch must be promoted, never rolled back."""
+    import tempfile
+    from pathlib import Path
+    from . import core, flashing, slots, stage
+    from .core import write_json as wj
+    saved = core.BENCH_HOME
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            core.BENCH_HOME = Path(tmp)
+            repos = sorted(stage.expected_repos())
+            commits = {p: "a" * 40 for p in repos}
+            h = stage.commit_set_hash(commits)
+            bid = f"ctl-{h}"
+            st = slots.first_run("a", "f" * 64, "t0")
+            st["baseline_closed"] = {"batch": "base", "build_id": None, "at": "t0", "seed": None,
+                                     "seed_written": True}
+            slots.reserve(st, "ctl", "batch", "f" * 64, "t1")
+            slots.mark_written(st, "flash-ctl", "t2")
+            flashing.save_state(st)
+            prs = [{"repo": "zrm625/android_manifest", "number": 1},
+                   {"repo": "zrm625/android_device_motorola_river", "number": 2}]
+            wj(core.batch_dir("ctl") / "batch.json", {
+                "batch": "ctl", "kind": "batch", "build_id": bid, "vendor_build_id": bid, "commit_set": commits,
+                "commit_set_hash": h, "prs": prs, "tag": "known-good-ctl",
+                "tag_repos": [f"https://github.com/{p['repo']}" for p in prs]})
+            merge = {p["repo"]: f"{p['number']:040x}" for p in prs}
 
-    def stub(cmd):
-        if cmd[0] == "gh":
-            return subprocess.CompletedProcess(cmd, 0, json.dumps({"state": "MERGED", "url": "u"}), "")
-        return subprocess.CompletedProcess(cmd, 0, "abc\trefs/tags/known-good-x\n", "")
-
-    look = recovery.lookup(batch, stub)
-    decision, why = slots.decide_recovery({"kind": "batch", "batch": "b"}, look)
-    return decision == slots.PROMOTE, f"{decision}: {why}"
+            def stub(cmd):
+                if cmd[0] == "gh":
+                    repo = cmd[cmd.index("--repo") + 1]
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps(
+                        {"state": "MERGED", "url": f"https://github.com/{repo}/pull/x",
+                         "mergeCommit": {"oid": merge[repo]}}), "")
+                repo = cmd[3].removeprefix("https://github.com/")
+                return subprocess.CompletedProcess(
+                    cmd, 0, f"{'9' * 40}\trefs/tags/known-good-ctl\n{merge[repo]}\trefs/tags/known-good-ctl^{{}}\n", "")
+            rc = flashing.recover(runner=stub, dev=_PromotePhone("b", bid))
+            after = flashing.load_state()
+    finally:
+        core.BENCH_HOME = saved
+    events = [e["event"] for e in after.get("history", [])]
+    ok = (rc == flashing.EXIT_OK and after["known_good_slot"] == "b" and after["pair"] is None
+          and "promote" in events and "rolled-back" not in events)
+    return ok, (f"flash --recover exit {rc}; persisted known_good_slot {after['known_good_slot']}, "
+                f"pair {'released' if after['pair'] is None else 'still reserved'}, events {events[-3:]}")

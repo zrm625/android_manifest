@@ -32,6 +32,12 @@ BOND_BONDED, BOND_NONE = "12", "10"
 SCAN_MODE_CONNECTABLE_DISCOVERABLE = 23
 
 
+def injected(run, name: str) -> None:
+    """Mark that a control's fault really went in (A1). record_control
+    qualifies a control only with this marker and the expected verdict."""
+    run.control_injected = name
+
+
 def th(run, key, default):
     """A threshold, never below its hard floor."""
     v = (run.thresholds.get("values") or {}).get(key, default)
@@ -107,16 +113,19 @@ def check_wifi(run) -> Result:
     cid = "radios.wifi"
     dev, cfg = run.dev, server_cfg(run)
     if control_active() == "wifi-off":
-        dev.sh("cmd wifi status")
         run.journal.record(PHONE, "wifi", "wifi", "enabled", attempt_id=run.attempt_id(), run_id=run.run_id)
         dev.sh("cmd wifi set-wifi-enabled disabled")
         time.sleep(3)
+        if "Wifi is disabled" in dev.sh("cmd wifi status"):
+            injected(run, "wifi-off")
     status = dev.sh("cmd wifi status")
     if run.server.lan_error:
         return Result(cid, UNVERIFIED, f"LAN test listener: {run.server.lan_error}")
     phone_ip = cfg.get("phone_wifi_addr")
     rounds, notes = [], []
     unbound = control_active() == "wifi-unbound"
+    if unbound:
+        injected(run, "wifi-unbound")
     for rnd in (1, 2):
         if rnd == 2:
             ok, msg = screen_off(dev)
@@ -211,7 +220,13 @@ def check_bluetooth(run) -> list[Result]:
     dev, cfg = run.dev, server_cfg(run)
     forge = cfg.get("forge_bt_addr", "").upper()
     show = bt_host("show")
-    if "Powered: yes" not in show or control_active() == "bt-rfkill":
+    if control_active() == "bt-rfkill":
+        # Control: only the adapter report is stubbed, as an rfkilled adapter
+        # prints it; the parsing below is the real check.
+        show = re.sub(r"Powered: yes", "Powered: no", show)
+        show = re.sub(r"PowerState: on", "PowerState: off-blocked", show)
+        injected(run, "bt-rfkill")
+    if "Powered: yes" not in show:
         # The harness never powers the host adapter itself.
         return [Result(cid, UNVERIFIED, "host Bluetooth adapter is not powered (fixture problem)")]
     m = re.search(r"Controller ([0-9A-F:]{17})", show)
@@ -346,7 +361,11 @@ def check_gps(run) -> Result:
     dev = run.dev
     cur = dev.sh("cmd location is-location-enabled").strip()
     run.journal.record(PHONE, "location", "location", cur, attempt_id=run.attempt_id(), run_id=run.run_id)
-    if control_active() != "location-off":
+    if control_active() == "location-off":
+        dev.sh("cmd location set-location-enabled false")
+        if dev.sh("cmd location is-location-enabled").strip() == "false":
+            injected(run, "location-off")
+    else:
         dev.sh("cmd location set-location-enabled true")
     res, attempts = None, 0
     try:
@@ -488,7 +507,9 @@ def check_cameras(run) -> list[Result]:
         exp = param(run, "camera0_photo_exposure_ns", 20_000_000)
         led_note = None
         if control_active() == "torch-disabled":
-            led_note = disable_torch(run)
+            took, led_note = disable_torch(run)
+            if took:
+                injected(run, "torch-disabled")
         r = helper.instrument(run, "camera_photo", {"id": 0, "torch": 1, "iso": iso, "exposure_ns": exp}, timeout=60)
         if control_active() == "torch-disabled":
             restore_led(run)
@@ -531,16 +552,23 @@ def torch_leds(run) -> list[str]:
                                   "/sys/class/leds/led:flash_* 2>/dev/null").split() if p]
 
 
-def disable_torch(run) -> str:
-    """Control only: hold the torch LEDs dark below the HAL."""
-    notes = []
-    for led in torch_leds(run):
-        f = f"{led}/max_brightness" if "switch" not in led else f"{led}/brightness"
+def disable_torch(run) -> tuple[bool, str]:
+    """Control only: hold the torch dark below the HAL through the LED
+    switch (led:switch_*/brightness). max_brightness is never written. True
+    only if every switch now reads 0."""
+    notes, took = [], True
+    switches = [led for led in torch_leds(run) if "/led:switch_" in led]
+    if not switches:
+        return False, "no led:switch_* node"
+    for led in switches:
+        f = f"{led}/brightness"
         cur = run.dev.sh(f"cat {f}").strip()
         run.journal.record(PHONE, "sysfs", f, cur, attempt_id=run.attempt_id(), run_id=run.run_id)
         run.dev.sh(f"echo 0 > {f}")
-        notes.append(f"{f}: {cur} -> 0")
-    return "; ".join(notes)
+        now = run.dev.sh(f"cat {f}").strip()
+        took = took and now == "0"
+        notes.append(f"{f}: {cur} -> {now}")
+    return took, "; ".join(notes)
 
 
 def restore_led(run):
@@ -559,6 +587,9 @@ def check_audio(run) -> Result:
     run.journal.record(PHONE, "volume_music", "music", m.group(1), attempt_id=run.attempt_id(), run_id=run.run_id)
     level = 0 if control_active() == "audio-volume-0" else int(param(run, "audio_volume", 9))
     dev.sh(f"cmd media_session volume --stream 3 --set {level}")
+    if level == 0 and control_active() == "audio-volume-0" and \
+            "volume is 0 " in dev.sh("cmd media_session volume --stream 3 --get"):
+        injected(run, "audio-volume-0")
     try:
         res = helper.instrument(run, "audio", {"amplitude": param(run, "audio_amplitude", 0.5)}, timeout=60)
     finally:
@@ -676,9 +707,10 @@ def backlight(dev) -> int | None:
     return None
 
 
-def color_matrix_diag(dev) -> list[float] | None:
+def color_matrix_diag(dev, run=None) -> list[float] | None:
     """The diagonal of SurfaceFlinger's colorTransformMatrix."""
-    if control_active() == "extra-dim-stub":
+    if control_active() == "extra-dim-stub" and run is not None:
+        injected(run, "extra-dim-stub")
         return [1.0, 1.0, 1.0]
     sf = dev.sh("dumpsys SurfaceFlinger", timeout=60)
     i = sf.find("colorTransformMatrix")
@@ -721,7 +753,7 @@ def check_screen(run) -> Result:
         time.sleep(1.5)
         cd = dev.sh("dumpsys color_display", timeout=30)
         m = re.search(r"Reduce bright colors:.*?Activated:\s*(\w+)", cd, re.S)
-        diag[v] = (m.group(1) if m else None, color_matrix_diag(dev))
+        diag[v] = (m.group(1) if m else None, color_matrix_diag(dev, run))
     d["extra_dim"] = {str(k): v for k, v in diag.items()}
     if diag[0][0] != "false" or diag[1][0] != "true":
         bad.append(f"color_display Activated {diag[0][0]} -> {diag[1][0]}")
@@ -937,6 +969,8 @@ def check_gestures(run) -> Result:
     dev = run.dev
     if control_active() == "nav-mode-0":
         put_setting(run, "secure", "navigation_mode", 0)
+        if dev.sh("settings get secure navigation_mode").strip() == "0":
+            injected(run, "nav-mode-0")
     sysui = dev.sh("dumpsys activity service com.android.systemui/.SystemUIService", timeout=60)
     nav = dev.sh("settings get secure navigation_mode").strip()
     home = dev.sh("cmd package resolve-activity --brief -a android.intent.action.MAIN "
@@ -1139,6 +1173,7 @@ def check_keyboard(run) -> Result:
             time.sleep(0.5)
             if control_active() == "input-text":
                 dev.sh(f"input text {word}")
+                injected(run, "input-text")
                 return
             for ch in word:
                 x, y = keys[ch]
@@ -1163,6 +1198,8 @@ def check_webview(run) -> Result:
     cid = "system.webview"
     token = secrets.token_hex(10)
     q = "?nobeacon" if control_active() == "beacon-blocked" else ""
+    if q:
+        injected(run, "beacon-blocked")
     url = f"http://127.0.0.1:{server_cfg(run)['local_port']}/page/{token}{q}"
     res = helper.instrument(run, "webview", {"url": url, "token": token, "timeout_s": 15}, timeout=60)
     early = helper_result(cid, res)
@@ -1187,6 +1224,8 @@ def check_video(run) -> Result:
     if control_active() == "software-decoder":
         args["force_decoder"] = "c2.android.avc.decoder"
     res = helper.instrument(run, "video", args, timeout=120)
+    if args.get("force_decoder") and res.get("decoder") == args["force_decoder"]:
+        injected(run, "software-decoder")   # the helper really used the forced decoder
     early = helper_result(cid, res)
     if early:
         return early
@@ -1248,6 +1287,7 @@ def check_time(run) -> Result:
         run.journal.record(PHONE, "ntp", "ntp", None, attempt_id=run.attempt_id(), run_id=run.run_id)
         dev.sh("cmd network_time_update_service set_server_config_for_tests --server ntp://192.0.2.1 "
                "--timeout_millis 2000")
+        injected(run, "bad-ntp")   # set after a successful sync
         e0 = float(dev.sh("cat /proc/uptime").split()[0]) * 1000
         out = dev.sh("cmd network_time_update_service force_refresh", timeout=60).strip()
         restore_now(run, PHONE, "ntp", "ntp")
@@ -1628,7 +1668,10 @@ def final_checks(run) -> None:
     run.add(Result("final.hal_deaths", PASS if deaths == "0" else (UNVERIFIED if deaths is None else FAIL),
                    f"HAL deaths since last reboot: {deaths}"))
     bid = dev.boot_id()
-    want = snap["boot_id"] if control_active() != "boot-id-changed" else "00000000-control"
+    want = snap["boot_id"]
+    if control_active() == "boot-id-changed":
+        want = "00000000-control"
+        injected(run, "boot-id-changed")
     run.add(Result("final.boot_id", PASS if bid == want else FAIL,
                    "boot_id unchanged" if bid == want else f"boot_id changed: {want[:8]} -> {bid[:8]}"))
     s = {"navigation_mode": dev.sh("settings get secure navigation_mode").strip(),

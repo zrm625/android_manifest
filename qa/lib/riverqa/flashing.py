@@ -259,6 +259,10 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
     kind = batch["kind"]
     if not wipe:
         raise SystemExit("error: a batch flash always wipes (--wipe)")
+    control = reboots.control_active()
+    if control and kind == "batch":
+        raise SystemExit(f"error: RIVERQA_CONTROL={control} on a kind 'batch' flash; controls use a "
+                         "calibration or experiment batch")
     hashes = check_images(images_dir, batch["images"])
     dev = Device(SERIAL)
     dev.guard()
@@ -314,7 +318,8 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
 
     log(f"Batch {batch_id} ({kind}): flashing slot {target}; fallback {pair['fallback']}")
     try:
-        rec = reboots.planned_reboot(dev, "fastboot", boot_timeout=FIRST_BOOT_TIMEOUT, in_fastboot=in_fb)
+        rec = reboots.planned_reboot(dev, "fastboot", boot_timeout=FIRST_BOOT_TIMEOUT, in_fastboot=in_fb,
+                                     inject_early_reboot=control == "extra-reboot-first-boot")
     except (TimeoutError, RuntimeError) as e:
         attempt["result"] = f"boot failed: {e}"
         save_attempt()
@@ -334,6 +339,12 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
                              "host_boot_seconds": rec.host_boot_seconds}
     save_attempt()
     batch["first_boot_seconds"] = rec.host_boot_seconds
+    if rec.control in ("early-reboot", "early-reboot-missed"):
+        batch.setdefault("control_injections", []).append(
+            {"control": control, "flash_attempt": attempt_id, "where": "first boot", "at": now_iso(),
+             "injected": rec.control == "early-reboot"})
+        if rec.control != "early-reboot":
+            batch["control_injections"][-1].pop("flash_attempt")   # missed: nothing for QA to find
     stage.save(batch)
     # A bootloader that fell back to the old slot by itself fails the batch.
     slot_now = running_slot(dev)

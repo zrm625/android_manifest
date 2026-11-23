@@ -214,10 +214,27 @@ def check_controls(run: Run) -> Result:
 
 def check_journal(run: Run) -> Result:
     from .restore import recover_journal
+    before = {e["id"]: e for e in run.journal.entries}
     restored, dropped, failed = recover_journal(run)
+    after = {e["id"] for e in run.journal.entries}
+    gone = {e["id"] for e in dropped}
+    entries = [{"run_id": e.get("run_id"), "kind": e["kind"], "key": e["key"]}
+               for i, e in before.items() if i not in after and i not in gone]
+    d = {"restored": len(entries), "restored_entries": entries, "dropped": len(dropped)}
     if failed:
-        return Result("preflight.journal", FAIL, "journal recovery failed: " + "; ".join(failed))
-    return Result("preflight.journal", PASS, f"restored {len(restored)}, dropped {len(dropped)} after a wipe")
+        return Result("preflight.journal", FAIL, "journal recovery failed: " + "; ".join(failed), d)
+    if control_active() == "killed-mid-check":
+        killed = killed_runs({e["run_id"] for e in entries if e["run_id"] and e["run_id"] != run.run_id})
+        d["killed_runs"] = killed
+        if entries and killed:
+            run.control_injected = "killed-mid-check"
+    return Result("preflight.journal", PASS, f"restored {len(entries)}, dropped {len(dropped)} after a wipe", d)
+
+
+def killed_runs(run_ids: set) -> list[str]:
+    """Runs that left journal entries and never wrote results.json: they were
+    killed, not finished."""
+    return sorted(r for r in run_ids if not (QA_HOME / "runs" / r / "results.json").exists())
 
 
 def proc_info(dev: Device) -> dict:
@@ -530,6 +547,14 @@ def batch_rows(run: Run) -> list[dict]:
 
 def check_bench_rows(run: Run) -> Result:
     rows = batch_rows(run)
+    if control_active() == "stale-csv-row" and rows:
+        # Control: a run-local copy of a row from another build, added to
+        # this run's view only (device.csv is never touched).
+        stale = dict(rows[0], run_id=rows[0]["run_id"] + "-stale",
+                     build_date_utc=str(int(rows[0].get("build_date_utc") or 0) - 86400),
+                     build_id="stale-" + str(rows[0].get("build_id")))
+        rows = rows + [stale]
+        run.control_injected = "stale-csv-row"
     if not rows:
         return Result("identity.bench_rows", UNVERIFIED, "no device-bench rows for this batch")
     want = run.batch["dates"]
@@ -614,7 +639,10 @@ def check_boot_evidence(run: Run) -> Result:
     if run.batch is None:
         return Result("health.boot_evidence", UNVERIFIED, NO_BATCH)
     states, notes, det = [], [], {}
-    for label, d, _path, first in evidence_dirs(run):
+    dirs = evidence_dirs(run)
+    if control_active() == "planted-crash":
+        dirs = plant_crash(run, dirs)
+    for label, d, _path, first in dirs:
         st, msg, details = evidence.judge(d, first_boot=first)
         # judge() binds collection boot_id to the completion boot_id it was
         # given; for bench boots also check completion.json.
@@ -634,10 +662,36 @@ def check_boot_evidence(run: Run) -> Result:
     return Result("health.boot_evidence", worst(states), "; ".join(notes), det)
 
 
+def plant_crash(run: Run, dirs: list) -> list:
+    """Control: copy one earlier measured boot's evidence into the run
+    directory, plant a FATAL line in its crash log, and judge the copy in its
+    place. The batch's own evidence is never touched."""
+    import shutil
+    for i, (label, d, path, first) in enumerate(dirs):
+        if first or not (d / "meta.json").exists():
+            continue
+        copy = run.dir / "control-evidence" / d.name
+        shutil.copytree(d, copy, dirs_exist_ok=True)
+        with open(copy / "crash.txt", "a") as f:
+            f.write("--------- beginning of crash\n"
+                    "E AndroidRuntime: FATAL EXCEPTION: main\n"
+                    "E AndroidRuntime: Process: river.qa.planted, PID: 4242\n")
+        run.control_injected = "planted-crash"
+        return dirs[:i] + [(label + " (planted crash)", copy, path, first)] + dirs[i + 1:]
+    return dirs
+
+
 def check_boot_signals(run: Run) -> Result:
     if run.batch is None:
         return Result("health.boot_signals", UNVERIFIED, NO_BATCH)
     timing = reboots.load_timing()
+    name = control_active()
+    if name in ("extra-reboot-first-boot", "extra-reboot-bench"):
+        # The fault went in during flash or device-bench; batch.json records
+        # it against this flash attempt.
+        if any(i.get("control") == name and i.get("flash_attempt") == run.attempt_id()
+               for i in run.batch.get("control_injections") or []):
+            run.control_injected = name
     states, notes = [], []
     for label, d, path, _first in evidence_dirs(run):
         sig = read_json(d / "signals.json")
@@ -726,8 +780,9 @@ def check_regression(run: Run) -> Result:
     if run.batch is None:
         return Result("health.regression", UNVERIFIED, NO_BATCH)
     rows = batch_rows(run)
-    if getattr(run, "control_drop_rows_after", None):
-        rows = rows[:run.control_drop_rows_after]
+    if control_active() == "missing-median" and len(rows) > 1:
+        rows = rows[:1]
+        run.control_injected = "missing-median"
     if run.mode in ("calibrate", "baseline"):
         b1 = rows[0] if rows else None
         if len(rows) < 3 or not b1:

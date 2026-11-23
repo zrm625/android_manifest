@@ -179,6 +179,10 @@ def run(a) -> int:
             return rc
     batch = stage.load(a.batch) if a.batch else None
     attempt = None
+    control = reboots.control_active()
+    if control and (not batch or batch.get("kind") == "batch"):
+        log(f"error: RIVERQA_CONTROL={control} needs a calibration or experiment batch (--batch)")
+        return 1
     if batch:
         attempt = current_attempt(batch)
         if attempt is None:
@@ -197,7 +201,8 @@ def run(a) -> int:
         log(f"Boot {i}/{a.boots}")
         dev.root()
         try:
-            rec = reboots.planned_reboot(dev, "adb", boot_timeout=flashing.BOOT_TIMEOUT)
+            rec = reboots.planned_reboot(dev, "adb", boot_timeout=flashing.BOOT_TIMEOUT,
+                                         inject_early_reboot=control == "extra-reboot-bench" and i == 1)
         except (TimeoutError, RuntimeError) as e:
             log(f"error: boot {i} failed: {e}")
             if batch:
@@ -209,6 +214,14 @@ def run(a) -> int:
                     log(f"HALT: {h}")
                     return flashing.EXIT_HALT
             return 1
+        if rec.control in ("early-reboot", "early-reboot-missed"):
+            b = stage.load(a.batch)
+            inj = {"control": control, "run_id": run_id, "boot": i, "where": "bench boot", "at": now_iso(),
+                   "injected": rec.control == "early-reboot"}
+            if rec.control == "early-reboot":
+                inj["flash_attempt"] = attempt["attempt_id"]
+            b.setdefault("control_injections", []).append(inj)
+            stage.save(b)
         key = f"{run_id}-{i}"
         ev_dir = batch_dir(a.batch) / "boots" / key if batch else None
         if ev_dir:
