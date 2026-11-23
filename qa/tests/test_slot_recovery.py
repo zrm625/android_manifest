@@ -279,6 +279,212 @@ class RecoverNoPair(unittest.TestCase):
             self.assertIn("No unresolved pair", err)
 
 
+def run_main(phone, *argv):
+    """run_flash, but an exception escaping main is an outcome too (a
+    traceback, not exit 3): it comes back as ("raised", repr)."""
+    try:
+        return run_flash(phone, *argv)
+    except Exception as e:     # noqa: BLE001
+        return "raised", repr(e)
+
+
+class FailingPhone(SlotPhone):
+    """SlotPhone with recovery failures: ``set_active_fails`` (fastboot
+    --set-active returns an error) and ``no_bootloader`` (adb reboot
+    bootloader never reaches fastboot)."""
+
+    def __init__(self, *a, set_active_fails=False, no_bootloader=False, **kw):
+        super().__init__(*a, **kw)
+        self.set_active_fails, self.no_bootloader = set_active_fails, no_bootloader
+
+    def fastboot_ok(self, *args, timeout=300):
+        if self.set_active_fails and args[0].startswith("--set-active="):
+            self.calls.append(("fastboot",) + args)
+            raise RuntimeError("fastboot --set-active failed: FAILED (remote: 'unknown command')")
+        return super().fastboot_ok(*args, timeout=timeout)
+
+    def reboot_adb(self, target=None):
+        if self.no_bootloader and target == "bootloader":
+            self.calls.append(("reboot_adb", target))
+            self.where, self.running = "hung", None
+            return
+        return super().reboot_adb(target)
+
+    def guard(self):
+        if self.where != "android":
+            from riverqa.device import GuardError
+            raise GuardError("adb guard: the phone is not in Android")
+
+
+PROMOTE = (slots.PROMOTE, "proved (test)")
+
+
+def promote_mocks():
+    """The host side of a PROMOTE decision, proved by fiat."""
+    from riverqa import recovery, stage
+    return (mock.patch.object(recovery, "lookup", return_value={"prs": [], "tags": []}),
+            mock.patch.object(slots, "decide_recovery", return_value=PROMOTE),
+            mock.patch.object(stage, "repo_slugs", return_value={}),
+            mock.patch.object(stage, "load", return_value={"batch": "cand", "build_id": "river-cand"}),
+            mock.patch.object(stage, "batch_identity_errors", return_value=[]))
+
+
+class RecoverHaltContract(unittest.TestCase):
+    """R6-1: every failure of flash --recover (and --rollback, and rescue)
+    on the phone exits HALT 3 with a clean error line; the fb_mode
+    obligation, and any pair, stay as they were. Driven through main."""
+
+    def assertHalted(self, rc, err, *, pair=None):
+        self.assertEqual(rc, flashing.EXIT_HALT, err)
+        self.assertIn("error: ", err)
+        self.assertIn("HALT", err)
+        self.assertNotIn("Traceback", err)
+        self.assertIsNotNone(fbmode.pending(), "the fb_mode obligation was resolved on a failure")
+        if pair is not None:
+            self.assertEqual(bool(flashing.load_state()["pair"]), pair)
+
+    def test_no_pair_dev_slot_failed_clear_stays_in_fastboot(self):
+        """Sol: no pair, a dev slot active, the clear fails: stay in
+        fastboot, switch nothing, wipe nothing, HALT."""
+        with bench_home():
+            state(pair_kind=None)
+            p = FailingPhone(active="b", bootable=(), clear_fails=True)
+            fbmode.arm(p)
+            rc, err = run_main(p, "--recover")
+            self.assertHalted(rc, err, pair=False)
+            self.assertEqual(order(p.calls), ["clear"])
+            self.assertEqual((p.where, p.active, p.boots), ("fastboot", "b", []))
+            self.assertIn("stays in fastboot", err)
+
+    def test_no_pair_set_active_fails(self):
+        with bench_home():
+            state(pair_kind=None)
+            p = FailingPhone(active="a", set_active_fails=True)
+            fbmode.arm(p)
+            rc, err = run_main(p, "--recover")
+            self.assertHalted(rc, err, pair=False)
+            self.assertEqual(p.boots, [])
+
+    def test_no_pair_bootloader_timeout(self):
+        """A TimeoutError on the way to fastboot (main's catch-all used to
+        make it exit 1)."""
+        with bench_home():
+            state(pair_kind=None)
+            p = FailingPhone(where="android", active="a", no_bootloader=True)
+            fbmode.arm(p)
+            p.where, p.running = "android", "a"
+            rc, err = run_main(p, "--recover")
+            self.assertHalted(rc, err, pair=False)
+
+    def test_before_the_first_baseline(self):
+        """No slot-state.json yet: the generic recovery's failures halt too,
+        both a failed clear and a boot that never completes."""
+        for kw in ({"clear_fails": True}, {"bootable": ()}):
+            with self.subTest(**kw), bench_home():
+                p = FailingPhone(active="a", **kw)
+                fbmode.arm(p)
+                rc, err = run_main(p, "--recover")
+                self.assertHalted(rc, err)
+                self.assertIsNone(flashing.load_state())
+
+    def test_promote_path_failures(self):
+        """A PROMOTE decision whose fb_mode recovery fails (clear) or times
+        out (the candidate never boots): HALT, pair and obligation kept."""
+        for kw in ({"clear_fails": True}, {"bootable": ()}):
+            with self.subTest(**kw), bench_home():
+                state(pair_kind="batch")
+                p = FailingPhone(active="b", **kw)
+                fbmode.arm(p)
+                mocks = promote_mocks()
+                with mocks[0], mocks[1], mocks[2], mocks[3], mocks[4]:
+                    rc, err = run_main(p, "--recover")
+                self.assertHalted(rc, err, pair=True)
+                self.assertEqual(flashing.load_state()["known_good_slot"], "a")
+
+    def test_rollback_path_failures(self):
+        """A ROLLBACK decision: --set-active fails, or adb reboot bootloader
+        never reaches fastboot. Nothing is wiped."""
+        for kw in ({"set_active_fails": True}, {"no_bootloader": True, "where": "android",
+                                                 "bootable": ("a", "b")}):
+            with self.subTest(**kw), bench_home():
+                state(pair_kind="calibration")
+                p = FailingPhone(**kw)
+                fbmode.arm(p)
+                if p.where == "android":
+                    p.running = "b"
+                rc, err = run_main(p, "--recover")
+                self.assertHalted(rc, err, pair=True)
+                self.assertNotIn("erase", order(p.calls))
+                self.assertEqual(p.boots, [])
+
+    def test_flash_rollback_set_active_fails(self):
+        with bench_home():
+            state(pair_kind="calibration")
+            p = FailingPhone(set_active_fails=True)
+            fbmode.arm(p)
+            rc, err = run_main(p, "--rollback")
+            self.assertHalted(rc, err, pair=True)
+            self.assertNotIn("erase", order(p.calls))
+
+    def test_rescue_raises_halt(self):
+        """flash_batch's rescue halts only on Halt, Unreachable and
+        GuardError; a fastboot error must arrive as Halt."""
+        with bench_home():
+            st = state(pair_kind="calibration")
+            p = FailingPhone(set_active_fails=True)
+            fbmode.arm(p)
+            with redirect_stderr(io.StringIO()), self.assertRaises(flashing.Halt):
+                flashing.rescue(p, st, "first boot timed out")
+            self.assertIsNotNone(fbmode.pending())
+
+
+class PhoneInFastbootNothingPending(unittest.TestCase):
+    """R6-8: a batch flash or --promote that finds the phone in fastboot
+    with no fb_mode obligation boots the slot it needs, or halts; it never
+    leaves the phone in fastboot for the next adb guard."""
+
+    def test_batch_flash_boots_known_good(self):
+        with bench_home():
+            state(pair_kind=None)
+            p = FailingPhone(active="a", fb=False)
+            with mock.patch.object(flashing, "flash_batch", return_value=flashing.EXIT_OK):
+                rc, err = run_main(p, "--batch", "x", "--wipe")
+            self.assertEqual(rc, flashing.EXIT_OK, err)
+            self.assertEqual((p.where, p.running, p.boots), ("android", "a", ["a"]))
+
+    def test_batch_flash_halts_on_another_active_slot(self):
+        with bench_home():
+            state(pair_kind=None)
+            p = FailingPhone(active="b", fb=False, bootable=())
+            with mock.patch.object(flashing, "flash_batch", side_effect=AssertionError("flashed")):
+                rc, err = run_main(p, "--batch", "x", "--wipe")
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+            self.assertEqual((p.where, p.boots), ("fastboot", []))
+            self.assertIn("not slot a", err)
+
+    def test_promote_boots_the_candidate(self):
+        with bench_home():
+            state(pair_kind="batch")
+            p = FailingPhone(active="b", fb=False, bootable=("a", "b"))
+            mocks = promote_mocks()
+            with mocks[0], mocks[1], mocks[2], mocks[3], mocks[4]:
+                rc, err = run_main(p, "--promote", "cand")
+            self.assertEqual(rc, flashing.EXIT_OK, err)
+            self.assertEqual(p.boots, ["b"])
+            self.assertEqual(flashing.load_state()["known_good_slot"], "b")
+
+    def test_promote_never_boots_another_slot(self):
+        with bench_home():
+            state(pair_kind="batch")
+            p = FailingPhone(active="a", fb=False)
+            mocks = promote_mocks()
+            with mocks[0], mocks[1], mocks[2], mocks[3], mocks[4]:
+                rc, err = run_main(p, "--promote", "cand")
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+            self.assertEqual(p.boots, [])
+            self.assertIsNotNone(flashing.load_state()["pair"])
+
+
 class DevFlash(unittest.TestCase):
     def test_dev_flash_never_boots_before_writing(self):
         """R5-16: flash --no-reboot (and every dev flash) recovers with
@@ -305,13 +511,28 @@ class DevFlash(unittest.TestCase):
             self.assertIn("unresolved slot pair", err)
 
     def test_preflight_timeout_halts(self):
-        """R5-11: a recovery TimeoutError is a HALT, not EXIT_ERROR."""
+        """R5-11: a recovery TimeoutError is a HALT, not EXIT_ERROR. Here
+        known_good_slot a is active but hangs on boot."""
+        with bench_home():
+            state(pair_kind=None)
+            p = SlotPhone(active="a", bootable=())
+            fbmode.arm(p)
+            with mock.patch.object(flashing, "flash_batch", side_effect=AssertionError("flashed")):
+                rc, err = run_flash(p, "--batch", "x", "--wipe")
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+            self.assertIn("error: fb_mode recovery failed", err)
+            self.assertIsNotNone(fbmode.pending())
+
+    def test_promote_without_a_pair_never_touches_the_phone(self):
+        """R6-8: --promote checks its pair and proof on the host first."""
         with bench_home():
             state(pair_kind=None)
             p = SlotPhone(active="b", bootable=())
             fbmode.arm(p)
+            calls = list(p.calls)
             rc, err = run_flash(p, "--promote", "x")
-            self.assertEqual(rc, flashing.EXIT_HALT, err)
+            self.assertEqual(rc, flashing.EXIT_ERROR, err)
+            self.assertEqual(p.calls, calls)
             self.assertIsNotNone(fbmode.pending())
 
 

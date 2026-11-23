@@ -124,7 +124,8 @@ def clear_then_set_active(dev: Device, slot: str) -> bool:
     """In fastboot: clear fb_mode, then set ``slot`` active (R5-1). Returns
     True if an fb_mode obligation is pending; the caller settles it once the
     phone runs ``slot``. If the clear fails with an obligation pending, it
-    still sets ``slot`` active, then halts (review round 5)."""
+    still sets ``slot`` active, then halts (review round 5). A failed
+    ``--set-active`` halts too (R6-1); the obligation stays pending."""
     try:
         owed = fbmode.clear_in_fastboot(dev)
     except fbmode.ClearFailed as e:
@@ -135,8 +136,24 @@ def clear_then_set_active(dev: Device, slot: str) -> bool:
             done = f"setting slot {slot} active failed too ({e2})"
         raise Halt(f"{e}; {done}. Clear it by hand (fastboot -s {dev.serial} oem fb_mode_clear), then run "
                    "flash --rollback.") from e
-    dev.fastboot_ok(f"--set-active={slot}", timeout=60)
+    try:
+        dev.fastboot_ok(f"--set-active={slot}", timeout=60)
+    except Halt:
+        raise
+    except (RuntimeError, TimeoutError) as e:
+        raise Halt(f"fastboot --set-active={slot} failed: {e}") from e
     return owed
+
+
+def recovery_halt(e: BaseException) -> int:
+    """The one way slot recovery stops on a failure (R6-1): a clean
+    ``error:`` line, a note that any fb_mode obligation stays pending, and
+    exit 3. Nothing is resolved here."""
+    log(f"error: {e}")
+    if fbmode.pending() is not None:
+        log("The fb_mode obligation stays pending in the journal; flash --recover finishes it.")
+    log("HALT: notify Zak.")
+    return EXIT_HALT
 
 
 def rollback(dev: Device, st: dict, reason: str, attempt_id: str | None = None) -> dict:
@@ -153,14 +170,22 @@ def rollback(dev: Device, st: dict, reason: str, attempt_id: str | None = None) 
         raise Halt(f"pair fallback {fallback} is not known_good_slot {kg}")
     attempt_id = attempt_id or new_id("rollback")
     log(f"Rollback to slot {fallback}: {reason}")
-    to_fastboot(dev)
-    dev.fastboot_guard()
-    owed = clear_then_set_active(dev, fallback)
-    r = dev.fastboot("erase", "userdata", timeout=300)
-    if r.returncode != 0:
-        raise Halt(f"rollback: fastboot erase userdata failed: {(r.stderr or r.stdout).strip()[-300:]}")
-    seq = journal.record_wipe(qa_home(), attempt_id, "rollback")
-    dev.reboot_fastboot()
+    # Every failure before the reboot halts (R6-1): a fastboot error, a
+    # timeout, a guard failure or an unreachable phone. The pair and any
+    # fb_mode obligation stay as they are.
+    try:
+        to_fastboot(dev)
+        dev.fastboot_guard()
+        owed = clear_then_set_active(dev, fallback)
+        r = dev.fastboot("erase", "userdata", timeout=300)
+        if r.returncode != 0:
+            raise Halt(f"rollback: fastboot erase userdata failed: {(r.stderr or r.stdout).strip()[-300:]}")
+        seq = journal.record_wipe(qa_home(), attempt_id, "rollback")
+        dev.reboot_fastboot()
+    except Halt:
+        raise
+    except (RuntimeError, TimeoutError) as e:
+        raise Halt(f"rollback to slot {fallback} stopped before the reboot: {e}") from e
     try:
         dev.wait_for_device(FIRST_BOOT_TIMEOUT)
         dev.wait_boot_completed(FIRST_BOOT_TIMEOUT)
@@ -458,16 +483,25 @@ def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
         log(f"error: {batch_id} is not proven merged and tagged ({why}). The fallback slot stays reserved.")
         return EXIT_HALT if decision == slots.HALT else EXIT_ERROR
     dev = dev or Device(SERIAL)
-    dev.guard()
     target = pair["target"]
-    if running_slot(dev) != target:
-        log(f"error: the phone is not running the candidate slot {target}")
-        return EXIT_ERROR
-    s, v = partition_build_ids(dev)
-    if s != batch["build_id"] or v != batch["build_id"]:
-        log(f"error: candidate build IDs {s}/{v} differ from batch.json {batch['build_id']}")
-        return EXIT_ERROR
-    sha = boot_partition_sha(dev, target)
+    # The phone is touched only now, after the host-side proof. A leftover
+    # fb_mode, or a phone sitting in fastboot, is brought to Android on the
+    # candidate slot and nowhere else (R6-8): fbmode.recover halts instead
+    # of booting another active slot. Any failure on the phone halts with
+    # the pair and any fb_mode obligation intact (R6-1).
+    try:
+        fbmode.recover(dev, BOOT_TIMEOUT, boot=True, slot=target)
+        dev.guard()
+        if running_slot(dev) != target:
+            log(f"error: the phone is not running the candidate slot {target}")
+            return EXIT_ERROR
+        s, v = partition_build_ids(dev)
+        if s != batch["build_id"] or v != batch["build_id"]:
+            log(f"error: candidate build IDs {s}/{v} differ from batch.json {batch['build_id']}")
+            return EXIT_ERROR
+        sha = boot_partition_sha(dev, target)
+    except (RuntimeError, TimeoutError) as e:
+        return recovery_halt(e)
     slots.promote(st, batch_id, s, sha, now_iso())
     save_state(st)
     log(f"Promoted {batch_id} ({why}): known_good_slot is now {target}")
@@ -532,7 +566,14 @@ def recover_fb_mode_to_known_good(dev: Device, st: dict) -> int:
     dev.fastboot_guard()
     active = dev.getvar("current-slot").lstrip("_")
     if active != kg:
-        if fbmode.clear_in_fastboot(dev):
+        try:
+            owed = fbmode.clear_in_fastboot(dev)
+        except fbmode.ClearFailed as e:
+            # R6-1: stay in fastboot, switch nothing, wipe nothing, halt.
+            raise Halt(f"{e}. The phone stays in fastboot with slot {active or '?'} active; no slot was switched "
+                       f"and nothing was wiped. Clear it by hand (fastboot -s {dev.serial} oem fb_mode_clear), "
+                       f"then run flash --recover again, or flash --rollback to return to slot {kg}.") from e
+        if owed:
             fbmode.settle()
         log(f"error: fb_mode is cleared, but the active slot is {active or '?'}, not known_good_slot {kg}. The "
             f"phone stays in fastboot. Return to slot {kg} with flash --rollback (it wipes userdata), or boot "
@@ -565,17 +606,18 @@ def recover(runner=None, dev: Device | None = None) -> int:
         st = load_state()
     if not st or not st.get("pair"):
         dev = dev or Device(SERIAL)
-        if fbmode.pending() is not None or dev.in_fastboot():
-            if not st:
-                # No known-good slot yet (before the first baseline): only
-                # the generic recovery, which boots the active slot.
-                fbmode.recover(dev, BOOT_TIMEOUT, boot=True)
-                return EXIT_OK
-            try:
+        # R6-1: every failure on the phone below halts (exit 3) with a clean
+        # error line; nothing resolves the obligation on the way out.
+        try:
+            if fbmode.pending() is not None or dev.in_fastboot():
+                if not st:
+                    # No known-good slot yet (before the first baseline):
+                    # only the generic recovery, which boots the active slot.
+                    fbmode.recover(dev, BOOT_TIMEOUT, boot=True)
+                    return EXIT_OK
                 return recover_fb_mode_to_known_good(dev, st)
-            except (Halt, Unreachable, GuardError) as h:
-                log(f"HALT: {h}")
-                return EXIT_HALT
+        except (RuntimeError, TimeoutError) as e:
+            return recovery_halt(e)
         log("No unresolved pair.")
         return EXIT_OK
     pair = st["pair"]
@@ -595,16 +637,14 @@ def recover(runner=None, dev: Device | None = None) -> int:
     dev = dev or Device(SERIAL)
     try:
         if decision == slots.PROMOTE:
-            # The candidate is the slot to keep, so booting the active slot
-            # is right here.
-            fbmode.recover(dev, BOOT_TIMEOUT)
+            # promote_batch brings the phone to the candidate slot (fb_mode
+            # recovery, booting only that slot) before it reads it (R6-8).
             return promote_batch(pair["batch"], runner, dev)
         dev.guard() if dev.state() == "device" else None
         rollback(dev, st, f"recovery: {why}")
         return EXIT_OK
-    except (Halt, Unreachable, GuardError) as h:
-        log(f"HALT: {h}")
-        return EXIT_HALT
+    except (RuntimeError, TimeoutError) as e:    # R6-1: every failure halts, obligation intact
+        return recovery_halt(e)
 
 
 def show_status() -> int:
@@ -698,17 +738,23 @@ def main(argv: list[str]) -> int:
                     log(f"error: batch {st['pair']['batch']} holds an unresolved slot pair; resolve it first "
                         "(flash --recover)")
                     return EXIT_ERROR
-            if a.promote or building:
+            if building:
                 # A leftover fb_mode would stop every boot in fastboot. A
-                # batch flash and --promote need Android, so this boots it.
-                # A dev flash only needs fastboot, so it never boots
-                # (R5-16): the active slot may be one that doesn't boot.
+                # batch flash needs Android on known_good_slot, so it boots
+                # that slot, also from a phone found in fastboot with
+                # nothing pending (R6-8), and halts rather than boot another
+                # active slot. A dev flash only needs fastboot, so it never
+                # boots (R5-16): the active slot may be one that doesn't
+                # boot. --promote does its own, after its host-side proof.
+                st = load_state()
                 try:
-                    fbmode.recover(Device(SERIAL), BOOT_TIMEOUT,
-                                   boot=False if not (a.batch or a.promote) else None)
-                except (RuntimeError, TimeoutError) as e:   # R5-11: HALT, not EXIT_ERROR
-                    log(f"HALT: fb_mode recovery failed: {e}")
-                    return EXIT_HALT
+                    if a.batch:
+                        fbmode.recover(Device(SERIAL), BOOT_TIMEOUT, boot=True,
+                                       slot=st["known_good_slot"] if st else None)
+                    else:
+                        fbmode.recover(Device(SERIAL), BOOT_TIMEOUT, boot=False)
+                except (RuntimeError, TimeoutError) as e:   # R5-11, R6-1: HALT, not EXIT_ERROR
+                    return recovery_halt(RuntimeError(f"fb_mode recovery failed: {e}"))
             if a.rollback:
                 st = load_state()
                 if not st:
@@ -719,9 +765,8 @@ def main(argv: list[str]) -> int:
                     if dev.state() == "device":
                         dev.guard()
                     rollback(dev, st, "requested (flash --rollback)")
-                except GuardError as e:   # mid-rollback: the pipeline halts (C7)
-                    log(f"HALT: {e}")
-                    return EXIT_HALT
+                except (RuntimeError, TimeoutError) as e:   # mid-rollback: the pipeline halts (C7, R6-1)
+                    return recovery_halt(e)
                 return EXIT_OK
             if a.recover:
                 return recover()
@@ -751,6 +796,8 @@ def main(argv: list[str]) -> int:
         log(f"HALT: {e}")
         return EXIT_HALT
     except TimeoutError as e:
+        if a.rollback or a.recover or fbmode.pending() is not None:
+            return recovery_halt(e)       # R6-1: never exit 1 from recovery or with an obligation pending
         log(f"error: {e}")
         return EXIT_ERROR
 

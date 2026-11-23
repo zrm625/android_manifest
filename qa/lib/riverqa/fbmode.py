@@ -96,7 +96,7 @@ def clear_in_fastboot(dev, j: jmod.Journal | None = None) -> bool:
     return owed
 
 
-def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None,
+def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, slot: str | None = None,
             j: jmod.Journal | None = None) -> str | None:
     """Clear a leftover fb_mode. Call it under the device lock, before the
     adb guard (the phone may be sitting in fastboot). It boots the
@@ -107,6 +107,10 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None,
     - Phone in fastboot: clear; then boot Android if ``boot`` is True, or if
       ``boot`` is None and an obligation was pending.
     - Neither: nothing.
+
+    With ``slot`` (R6-8), it boots only that slot: if fastboot reports
+    another slot active, it raises before clearing or booting anything, and
+    the caller halts.
 
     The entry is resolved after the boot completed, or right after the
     clear when the phone stays in fastboot. Returns a description of what it
@@ -128,10 +132,17 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None,
         dev.reboot_adb("bootloader")
         dev.wait_fastboot(120)
         took = True
+    will_boot = boot is True or (boot is None and (took or e is not None))
+    if slot is not None and will_boot:
+        active = dev.getvar("current-slot").lstrip("_")
+        if active != slot:
+            raise RuntimeError(f"{dev.serial} is in fastboot with slot {active or '?'} active, not slot {slot}; "
+                               f"not booting it. Return to slot {slot} with flash --rollback (it wipes userdata) "
+                               f"or flash --recover")
     dev.fb_mode_clear()
     what = ("cleared a pending fb_mode obligation" if e is not None else
             "found the phone in fastboot; cleared fb_mode")
-    if boot is True or (boot is None and (took or e is not None)):
+    if will_boot:
         dev.reboot_fastboot()
         dev.wait_for_device(boot_timeout)
         dev.wait_boot_completed(boot_timeout)
