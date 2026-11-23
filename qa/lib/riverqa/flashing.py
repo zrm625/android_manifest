@@ -87,7 +87,7 @@ def known_good_want(st: dict, *, boot_sha: str | None = None, hash_boot: bool = 
     record's), or for a provisional record without one its boot hash."""
     kg = st["known_good_slot"]
     kgrec = st.get("known_good") or {}
-    bid = kgrec.get("build_id")
+    bid = fbmode.stamp(kgrec.get("build_id"))       # R10-1: the sentinel is no stamp
     return fbmode.Want(kg, (bid, bid) if bid else None,
                        boot_sha=boot_sha if boot_sha is not None else (None if bid else kgrec.get("boot_sha256")),
                        hash_boot=hash_boot)
@@ -267,9 +267,10 @@ def write_images(dev: Device, images_dir: Path, target: str, wipe: bool, attempt
 def product_want(product: Path, slot: str) -> fbmode.Want:
     """What a dev flash of ``product`` to ``slot`` must boot (R8-1): both
     build IDs from the images' build.prop files, or for an unstamped build
+    (no stamp, or the ``unstamped`` sentinel, on either partition: R10-1)
     the hash of boot.img against the start of boot_<slot>."""
-    sid = stage.read_prop(product / "system/build.prop", "ro.river.build_id")
-    vid = stage.read_prop(product / "vendor/build.prop", "ro.vendor.river.build_id")
+    sid = fbmode.stamp(stage.read_prop(product / "system/build.prop", "ro.river.build_id"))
+    vid = fbmode.stamp(stage.read_prop(product / "vendor/build.prop", "ro.vendor.river.build_id"))
     if sid and vid:
         return fbmode.Want(slot, (sid, vid))
     img = product / "boot.img"
