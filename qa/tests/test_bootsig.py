@@ -869,6 +869,16 @@ class Enumeration(unittest.TestCase):
             from riverqa.device import BootStatus
             return BootStatus("bid", True, 30.0, 99.9, 100.0, 0.0)
 
+        # fbmode.recover's slot check (R7-1): one slot, always booted.
+        def getvar(self, name):
+            return "_a"
+
+        def guard(self):
+            pass
+
+        def getprop(self, name):
+            return "_a"
+
     def reboot(self, path, stray=False, dev=None, **kw):
         w = self.W()
         dev = dev or self.Dev(w, stray)

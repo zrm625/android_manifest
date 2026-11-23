@@ -12,10 +12,11 @@ host dies while it is set, every later boot stops in fastboot, so:
   phone (calibration, phone-qa, device-bench, flash builds): with an entry
   pending, or with the phone found in fastboot, it clears fb_mode and, when
   asked or when it had to take the phone out of Android, boots the active
-  slot. The entry is resolved only once that boot completed (or, with
-  ``boot=False``, once the clear succeeded), so a host that dies between
-  the clear and the boot leaves the entry for the next recovery
-  (review round 5, R5-1);
+  slot. The entry is resolved only once that boot completed and the
+  booted phone passed the guard, the slot check and the caller's build
+  check (R7-1), or, with ``boot=False``, once the clear succeeded. A host
+  that dies between the clear and the resolve leaves the entry for the
+  next recovery (review round 5, R5-1);
 - slot recovery (``flash --rollback``, ``flash --recover``, rescue) never
   calls ``recover``: it must not boot the active slot, which may be the
   failed candidate. It calls ``clear_in_fastboot`` while in fastboot, sets
@@ -96,8 +97,20 @@ def clear_in_fastboot(dev, j: jmod.Journal | None = None) -> bool:
     return owed
 
 
+class WrongSlot(RuntimeError):
+    """fastboot reports another slot active than the one the caller may
+    boot (R6-8). Raised before anything is cleared or booted. The caller
+    says what to do: the right advice differs for a promotion and a batch
+    preflight (R7-2)."""
+
+    def __init__(self, serial: str, active: str, want: str):
+        self.active, self.want = active, want
+        super().__init__(f"{serial} is in fastboot with slot {active or '?'} active, not slot {want}; not "
+                         "booting it")
+
+
 def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, slot: str | None = None,
-            j: jmod.Journal | None = None) -> str | None:
+            verify=None, j: jmod.Journal | None = None) -> str | None:
     """Clear a leftover fb_mode. Call it under the device lock, before the
     adb guard (the phone may be sitting in fastboot). It boots the
     **active** slot, so slot recovery must not use it (R5-1).
@@ -108,15 +121,20 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, slot: s
       ``boot`` is None and an obligation was pending.
     - Neither: nothing.
 
-    With ``slot`` (R6-8), it boots only that slot: if fastboot reports
-    another slot active, it raises before clearing or booting anything, and
-    the caller halts.
+    Before a boot it reads the active slot. With ``slot`` (R6-8), it boots
+    only that slot: another active slot raises WrongSlot before anything
+    is cleared or booted.
 
-    The entry is resolved after the boot completed, or right after the
-    clear when the phone stays in fastboot. Returns a description of what it
-    did, or None. Raises (GuardError, TimeoutError, RuntimeError) if it
-    could not finish; the obligation then stays pending for the next
-    recovery."""
+    After a boot, and before the entry is resolved (R7-1), the booted phone
+    must pass the guard and run the slot it meant to boot (``slot``, or
+    the slot fastboot reported active): a bootloader that fell back to the
+    other slot raises. ``verify`` (no arguments) then runs the caller's
+    build check; it raises on a mismatch or a failed read. The entry is
+    resolved only after all of that, or right after the clear when the
+    phone stays in fastboot (``boot`` False, or nothing to boot). Returns
+    a description of what it did, or None. Raises (GuardError,
+    TimeoutError, RuntimeError) if it could not finish; the obligation
+    then stays pending for the next recovery."""
     j = j or journal()
     e = pending(j)
     in_fb = dev.in_fastboot()
@@ -133,12 +151,13 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, slot: s
         dev.wait_fastboot(120)
         took = True
     will_boot = boot is True or (boot is None and (took or e is not None))
-    if slot is not None and will_boot:
+    if will_boot:
         active = dev.getvar("current-slot").lstrip("_")
-        if active != slot:
-            raise RuntimeError(f"{dev.serial} is in fastboot with slot {active or '?'} active, not slot {slot}; "
-                               f"not booting it. Return to slot {slot} with flash --rollback (it wipes userdata) "
-                               f"or flash --recover")
+        if slot is not None and active != slot:
+            raise WrongSlot(dev.serial, active, slot)
+        want = slot or active
+        if want not in ("a", "b"):
+            raise RuntimeError(f"cannot read the active slot in fastboot ({active!r}); not booting")
     dev.fb_mode_clear()
     what = ("cleared a pending fb_mode obligation" if e is not None else
             "found the phone in fastboot; cleared fb_mode")
@@ -146,7 +165,17 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, slot: s
         dev.reboot_fastboot()
         dev.wait_for_device(boot_timeout)
         dev.wait_boot_completed(boot_timeout)
-        what += " and booted Android"
+        # R7-1: the guarded slot check and the caller's build check come
+        # before the entry is resolved. fastboot may report a slot active
+        # that the bootloader then falls back from.
+        dev.guard()
+        running = dev.getprop("ro.boot.slot_suffix").lstrip("_")
+        if running != want:
+            raise RuntimeError(f"fastboot booted slot {want}, but the phone runs slot {running or '?'} (the "
+                               "bootloader fell back, or the slot can't be read)")
+        if verify is not None:
+            verify()
+        what += f" and booted Android on slot {want}"
     else:
         what += "; the phone stays in fastboot"
     settle(j)
