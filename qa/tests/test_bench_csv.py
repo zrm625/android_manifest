@@ -50,6 +50,11 @@ class BootPlan(unittest.TestCase):
         self.assertEqual(bench.boot_plan(0, 1, True, None), [("adb", False), ("sysrq", False)])
         self.assertEqual(bench.boot_plan(1, 1, True, None), [("sysrq", False)])
         self.assertEqual(bench.boot_plan(0, 1, False, None), [("adb", False)])     # no batch: as asked
+        # A kernel batch needs 2 sysrq boots after boot 1 (review round 4).
+        self.assertEqual(bench.boot_plan(0, 1, True, None, sysrq_needed=2),
+                         [("adb", False), ("sysrq", False), ("sysrq", False)])
+        self.assertEqual(bench.boot_plan(2, 1, True, None, sysrq_needed=2), [("sysrq", False)])
+        self.assertEqual(bench.boot_plan(3, 1, True, None, sysrq_needed=2), [("sysrq", False)])
 
     def test_extra_reboot_bench_goes_into_the_first_sysrq_boot(self):
         self.assertEqual(bench.boot_plan(0, 3, True, "extra-reboot-bench"),

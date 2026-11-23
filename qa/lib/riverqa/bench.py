@@ -116,16 +116,18 @@ def current_attempt(batch: dict) -> dict | None:
     return atts[-1]
 
 
-def boot_plan(done_before: int, boots: int, batch: bool, control: str | None) -> list[tuple[str, bool]]:
+def boot_plan(done_before: int, boots: int, batch: bool, control: str | None,
+              sysrq_needed: int = 1) -> list[tuple[str, bool]]:
     """(reboot path, inject the extra-reboot-bench fault) for each boot of
     this run (amendment A2). ``done_before``: bench boots this flash attempt
     already has. Boot 1 of the attempt is a normal adb reboot (the charter's
     boot time, and a clean Android shutdown); every later boot is the
-    immediate sysrq reboot, which has an uptime gate. A batch's first run
-    measures at least 2 boots, so every batch has a sysrq boot. The
-    extra-reboot-bench control goes into this run's first sysrq boot."""
+    immediate sysrq reboot, which has an uptime gate. A batch measures at
+    least ``sysrq_needed`` sysrq boots after boot 1 (1, or 2 for a batch
+    that touches the kernel: stage.sysrq_boots_required, review round 4).
+    The extra-reboot-bench control goes into this run's first sysrq boot."""
     if batch:
-        boots = max(boots, 2 - done_before)
+        boots = max(boots, 1 + sysrq_needed - done_before)
     plan, injected = [], False
     for i in range(1, boots + 1):
         path = "adb" if done_before + i == 1 else "sysrq"
@@ -218,9 +220,12 @@ def run(a) -> int:
     run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{a.env}"
     # Only this flash attempt's boots count (B1).
     done_before = len(attempt_rows(batch)) if batch else 0
-    plan = boot_plan(done_before, a.boots, bool(batch), control)
+    sysrq_needed, sysrq_why = (stage.sysrq_boots_required(batch, read_json(bench_path("qa", "known-good.json")))
+                               if batch else (0, ""))
+    plan = boot_plan(done_before, a.boots, bool(batch), control, sysrq_needed)
     if len(plan) != a.boots:
-        log(f"Measuring {len(plan)} boots: every batch needs a sysrq bench boot after bench boot 1 (amendment A2)")
+        log(f"Measuring {len(plan)} boots: this batch needs {sysrq_needed} sysrq bench boot(s) after bench boot 1 "
+            f"({sysrq_why}; amendment A2, review round 4)")
     if batch:
         batch.setdefault("bench_runs", []).append(run_id)
         stage.save(batch)

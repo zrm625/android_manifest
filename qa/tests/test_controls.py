@@ -152,7 +152,7 @@ class BatchRefusesControls(unittest.TestCase):
 class Attribution(unittest.TestCase):
     """Controls are credited only for their own fault (review round 2)."""
 
-    def run_with(self, injections, sig_states, attempt="att-1"):
+    def run_with(self, injections, sig_states, attempt="att-1", sysrq_needed=1):
         """sig_states: (label, first boot, combined state, boot_id[, path[, uptime state]]).
         Bench rows default to the sysrq path, after an adb bench boot 1."""
         from pathlib import Path
@@ -173,7 +173,9 @@ class Attribution(unittest.TestCase):
         run.attempt_id.return_value = attempt
         run.control_injected = None
         with mock.patch.object(qa, "evidence_dirs", lambda r: dirs), \
-                mock.patch.object(reboots, "load_timing", lambda: {}):
+                mock.patch.object(reboots, "load_timing", lambda: {}), \
+                mock.patch.object(qa.stage, "sysrq_boots_required",
+                                  lambda b, kg: (sysrq_needed, "kernel batch: x" if sysrq_needed > 1 else "same")):
             r = qa.check_boot_signals(run)
         return r, run.control_injected
 
@@ -204,9 +206,17 @@ class Attribution(unittest.TestCase):
     def test_every_batch_needs_a_sysrq_bench_boot(self):
         r, _ = self.run_with([], [("first boot", True, PASS, "B0"), self.BENCH1])
         self.assertEqual(r.state, UNVERIFIED)
-        self.assertIn("no sysrq bench boot", r.summary)
+        self.assertIn("0 sysrq bench boot(s), need 1", r.summary)
         r, _ = self.run_with([], [("first boot", True, PASS, "B0"), self.BENCH1,
                                   ("bench dev-1#2", False, PASS, "B2")])
+        self.assertEqual(r.state, PASS, r.summary)
+
+    def test_kernel_batch_needs_two_sysrq_bench_boots(self):
+        rows = [("first boot", True, PASS, "B0"), self.BENCH1, ("bench dev-1#2", False, PASS, "B2")]
+        r, _ = self.run_with([], rows, sysrq_needed=2)
+        self.assertEqual(r.state, UNVERIFIED)
+        self.assertIn("1 sysrq bench boot(s), need 2", r.summary)
+        r, _ = self.run_with([], rows + [("bench dev-2#1", False, PASS, "B3")], sysrq_needed=2)
         self.assertEqual(r.state, PASS, r.summary)
 
     def test_bench_boot_1_must_be_the_adb_reboot(self):

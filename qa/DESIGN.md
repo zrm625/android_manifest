@@ -1459,3 +1459,14 @@ enqueued never counts.
   boot into it. A kernel that ran past ramoops init therefore replaces the
   marker kernel's log. A batch that touches the kernel must keep that
   behaviour, or the chain proves nothing.
+- **Kernel batches get 2 `sysrq` bench boots (Opus 3).** A batch that
+  changes the kernel or the boot image needs at least 2 `sysrq` bench boots
+  after bench boot 1 (`stage.sysrq_boots_required`): `device-bench --batch`
+  plans them, and `health.boot_signals` is UNVERIFIED with fewer. A batch
+  counts as a kernel batch when, compared with `known-good.json`'s latest
+  build, the `kernel/motorola/sdm632` commit, the `dtbo.img` hash or the boot
+  image's command line differs, or when any of these can't be compared. The
+  boot image's own hash can't be the test: it changes on every build (the
+  ramdisk carries the build date and the kernel image its build timestamp).
+  baseline-1 and baseline-2 have the same kernel commit but different boot,
+  kernel and ramdisk hashes.

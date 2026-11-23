@@ -211,3 +211,63 @@ def load(batch_id: str) -> dict:
 
 def save(batch: dict) -> None:
     write_json(batch_dir(batch["batch"]) / "batch.json", batch)
+
+
+# --- kernel batches (review round 4) -------------------------------------------
+
+KERNEL_PATH = "kernel/motorola/sdm632"
+
+
+def boot_cmdline(img: Path) -> str | None:
+    """The kernel command line from an Android boot image header (v0-v2:
+    512 bytes at offset 64, plus the 1024-byte extra at offset 608), or
+    None if the file is missing or not a boot image."""
+    try:
+        with open(img, "rb") as f:
+            head = f.read(1632)
+    except OSError:
+        return None
+    if len(head) < 1632 or head[:8] != b"ANDROID!":
+        return None
+    return (head[64:576].split(b"\0", 1)[0] + head[608:1632].split(b"\0", 1)[0]).decode("latin-1")
+
+
+def kernel_change(batch: dict, known_good: dict | None, load_batch=None, cmdline=None) -> tuple[bool, str]:
+    """Does this batch change the kernel, compared with the latest
+    known-good build? (True, why) if the kernel commit, the dtbo image or
+    the boot image's command line differs, and also when any of them can't
+    be compared (unknown counts as changed).
+
+    The boot image's own hash can't be used: it changes on every build (the
+    ramdisk carries the build date and the kernel its build timestamp), as
+    baseline-1 and baseline-2 show for the same kernel commit."""
+    load_batch = load_batch or (lambda b: read_json(batch_dir(b) / "batch.json"))
+    cmdline = cmdline or boot_cmdline
+    latest = (known_good or {}).get("latest") or {}
+    mine, theirs = (batch.get("commit_set") or {}).get(KERNEL_PATH), (latest.get("commit_set") or {}).get(KERNEL_PATH)
+    if not mine or not theirs:
+        return True, "no known-good kernel commit to compare with"
+    if mine != theirs:
+        return True, f"{KERNEL_PATH} {mine[:12]} differs from known-good {theirs[:12]}"
+    try:
+        kg_batch = load_batch(latest["batch"])
+    except (KeyError, OSError, ValueError, TypeError, SystemExit):
+        kg_batch = None
+    if not kg_batch:
+        return True, "the known-good batch.json is missing, so its boot images can't be compared"
+    dt_mine = ((batch.get("images") or {}).get("dtbo") or {}).get("sha256")
+    dt_theirs = ((kg_batch.get("images") or {}).get("dtbo") or {}).get("sha256")
+    if not dt_mine or dt_mine != dt_theirs:
+        return True, "dtbo.img differs from the known-good build's (or is unknown)"
+    c_mine = cmdline(batch_dir(batch["batch"]) / "images" / "boot.img")
+    c_theirs = cmdline(batch_dir(kg_batch["batch"]) / "images" / "boot.img")
+    if c_mine is None or c_theirs is None or c_mine != c_theirs:
+        return True, "the boot image command line differs from the known-good build's (or is unreadable)"
+    return False, f"same kernel commit {mine[:12]}, dtbo and boot command line as known-good"
+
+
+def sysrq_boots_required(batch: dict, known_good: dict | None, **kw) -> tuple[int, str]:
+    """sysrq bench boots this batch needs (amendment A2, review round 4): 1,
+    or 2 when it touches the kernel or the boot image (kernel_change)."""
+    changed, why = kernel_change(batch, known_good, **kw)
+    return (2, f"kernel batch: {why}") if changed else (1, why)

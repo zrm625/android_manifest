@@ -760,9 +760,12 @@ def check_boot_signals(run: Run) -> Result:
     if bench_paths and bench_paths[0] != "adb":
         states.append(UNVERIFIED)
         notes.append(f"bench boot 1 used the {bench_paths[0]} path, not adb (amendment A2)")
-    if "sysrq" not in bench_paths:
+    need, need_why = stage.sysrq_boots_required(run.batch, read_json(KNOWN_GOOD))
+    have = bench_paths.count("sysrq")
+    if have < need:
         states.append(UNVERIFIED)
-        notes.append("no sysrq bench boot: every batch needs one after bench boot 1 (amendment A2)")
+        notes.append(f"{have} sysrq bench boot(s), need {need} after bench boot 1 ({need_why}; amendment A2, "
+                     "review round 4)")
     details: dict = {}
     if name in ("extra-reboot-first-boot", "extra-reboot-bench"):
         # The fault went in during flash or device-bench; batch.json records
