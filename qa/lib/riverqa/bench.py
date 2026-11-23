@@ -201,11 +201,12 @@ def run(a) -> int:
     # A leftover fb_mode would stop every sysrq bench boot in fastboot
     # (review round 4): clear it first. For a batch, that reboot is outside
     # the plan, so the batch's boot counts no longer hold: stop. With --flash
-    # it never boots (R6-4): the active slot may be an unbootable dev slot,
-    # and flash_dev only needs fastboot, so the phone stays there.
-    if fbmode.pending() is not None:
+    # flash_dev does it, after it has checked the pair and its inputs, so a
+    # refused flash never touches the phone (R7-3); it never boots there
+    # (R6-4).
+    if fbmode.pending() is not None and not a.flash:
         try:
-            what = fbmode.recover(dev, flashing.BOOT_TIMEOUT, boot=False if a.flash else None)
+            what = fbmode.recover(dev, flashing.BOOT_TIMEOUT)
         except (RuntimeError, TimeoutError) as e:   # R5-11: a clean HALT; the obligation stays pending
             log(f"HALT: fb_mode recovery failed: {e}")
             return flashing.EXIT_HALT
