@@ -22,6 +22,13 @@ Every planned reboot:
 3. at boot completion reads boot_id, sys.boot_completed and /proc/uptime in
    one shell command, then judges the kernel-log chain and the uptime.
 
+The uptime clock (review round 4) runs from the earliest possible
+disconnect, the start of the last USB poll that still saw the phone, to the
+end of the status read, so every timing uncertainty makes elapsed longer.
+A disconnect bracketed more loosely than bootsig.DISCONNECT_BOUND_S, or a
+status read slower than bootsig.STATUS_READ_BOUND_S, makes the uptime gate
+UNVERIFIED.
+
 Only control mode may inject an extra bootloader pass, and only it may mark
 the extra fastboot enumerations as planned.
 """
@@ -72,7 +79,9 @@ class BootRecord:
     boot_id_before: str | None
     boot_id: str = ""
     uptime: float = 0.0
-    elapsed: float = 0.0                # host seconds from the clock's USB disconnect to the status read
+    elapsed: float = 0.0                # host seconds from the clock's last-present poll to the end of the status read
+    disconnect_gap: float | None = None  # first_gone - last_present of the clock's disconnect (review round 4)
+    status_read_s: float | None = None   # latency of the status read that carried uptime (review round 4)
     host_boot_seconds: float = 0.0      # reboot command (after any image writes) to boot completed
     bootloader_pass: float = 0.0        # elapsed - uptime
     control: str | None = None
@@ -206,10 +215,17 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             rec.control = "extra-pass-unmarked"
         if inject_early_reboot:
             rec.control = inject_reboot_before_completion(dev, boot_timeout, w)
-        st = dev.wait_boot_completed(boot_timeout)
+        st = completed_status(dev, boot_timeout)
         rec.completed_wall = st.host_wall
         rec.boot_id, rec.uptime = st.boot_id, st.uptime
-        rec.elapsed = st.host_mono - clock.t
+        # Review round 4: the clock starts at the earliest possible
+        # disconnect (the last poll that saw the phone) and stops at the end
+        # of the status read, so every uncertainty makes elapsed longer.
+        # judge_record bounds both brackets.
+        rec.disconnect_gap = None if clock.gap is None else round(clock.gap, 3)
+        rec.status_read_s = round(st.read_s, 3)
+        start = clock.last_present if clock.last_present is not None else clock.t
+        rec.elapsed = st.t1 - start
         rec.host_boot_seconds = round(st.host_mono - t_cmd, 2)
         rec.bootloader_pass = round(rec.elapsed - rec.uptime, 3)
         rec.usb_events = [asdict(e) for e in w.since(start_mark)]
@@ -221,6 +237,23 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             clear_fb_mode(dev, boot_timeout)
         if own_watcher:
             w.stop()
+
+
+def completed_status(dev: Device, boot_timeout: float, tries: int = 3):
+    """The first status read that sees boot completed. If that read was
+    slower than bootsig.STATUS_READ_BOUND_S, read again (up to ``tries``
+    times) and use the first fast read of the same boot: a later read only
+    makes elapsed longer, which is safe (review round 4). If no fast read
+    comes, the slow one is returned and the uptime gate is UNVERIFIED."""
+    st = dev.wait_boot_completed(boot_timeout)
+    for _ in range(tries):
+        if st.read_s <= bootsig.STATUS_READ_BOUND_S:
+            break
+        again = dev.boot_status()
+        if again is not None and again.completed and again.boot_id == st.boot_id \
+                and again.read_s <= bootsig.STATUS_READ_BOUND_S:
+            return again
+    return st
 
 
 def arm_bootloader_stop(dev: Device, boot_timeout: float) -> None:
@@ -309,7 +342,8 @@ def judge_record(rec: BootRecord, pstore_log: bytes | None, timing: dict) -> Non
         rec.chain = (UNVERIFIED, f"pstore read failed: {rec.pstore_read_error}")
     if rec.path in GATED_PATHS:
         rec.uptime_check = bootsig.uptime_verdict(rec.uptime, rec.elapsed, allowance_for(rec.path, timing),
-                                                  rec.unplanned_fastboot)
+                                                  rec.unplanned_fastboot, disconnect_gap_s=rec.disconnect_gap,
+                                                  status_read_s=rec.status_read_s)
     elif rec.unplanned_fastboot:
         rec.uptime_check = (FAIL, f"{rec.unplanned_fastboot} unplanned fastboot enumeration(s): extra boot")
     else:

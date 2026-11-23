@@ -107,7 +107,7 @@ class EarlyReboot(unittest.TestCase):
 
         def boot_status(self):
             from riverqa.device import BootStatus
-            return BootStatus("b", self.completed, 5.0, 0.0, 0.0)
+            return BootStatus("b", self.completed, 5.0, 0.0, 0.1, 0.0)
 
         def reboot_adb(self, target=None):
             self.reboots += 1

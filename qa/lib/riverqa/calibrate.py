@@ -82,12 +82,17 @@ def one(dev: Device, w: UsbWatcher, path: str, timing: dict, *, inject=False, ma
     kind = "early reboot" if early_reboot else "inject" if inject else "normal"
     log(f"  {path:8} {kind}{'' if mark_planned else ' unmarked'}: "
         f"boot {rec.host_boot_seconds:.1f} s, uptime {rec.uptime:.1f} s, elapsed {rec.elapsed:.2f} s, "
-        f"pass {rec.bootloader_pass:.2f} s, fastboot planned {rec.planned_fastboot} unplanned "
+        f"pass {rec.bootloader_pass:.2f} s, disconnect gap {fmt_s(rec.disconnect_gap)}, status read "
+        f"{fmt_s(rec.status_read_s)}, fastboot planned {rec.planned_fastboot} unplanned "
         f"{rec.unplanned_fastboot}, chain {rec.chain[0]} ({exact} exact copies, {copies} within flips), "
         f"uptime-check {rec.uptime_check[0]}{' (' + rec.control + ')' if rec.control else ''}")
     ids = sorted({e['ids'] for e in d['usb_events'] if e['kind'] == 'present'})
     log(f"           usb ids seen: {ids}")
     return d
+
+
+def fmt_s(v) -> str:
+    return "?" if v is None else f"{v:.3f} s"
 
 
 def save_nopass_pstore(rec, log_bytes: bytes):

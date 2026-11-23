@@ -28,11 +28,24 @@ class Unreachable(RuntimeError):
 
 @dataclass
 class BootStatus:
+    """One read of boot_id, sys.boot_completed and /proc/uptime, all from
+    one shell command, with the host clock just before and just after it
+    (review round 4: the read's latency bounds when the uptime was taken)."""
     boot_id: str
     completed: bool
     uptime: float
-    host_mono: float   # time.monotonic() halfway through the read
-    host_wall: float
+    t0: float          # time.monotonic() just before the read
+    t1: float          # time.monotonic() just after it
+    host_wall: float   # time.time() halfway through the read
+
+    @property
+    def read_s(self) -> float:
+        """How long the read took: the uptime was taken somewhere in it."""
+        return self.t1 - self.t0
+
+    @property
+    def host_mono(self) -> float:
+        return (self.t0 + self.t1) / 2
 
 
 # Test seam: unit tests add fake serials here. Nothing else may; the
@@ -289,8 +302,7 @@ class Device:
             uptime = float(lines[2].split()[0])
         except (IndexError, ValueError):
             return None
-        return BootStatus(lines[0].strip(), lines[1].strip() == "1", uptime,
-                          (t0 + t1) / 2, w0 + (t1 - t0) / 2)
+        return BootStatus(lines[0].strip(), lines[1].strip() == "1", uptime, t0, t1, w0 + (t1 - t0) / 2)
 
     def boot_id(self) -> str:
         return self.sh("cat /proc/sys/kernel/random/boot_id").strip()
@@ -406,10 +418,21 @@ def usb_presence(serial: str = SERIAL) -> str | None:
 
 @dataclass
 class UsbEvent:
+    """One change seen by the watcher. ``t`` is the end of the poll that saw
+    the change: for "gone", the latest time the disconnect can have
+    happened (first_gone). ``last_present`` (gone events only) is the start
+    of the last poll that still saw the phone: the earliest time the
+    disconnect can have happened. None if no poll saw it present."""
     t: float          # monotonic
     wall: float
     kind: str         # "gone" or "present"
     ids: str | None   # vid:pid when present
+    last_present: float | None = None
+
+    @property
+    def gap(self) -> float | None:
+        """first_gone - last_present: how loosely the disconnect is bracketed."""
+        return None if self.last_present is None else self.t - self.last_present
 
 
 @dataclass
@@ -428,21 +451,33 @@ class UsbWatcher:
         self._lock = threading.Lock()
         self._thread = None
         self._last = "unset"
+        self._last_present: float | None = None
 
     def start(self) -> "UsbWatcher":
-        self._last = usb_presence(self.serial)
+        self._poll(record=False)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
 
+    def _poll(self, record: bool = True) -> None:
+        """One sysfs poll, bracketed by the clock (review round 4): a gone
+        event carries the start of the last poll that saw the phone, so a
+        host too busy to poll widens the bracket instead of moving the
+        clock."""
+        before = time.monotonic()
+        cur = usb_presence(self.serial)
+        after = time.monotonic()
+        if cur != self._last and record:
+            with self._lock:
+                self.events.append(UsbEvent(after, time.time(), "present" if cur else "gone", cur,
+                                            None if cur else self._last_present))
+        self._last = cur
+        if cur:
+            self._last_present = before
+
     def _loop(self):
         while not self._stop.is_set():
-            cur = usb_presence(self.serial)
-            if cur != self._last:
-                with self._lock:
-                    self.events.append(UsbEvent(time.monotonic(), time.time(),
-                                                "present" if cur else "gone", cur))
-                self._last = cur
+            self._poll()
             time.sleep(self.interval)
 
     def stop(self):

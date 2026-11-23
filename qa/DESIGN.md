@@ -1339,3 +1339,30 @@ failed write retried with a new nonce, and no live readback.
 **Phone runs.** `phone-qa boot-timing`, no wipe needed; count the chain
 verdicts per path (PASS on normal boots should be about 100%), and check that
 the injected controls still FAIL for the right reason.
+
+## Code review round 4: changes to A2 and A2.1
+
+Status: specified 2026-11-23 from the round-4 code review of `f0ebde5`.
+Everything in A2 and A2.1 stands except as changed here.
+
+**R4-1. The uptime clock is bracketed at both ends.**
+- The USB watcher records, for each disconnect, `last_present` (the start of
+  the last poll that still saw the phone) and `first_gone` (the end of the
+  first poll that did not). The disconnect happened somewhere between them.
+- The clock starts at `last_present`, the earliest possible disconnect, and
+  stops at the end of the status read that saw `sys.boot_completed=1`. Every
+  timing uncertainty therefore makes `elapsed` longer, which leans toward
+  FAIL.
+- If `first_gone − last_present` is more than 0.5 s
+  (`bootsig.DISCONNECT_BOUND_S`), the uptime gate is UNVERIFIED. Before this
+  change a busy host that saw the phone gone 2.3 s late turned a 14.23 s
+  extra pass into 11.93 s, under A, and passed it.
+- `boot_id`, `sys.boot_completed` and `/proc/uptime` come from one shell
+  command, and the host clock is read just before and just after it. If that
+  read took more than 1 s (`bootsig.STATUS_READ_BOUND_S`), the harness reads
+  again, up to 3 times, and uses the first fast read of the same boot (a
+  later read only makes `elapsed` longer). If none is fast, the uptime gate
+  is UNVERIFIED.
+- `BootRecord` and `boot-timing.json` carry `disconnect_gap` and
+  `status_read_s`. On the adb path both are recorded but, like the uptime,
+  are INFO only.

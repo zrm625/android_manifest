@@ -158,10 +158,11 @@ class Chain(unittest.TestCase):
 
 class Uptime(unittest.TestCase):
     def test_rule(self):
-        self.assertEqual(b.uptime_verdict(29.0, 45.7, 18.5, 0)[0], PASS)
-        self.assertEqual(b.uptime_verdict(29.0, 49.9, 18.5, 0)[0], FAIL)
-        self.assertEqual(b.uptime_verdict(29.0, 45.7, None, 0)[0], UNVERIFIED)
-        self.assertEqual(b.uptime_verdict(29.0, 45.7, 18.5, 1)[0], FAIL)
+        tight = {"disconnect_gap_s": 0.06, "status_read_s": 0.1}
+        self.assertEqual(b.uptime_verdict(29.0, 45.7, 18.5, 0, **tight)[0], PASS)
+        self.assertEqual(b.uptime_verdict(29.0, 49.9, 18.5, 0, **tight)[0], FAIL)
+        self.assertEqual(b.uptime_verdict(29.0, 45.7, None, 0, **tight)[0], UNVERIFIED)
+        self.assertEqual(b.uptime_verdict(29.0, 45.7, 18.5, 1, **tight)[0], FAIL)
 
     def test_allowance_window(self):
         a, why = b.compute_allowance([16.55, 16.73, 16.56], 3.84)
@@ -206,6 +207,7 @@ TIMING = {"paths": {"sysrq": dict(GATED), "fastboot": dict(GATED)}}
 def record(path="sysrq", **kw):
     rec = reboots.BootRecord(path=path, marker=MARKER, boot_id_before="x")
     rec.uptime, rec.elapsed = 35.0, 45.0
+    rec.disconnect_gap, rec.status_read_s = 0.06, 0.1
     for k, v in kw.items():
         setattr(rec, k, v)
     return rec
@@ -455,7 +457,8 @@ class Enumeration(unittest.TestCase):
             self.events, self.clock = [], itertools.count(1)
 
         def add(self, kind, ids=None):
-            self.events.append(UsbEvent(float(next(self.clock)), 0.0, kind, ids))
+            t = float(next(self.clock))
+            self.events.append(UsbEvent(t, 0.0, kind, ids, t - 0.05 if kind == "gone" else None))
 
         def mark(self):
             return len(self.events)
@@ -522,7 +525,7 @@ class Enumeration(unittest.TestCase):
 
         def wait_boot_completed(self, seconds):
             from riverqa.device import BootStatus
-            return BootStatus("bid", True, 30.0, 100.0, 0.0)
+            return BootStatus("bid", True, 30.0, 99.9, 100.0, 0.0)
 
     def reboot(self, path, stray=False, dev=None, **kw):
         w = self.W()
@@ -539,7 +542,11 @@ class Enumeration(unittest.TestCase):
         rec, dev = self.reboot("sysrq")
         self.assertEqual(rec.planned_fastboot, 0)
         self.assertEqual(dev.calls, [("sysrq",)])
-        self.assertEqual(rec.elapsed, 100.0 - 1.0)       # the clock starts at the sysrq disconnect
+        # The clock starts at the sysrq disconnect's last-present poll and
+        # stops at the end of the status read.
+        self.assertAlmostEqual(rec.elapsed, 100.0 - 0.95)
+        self.assertAlmostEqual(rec.disconnect_gap, 0.05)
+        self.assertAlmostEqual(rec.status_read_s, 0.1)
 
     def test_marked_extra_pass(self):
         for path in reboots.GATED_PATHS:
@@ -553,7 +560,7 @@ class Enumeration(unittest.TestCase):
                                      ("reboot_fastboot", None)])
         self.assertEqual(rec.planned_fastboot, 1)
         # The clock starts at the sysrq disconnect (event 3), not the final reboot's.
-        self.assertEqual(rec.elapsed, 100.0 - 3.0)
+        self.assertAlmostEqual(rec.elapsed, 100.0 - 2.95)
 
     def test_unmarked_extra_pass_counts(self):
         for path in reboots.GATED_PATHS:

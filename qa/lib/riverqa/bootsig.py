@@ -96,12 +96,44 @@ def chain_verdict(pstore_log: bytes | None, marker: str | None) -> tuple[str, st
                   "and no new session after them")
 
 
+DISCONNECT_BOUND_S = 0.5    # first_gone - last_present above this: the disconnect is not bracketed (R4)
+STATUS_READ_BOUND_S = 1.0   # a completion status read slower than this: the uptime is not pinned (R4)
+
+
+def timing_bracket_problem(disconnect_gap_s: float | None, status_read_s: float | None) -> str | None:
+    """Why the host clock of one gated boot can't be trusted, or None.
+
+    Review round 4: the clock starts at the earliest possible disconnect
+    (the last poll that still saw the phone), which only makes elapsed
+    longer. But if the watcher saw the phone gone much later than it last
+    saw it present (a busy host), or the status read that carried uptime
+    was slow, the boot is UNVERIFIED rather than judged."""
+    if disconnect_gap_s is None:
+        return "the USB disconnect has no last-present poll to bracket it"
+    if disconnect_gap_s > DISCONNECT_BOUND_S:
+        return (f"the USB disconnect is bracketed only to {disconnect_gap_s:.2f} s "
+                f"(first_gone - last_present > {DISCONNECT_BOUND_S} s): the host was too busy to poll")
+    if status_read_s is None:
+        return "the completion status read has no recorded latency"
+    if status_read_s > STATUS_READ_BOUND_S:
+        return f"the completion status read took {status_read_s:.2f} s (> {STATUS_READ_BOUND_S} s)"
+    return None
+
+
 def uptime_verdict(uptime_s: float, elapsed_since_disconnect_s: float, allowance_s: float | None,
-                   unplanned_fastboot: int) -> tuple[str, str]:
+                   unplanned_fastboot: int, *, disconnect_gap_s: float | None,
+                   status_read_s: float | None) -> tuple[str, str]:
+    """The uptime gate of one boot on a gated path. ``elapsed`` runs from the
+    earliest possible disconnect (last_present) to the end of the status
+    read, so every uncertainty makes it longer, toward FAIL. A loose
+    bracket on either end is UNVERIFIED (timing_bracket_problem)."""
     if unplanned_fastboot:
         return FAIL, f"{unplanned_fastboot} unplanned fastboot enumeration(s): extra boot"
     if allowance_s is None:
         return UNVERIFIED, "no calibrated bootloader allowance for this reboot path"
+    problem = timing_bracket_problem(disconnect_gap_s, status_read_s)
+    if problem:
+        return UNVERIFIED, problem
     floor = elapsed_since_disconnect_s - allowance_s
     if uptime_s >= floor:
         return PASS, f"uptime {uptime_s:.1f} s >= {elapsed_since_disconnect_s:.1f} s - A {allowance_s:.1f} s"

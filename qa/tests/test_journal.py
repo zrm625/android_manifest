@@ -190,7 +190,7 @@ class Handlers(unittest.TestCase):
 
         class Dev(FakeShell):
             def boot_status(self):
-                return BootStatus("B", True, 1.0, 0.0, 0.0)
+                return BootStatus("B", True, 1.0, 0.0, 0.1, 0.0)
         def restore_wd(dev):
             with tempfile.TemporaryDirectory() as d:
                 run = FakeRun(dev, d)
