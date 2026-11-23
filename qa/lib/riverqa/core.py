@@ -46,6 +46,19 @@ def now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
 
 
+def host_boottime() -> float:
+    """The host's CLOCK_BOOTTIME: steady across wall-clock steps (NTP, a
+    manual date change) and counting suspend, as the phone's uptime does
+    (R9-7). Comparable only within one host boot (host_boot_id)."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def host_boot_id() -> str:
+    """The host kernel's boot_id: it changes when the host reboots, and with
+    it the zero of host_boottime (R9-7)."""
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
 

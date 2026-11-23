@@ -941,8 +941,9 @@ class Enumeration(unittest.TestCase):
         def boot_status(self):
             import time
             from riverqa.device import BootStatus
+            from riverqa.core import host_boottime
             t = time.monotonic()
-            return BootStatus("bid", True, 0.0, t, t, time.time())
+            return BootStatus("bid", True, 0.0, t, t, time.time(), host_boottime())
 
         def boot_id(self):
             return "bid"

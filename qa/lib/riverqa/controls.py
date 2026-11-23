@@ -225,8 +225,9 @@ class _PromotePhone:
         """A completed boot (fbmode.verify_boot reads it, R8-1)."""
         import time
         from .device import BootStatus
+        from .core import host_boottime
         t = time.monotonic()
-        return BootStatus("control-boot", True, 0.0, t, t, time.time())
+        return BootStatus("control-boot", True, 0.0, t, t, time.time(), host_boottime())
 
     def boot_id(self):
         return "control-boot"

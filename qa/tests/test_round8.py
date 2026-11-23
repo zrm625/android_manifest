@@ -330,10 +330,31 @@ class SingleSettlePath(unittest.TestCase):
             walk(tree, None)
         return out
 
+    @staticmethod
+    def seal_writers():
+        """The functions in fbmode that set ``_seal`` (by setattr or by
+        passing it to the constructor)."""
+        out = set()
+        tree = ast.parse((LIB / "fbmode.py").read_text())
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for c in ast.walk(fn):
+                if isinstance(c, ast.Call) and any(isinstance(a, ast.Constant) and a.value == "_seal" for a in c.args):
+                    out.add(fn.name)
+                if isinstance(c, ast.keyword) and c.arg == "_seal":
+                    out.add(fn.name)
+        return out
+
     def test_only_settle_resolves_an_obligation(self):
         self.assertEqual(self.calls("_settle_fb_mode"), {("fbmode", "settle")})
         self.assertEqual(self.calls("VerifiedBoot"), {("fbmode", "verify_boot")})
         self.assertEqual(self.calls("settle"), self.SETTLE_CALLERS)
+        # R9-8: only verify_boot seals a proof, and only fbmode knows the seal.
+        self.assertEqual(self.seal_writers(), {"verify_boot"})
+        for f in LIB.glob("*.py"):
+            if f.stem != "fbmode":
+                self.assertNotIn("_seal", f.read_text().lower(), f.name)
         # Nothing writes journal.json but the Journal class.
         for f in LIB.glob("*.py"):
             if f.stem != "journal":
@@ -370,8 +391,9 @@ class SingleSettlePath(unittest.TestCase):
             p = self.phone_with_obligation()
             with self.assertRaises(TypeError):
                 fbmode.settle(object())
+            # R9-8: a VerifiedBoot built outside verify_boot is unsealed.
             with self.assertRaises(TypeError):
-                fbmode.VerifiedBoot("ZY225DPT7F", "boot-1", 0.0, "a", (BID, BID), None, p)
+                fbmode.settle(fbmode.VerifiedBoot("ZY225DPT7F", "boot-1", 0.0, "host", "a", (BID, BID), None, p))
             self.assertIsNotNone(fbmode.pending())
 
     def test_settle_needs_a_clear_then_a_boot_then_the_same_boot(self):

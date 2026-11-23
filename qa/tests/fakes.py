@@ -63,8 +63,9 @@ class FakeShell:
         """A completed boot that began now (verify_boot, R8-1)."""
         import time
         from riverqa.device import BootStatus
+        from riverqa.core import host_boottime
         t = time.monotonic()
-        return BootStatus(self._boot_id, True, 0.0, t, t, time.time())
+        return BootStatus(self._boot_id, True, 0.0, t, t, time.time(), host_boottime())
 
     def state(self):
         return "device"
@@ -84,12 +85,12 @@ class Boots:
     them and settle reads boot_id again). Call ``_new_boot()`` whenever the
     fake reaches Android; ``state()`` says whether it is there."""
     _boot_n = 0
-    _boot_wall = 0.0
+    _boot_bt = 0.0
 
     def _new_boot(self):
-        import time
+        from riverqa.core import host_boottime
         self._boot_n += 1
-        self._boot_wall = time.time()
+        self._boot_bt = host_boottime()   # R9-7: the host clock settle compares with
 
     def boot_id(self):
         return f"boot-{self._boot_n}" if self.state() == "device" else ""
@@ -99,6 +100,7 @@ class Boots:
         from riverqa.device import BootStatus
         if self.state() != "device":
             return None
+        from riverqa.core import host_boottime
         t = time.monotonic()
-        now = time.time()
-        return BootStatus(self.boot_id(), True, max(0.0, now - self._boot_wall), t, t, now)
+        bt = host_boottime()
+        return BootStatus(self.boot_id(), True, max(0.0, bt - self._boot_bt), t, t, time.time(), bt)

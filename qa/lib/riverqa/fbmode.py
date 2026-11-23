@@ -10,7 +10,8 @@ host dies while it is set, every later boot stops in fastboot, so:
   identity of the phone it was armed on: the slot and both build IDs
   (R8-1). Generic recovery verifies the phone against that identity.
 - ``clear`` (and ``recover``) send ``fb_mode_clear`` in fastboot and stamp
-  the entry with the time of the clear. Nothing else is resolved there.
+  the entry with the time of the clear: the host's CLOCK_BOOTTIME and
+  boot_id (R9-7). Nothing else is resolved there.
 - **The single rule (R8-1).** ``settle(proof)`` is the only function that
   resolves the obligation. ``proof`` is a ``VerifiedBoot``, which only
   ``verify_boot`` makes: on the booted phone, the adb guard, the boot_id,
@@ -33,7 +34,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import journal as jmod
-from .core import bench_path, log, now_iso
+from .core import bench_path, host_boot_id, host_boottime, log, now_iso
 
 KIND = KEY = jmod.FB_MODE
 SLOTS = ("a", "b")
@@ -165,19 +166,22 @@ _SEAL = object()
 @dataclass(frozen=True)
 class VerifiedBoot:
     """Proof that the phone booted Android and passed verify_boot. Only
-    verify_boot makes one (the seal); settle accepts nothing else."""
+    verify_boot seals one; settle accepts nothing else. The seal is not an
+    ``__init__`` argument (R9-8), so neither a direct construction nor
+    ``dataclasses.replace`` of a sealed proof gives a sealed object."""
     serial: str
     boot_id: str
-    booted_at: float          # host time.time() at which this boot's kernel started (wall - uptime)
+    booted_at: float          # host CLOCK_BOOTTIME at which this boot's kernel started, at the latest (R9-7)
+    host_boot_id: str         # the host boot that booted_at is measured in
     slot: str
     build_ids: tuple[str | None, str | None]
     boot_sha: str | None
     dev: object = field(repr=False, compare=False)
-    _seal: object = field(repr=False, compare=False, default=None)
+    _seal: object = field(init=False, repr=False, compare=False, default=None)
 
-    def __post_init__(self):
-        if self._seal is not _SEAL:
-            raise TypeError("a VerifiedBoot is made only by fbmode.verify_boot")
+    @property
+    def sealed(self) -> bool:
+        return self._seal is _SEAL
 
     def describe(self) -> str:
         return (f"slot {self.slot}, build IDs {self.build_ids[0]}/{self.build_ids[1]}"
@@ -208,7 +212,12 @@ def verify_boot(dev, want: Want) -> VerifiedBoot:
         sha = boot_partition_sha(dev, slot, want.boot_bytes)
         if want.boot_sha and sha != want.boot_sha:
             raise NotVerified(f"boot_{slot} hash {sha[:12]} differs from the expected {want.boot_sha[:12]}")
-    return VerifiedBoot(dev.serial, st.boot_id, st.host_wall - st.uptime, slot, tuple(ids), sha, dev, _SEAL)
+    if st.host_boottime is None:
+        raise NotVerified(f"{dev.serial}: the boot status read has no host boot clock")
+    proof = VerifiedBoot(dev.serial, st.boot_id, st.host_boottime - st.uptime, host_boot_id(), slot, tuple(ids),
+                         sha, dev)
+    object.__setattr__(proof, "_seal", _SEAL)      # R9-8: the only place a proof is sealed
+    return proof
 
 
 # --- the obligation -----------------------------------------------------------
@@ -243,11 +252,12 @@ def arm(dev, slot: str, build_ids: tuple[str, str], j: jmod.Journal | None = Non
 
 def _mark_cleared(j: jmod.Journal) -> bool:
     """After a successful fb_mode_clear: stamp the pending entry with the
-    host time. Returns True if an obligation is pending."""
+    host's CLOCK_BOOTTIME and boot_id (R9-7; the wall time is only for
+    people). Returns True if an obligation is pending."""
     e = pending(j)
     if e is None:
         return False
-    j.annotate(e, cleared_at=time.time())
+    j.annotate(e, cleared_at={"boottime": host_boottime(), "host_boot_id": host_boot_id(), "wall": time.time()})
     return True
 
 
@@ -284,10 +294,11 @@ def settle(proof: VerifiedBoot, j: jmod.Journal | None = None) -> bool:
     """The one way an fb_mode obligation is resolved (R8-1). Returns True if
     one was. Refuses (TypeError, NotSettled) unless ``proof`` is a
     VerifiedBoot of this phone, the entry was stamped cleared, the
-    verified boot began after that clear, and the phone's boot_id, read
-    again now, is still the proof's (no reboot since, so every read of
-    verify_boot was of this boot)."""
-    if not isinstance(proof, VerifiedBoot) or proof._seal is not _SEAL:
+    verified boot began after that clear (both on the host's
+    CLOCK_BOOTTIME, in the host boot that is running now: R9-7), and the
+    phone's boot_id, read again now, is still the proof's (no reboot
+    since, so every read of verify_boot was of this boot)."""
+    if not isinstance(proof, VerifiedBoot) or not proof.sealed:
         raise TypeError("fbmode.settle needs a VerifiedBoot from fbmode.verify_boot")
     j = j or journal()
     e = pending(j)
@@ -299,7 +310,17 @@ def settle(proof: VerifiedBoot, j: jmod.Journal | None = None) -> bool:
     cleared = x.get("cleared_at")
     if cleared is None:
         raise NotSettled("fb_mode_clear was never confirmed for this obligation; not resolving it")
-    if proof.booted_at < cleared:
+    if not isinstance(cleared, dict) or not isinstance(cleared.get("boottime"), (int, float)) \
+            or not cleared.get("host_boot_id"):
+        raise NotSettled("the clear stamp has no host boot clock (written before round 9); not resolving the "
+                         "obligation. Recovery clears and stamps it again.")
+    # R9-7: both times are the host's CLOCK_BOOTTIME, which a wall-clock
+    # step doesn't move; they compare only within one host boot.
+    host = host_boot_id()
+    if cleared["host_boot_id"] != host or proof.host_boot_id != host:
+        raise NotSettled("the host rebooted after fb_mode was cleared, so the clear and the boot can't be "
+                         "compared; not resolving the obligation. Recovery clears and stamps it again.")
+    if proof.booted_at < cleared["boottime"]:
         raise NotSettled("the verified boot began before fb_mode was cleared; not resolving the obligation")
     now = proof.dev.boot_id()
     if now != proof.boot_id:

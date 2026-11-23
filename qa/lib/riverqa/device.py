@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .core import CODENAME, SERIAL, Deadline, log, run
+from .core import CODENAME, SERIAL, Deadline, host_boottime, log, run
 
 USB_ROOT = Path("/sys/bus/usb/devices")
 
@@ -37,6 +37,7 @@ class BootStatus:
     t0: float          # time.monotonic() just before the read
     t1: float          # time.monotonic() just after it
     host_wall: float   # time.time() halfway through the read
+    host_boottime: float | None = None   # core.host_boottime() just before the read (R9-7)
 
     @property
     def read_s(self) -> float:
@@ -366,6 +367,7 @@ class Device:
         """boot_id, sys.boot_completed and uptime in one shell command."""
         t0 = time.monotonic()
         w0 = time.time()
+        b0 = host_boottime()
         try:
             r = self.adb("shell", "cat /proc/sys/kernel/random/boot_id; getprop sys.boot_completed; cat /proc/uptime",
                          timeout=10)
@@ -381,7 +383,7 @@ class Device:
             uptime = float(lines[2].split()[0])
         except (IndexError, ValueError):
             return None
-        return BootStatus(lines[0].strip(), lines[1].strip() == "1", uptime, t0, t1, w0 + (t1 - t0) / 2)
+        return BootStatus(lines[0].strip(), lines[1].strip() == "1", uptime, t0, t1, w0 + (t1 - t0) / 2, b0)
 
     def boot_id(self) -> str:
         return self.sh("cat /proc/sys/kernel/random/boot_id").strip()
