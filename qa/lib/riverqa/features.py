@@ -1216,14 +1216,35 @@ def screen_size(dev) -> tuple[int, int]:
 EVENT_TIME_RE = re.compile(r"\b(?:postTime|mCreationTimeMs)=(\d{12,})")
 
 
+POSTED_HEADER_RE = re.compile(r"^  Notification List:\s*$", re.M)
+# What NotificationManagerService.dumpImpl prints after the posted list:
+# the enqueue rate, the archive and then "Enqueued Notification List".
+AFTER_POSTED_RE = re.compile(r"^  (?:mMaxPackageEnqueueRate=|hideSilentStatusBar=|mArchive=|"
+                             r"Enqueued Notification List:)", re.M)
+
+
+def posted_records(dump: str) -> str:
+    """The posted notifications only: the "Notification List:" section of
+    `dumpsys notification` (NotificationManagerService.dumpNotificationRecords),
+    up to the next section. Records in "Enqueued Notification List" were
+    never posted and are not evidence (review round 4). Empty if nothing is
+    posted (the section is then not printed at all)."""
+    m = POSTED_HEADER_RE.search(dump)
+    if m is None:
+        return ""
+    end = AFTER_POSTED_RE.search(dump, m.end())
+    return dump[m.end():end.start() if end else len(dump)]
+
+
 def alarm_firing_event(dump: str, label: str) -> tuple[bool, float | None]:
     """(firing?, event time in phone seconds or None) for DeskClock's firing
-    notification with fullScreenIntent and this label. The event time is
+    notification with fullScreenIntent and this label, among the posted
+    notifications only (posted_records). The event time is
     the time the system recorded the post (postTime, or mCreationTimeMs,
     which NotificationRecord sets from it); the app-chosen ``when`` is not
     used, because DeskClock may set it to the alarm time whenever the
     notification really fired (review round 3)."""
-    for block in re.split(r"\n\s*NotificationRecord\(", dump):
+    for block in re.split(r"\n\s*NotificationRecord\(", posted_records(dump)):
         if "pkg=com.android.deskclock" not in block:
             continue
         chan = re.search(r"channel=([^\s,]+)|mChannel=.*?mId='([^']+)'", block)

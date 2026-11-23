@@ -1433,3 +1433,13 @@ a usable torch-on flash state that is not FIRED, or a valid luma pair that
 fails the delta check. A missing capture result or missing metadata never
 qualifies the control. For the normal check a missing flash state is an
 incomplete capture (FAIL), as before.
+
+**R4-6. Only a posted notification is alarm evidence.** `dumpsys
+notification` lists posted notifications under `  Notification List:` and,
+further down, records still waiting under `  Enqueued Notification List:`
+(`NotificationManagerService.dumpNotificationRecords` and `dumpImpl`). An
+enqueued record was never posted. `features.alarm_firing_event` now looks
+only at the posted section (`features.posted_records`: from its header to
+the next section, `mMaxPackageEnqueueRate=`, `hideSilentStatusBar=`,
+`mArchive=` or the enqueued list). A DeskClock firing record that is only
+enqueued never counts.

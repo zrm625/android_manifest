@@ -91,6 +91,10 @@ class Gestures(unittest.TestCase):
 
 
 NOTIF = "Current Notification Manager state:\n"
+ALARM_RECORD = ("    NotificationRecord(0x1: pkg=com.android.deskclock user=UserHandle{0} id=1 "
+                "tag=null importance=4 key=0|x: Notification(channel=alarmFiringNotificationChannel ...))\n"
+                "      fullscreenIntent=PendingIntent{1: x}\n      river-qa-ab\n      when=0\n"
+                "      mCreationTimeMs=1000000123456\n")
 
 
 class Alarm(unittest.TestCase):
@@ -133,13 +137,30 @@ class Alarm(unittest.TestCase):
         self.assertEqual(st, PASS)
 
     def test_event_time_is_parsed_from_the_record(self):
-        dump = (NOTIF + "  NotificationRecord(0x1: pkg=com.android.deskclock user=UserHandle{0} id=1 "
-                "tag=null importance=4 key=0|x: Notification(channel=alarmFiringNotificationChannel ...))\n"
-                "    fullscreenIntent=PendingIntent{1: x}\n    river-qa-ab\n    when=0\n"
-                "    mCreationTimeMs=1000000123456\n")
+        dump = NOTIF + "  Notification List:\n" + ALARM_RECORD + "  \n  mArchive=Archive (1 notification)\n"
         self.assertEqual(F.alarm_firing_event(dump, "river-qa-ab"), (True, 1000000123.456))
         self.assertEqual(F.alarm_firing_event(dump.replace("mCreationTimeMs=1000000123456", "when=99"),
                                               "river-qa-ab"), (True, None))
+
+    def test_only_a_posted_record_counts(self):
+        """Review round 4: a record in "Enqueued Notification List" was never
+        posted, so it is no evidence that the alarm fired."""
+        other = ("    NotificationRecord(0x2: pkg=android user=UserHandle{0} id=9 tag=null importance=2 key=0|y: "
+                 "Notification(channel=misc))\n      uid=1000 userId=0\n")
+        enqueued_only = (NOTIF + "  Notification List:\n" + other + "  \n  mMaxPackageEnqueueRate=5.0\n"
+                         "  hideSilentStatusBar=false\n  mArchive=Archive (0 notifications)\n"
+                         "  Enqueued Notification List:\n" + ALARM_RECORD + "  \n")
+        self.assertEqual(F.alarm_firing_event(enqueued_only, "river-qa-ab"), (False, None))
+        nothing_posted = NOTIF + "  mArchive=Archive (0)\n  Enqueued Notification List:\n" + ALARM_RECORD
+        self.assertEqual(F.alarm_firing_event(nothing_posted, "river-qa-ab"), (False, None))
+        sample = F.parse_alarm_sample(0, f"1.0\n{enqueued_only}__DUMP_RC__0\n2.0\n", "river-qa-ab")
+        self.assertEqual(sample, (1.0, 2.0, False, None))
+        # Enqueued in the window, never posted: the alarm check can't PASS.
+        st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, False), (1.0, 2.0, False), (3.0, 4.0, False)), self.T)
+        self.assertNotEqual(st, PASS)
+        # Posted (and also still listed as enqueued): it counts.
+        both = enqueued_only.replace("  Notification List:\n" + other, "  Notification List:\n" + other + ALARM_RECORD)
+        self.assertEqual(F.alarm_firing_event(both, "river-qa-ab"), (True, 1000000123.456))
 
     def test_absence_must_be_at_or_before_minus_10(self):
         st, _ = F.alarm_verdict(self.polls((-10.2, -9.0, False), (1.0, 2.0, True)), self.T)
