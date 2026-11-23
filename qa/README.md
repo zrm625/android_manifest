@@ -333,7 +333,8 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
     obligation was armed on is the only slot known to boot. So, before it
     touches the phone, a dev flash refuses:
     - `--no-reboot` while an obligation is pending (exit 1): it would leave
-      the other slot active, and the next flash would write the armed slot;
+      the other slot active, and the next flash could write the only slot
+      known to boot;
     - a write to the armed slot, which happens when the other slot is
       active (exit 3).
 

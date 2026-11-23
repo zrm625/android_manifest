@@ -121,3 +121,38 @@ class R12_2TimeoutAdvice(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class R13FollowUps(unittest.TestCase):
+    def test_sentinel_entry_in_fastboot_advice_leads_out(self):
+        """Opus round 13 (m1): no slot-state.json, an obligation armed on a
+        with the unstamped sentinel, the phone in fastboot on a. R12-1
+        refuses; at a1abb2a the advice said "run flash stripped with slot a
+        active", the command just refused. Now it says to clear fb_mode and
+        boot slot a first, and following it lets the next flash settle."""
+        from test_round8 import arm_entry
+        with bench_home():
+            p = R9Phone(where="fastboot", active="a", bootable=("a", "b"), builds={"a": BID, "b": DEV_BID})
+            arm_entry("a", ids=("unstamped", "unstamped"))
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+            self.assertIn("oem fb_mode_clear", err)
+            self.assertIn("wait until it has reached Android", err)
+            self.assertEqual(flashes(p.calls), [])
+            # Follow the advice: clear fb_mode, boot slot a, then flash.
+            p.fb_mode_clear()
+            p.reboot_fastboot()
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_OK, err)
+            self.assertIsNone(fbmode.pending())
+            self.assertEqual({c[2][-1] for c in flashes(p.calls)}, {"b"})
+
+    def test_not_booted_with_nothing_pending_says_wait(self):
+        """Opus round 13 (m2): in Android before boot completes, the advice
+        first says to wait for the boot to finish."""
+        with bench_home():
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False)
+            not_booted(p)
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertEqual(rc, flashing.EXIT_ERROR, err)
+            self.assertIn("If the phone is still booting, wait until it finishes", err)

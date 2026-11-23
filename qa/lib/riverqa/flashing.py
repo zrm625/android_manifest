@@ -366,7 +366,9 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         if owed is not None:
             return recovery_halt(RuntimeError(msg), advice=armed_way_back(owed, current))
         log(f"error: {msg}.")
-        log(f"Boot the phone to Android on a slot that works and let it finish booting (for slot X: fastboot -s "
+        log(("If the phone is still booting, wait until it finishes and run the flash again. Otherwise b"
+             if source == "getprop" else "B")
+            + f"oot the phone to Android on a slot that works and let it finish booting (for slot X: fastboot -s "
             f"{SERIAL} --set-active=X, then fastboot -s {SERIAL} reboot), then run the flash again.")
         return EXIT_ERROR
     if st is None and owed is not None and fbmode.armed_slot(owed) == target:
@@ -521,8 +523,12 @@ def armed_way_back(e: dict | None, active: str | None) -> str:
         # R10-1: an identity generic recovery can't verify (the unstamped
         # sentinel): the verified boot of a dev flash of the other slot
         # settles it.
-        then = (f"run flash stripped with slot {slot} active: it writes slot {slots.other(slot)} and settles the "
-                "obligation once that boot is verified.")
+        # R13 (Opus m1): before the first baseline a dev flash needs the
+        # phone booted (R12-1), so first clear fb_mode and boot the slot.
+        then = (f"clear fb_mode by hand (fastboot -s {SERIAL} oem fb_mode_clear), boot slot {slot} (fastboot -s "
+                f"{SERIAL} reboot) and wait until it has reached Android and finished booting; then run flash "
+                f"stripped: it writes slot {slots.other(slot)} and settles the obligation once that boot is verified. "
+                f"If slot {slot} doesn't reach Android, stop and tell Zak: don't flash.")
     how = first + then
     return (f"The fb_mode obligation stays pending. With no known-good slot yet, slot {slot} (where it was armed) "
             f"is the only slot known to boot. {how[:1].upper()}{how[1:]}")

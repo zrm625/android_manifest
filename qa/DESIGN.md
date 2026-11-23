@@ -2575,3 +2575,15 @@ Gemini's round-12 minors: m1 (adb up is not a completed boot) and m2
 lacks; `armed_way_back` says to reboot to the bootloader before
 `getvar current-slot`; `armed_want`'s hint mentions the pre-baseline
 booted-phone rule.
+
+## Round 13 follow-ups (minors)
+
+- Opus m1: for an obligation armed with the `unstamped` sentinel before
+  the first baseline, `armed_way_back` said "run flash stripped with slot X
+  active", which R12-1 refuses while the phone is in fastboot. It now says
+  to clear fb_mode by hand, boot slot X and wait for it to finish booting,
+  then run `flash stripped`; if slot X doesn't reach Android, stop and tell
+  Zak. Test: `test_round12.R13FollowUps`.
+- Opus m2: the R12-1 refusal for a phone in Android that hasn't finished
+  booting first says to wait and run the flash again.
+- Opus m3: README wording matches the `--no-reboot` refusal message.
