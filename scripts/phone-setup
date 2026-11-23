@@ -11,9 +11,10 @@
 #                              password is never printed.
 #   --no-extra-dim             Leave Extra dim off.
 #
-# The wizard choices are the defaults: English, gesture navigation, no screen
-# lock, no fingerprint. Images built from river-22.2 already default to no
-# lock screen, gesture navigation, dark theme and low brightness.
+# Wizard choices: English, location off, no "Help improve LineageOS" stats,
+# gesture navigation, no screen lock, no fingerprint. Images built from
+# river-22.2 already default to most of this (and dark theme, low brightness,
+# no click sounds); the script sets them again so older images match too.
 #
 # Only the phone with serial $BENCH_DEVICE (default ZY225DPT7F) is touched.
 set -euo pipefail
@@ -70,6 +71,10 @@ fi
 # a crash sweep) would make Back walk through all of them. Clear them first.
 a shell am force-stop com.android.settings >/dev/null 2>&1 || true
 a shell input keyevent WAKEUP >/dev/null 2>&1 || true
+# Mute touch, lock and charging sounds before tapping anything.
+a shell settings put system sound_effects_enabled 0
+a shell settings put system lockscreen_sounds_enabled 0
+a shell settings put secure charging_sounds_enabled 0
 
 setup_done() {
   [[ "$(sh_ settings get secure user_setup_complete)" == 1 &&
@@ -93,6 +98,11 @@ def find(*labels, checked=None):
                     continue
                 return n
     return None
+# Untick location and "Help improve LineageOS" (usage stats).
+for rid in ("location_checkbox", "enable_metrics_checkbox"):
+    for n in nodes:
+        if n.get("resource-id", "").endswith(":id/" + rid) and n.get("checked") == "true":
+            print(*centre(n), "untick " + rid); sys.exit()
 # Navigation page: make sure gestures are picked before moving on.
 n = find("Gesture navigation", checked=False)
 if n is not None and n.get("checkable") == "true":
@@ -144,6 +154,8 @@ a shell rm -f /sdcard/phone-setup.xml >/dev/null 2>&1 || true
 # No lock screen (the image defaults to this too, via
 # config_disableLockscreenByDefault). Has no effect if a PIN was set.
 a shell cmd lock_settings set-disabled true >/dev/null 2>&1 || true
+a shell cmd location set-location-enabled false
+a shell 'content update --uri content://lineagesettings/secure --bind value:s:0 --where "name=\"stats_collection\""'
 if (( extra_dim )); then
   a shell settings put secure reduce_bright_colors_activated 1
 fi
@@ -161,4 +173,7 @@ echo "  dark theme      $night"
 echo "  lock screen     $([[ "$lock" == true ]] && echo none || echo 'swipe or secure (not disabled)')"
 echo "  brightness      $([[ "$bright_mode" == 0 ]] && echo manual || echo adaptive), level $(sh_ settings get system screen_brightness)/255"
 echo "  extra dim       $([[ "$dim" == 1 ]] && echo on || echo off)"
+echo "  location        $([[ "$(sh_ cmd location is-location-enabled)" == true ]] && echo on || echo off)"
+echo "  usage stats     $(sh_ content query --uri content://lineagesettings/secure --where 'name="stats_collection"' | grep -q 'value=0' && echo off || echo ON)"
+echo "  touch sounds    $([[ "$(sh_ settings get system sound_effects_enabled)" == 0 ]] && echo off || echo on)"
 echo "  wifi            $(wifi_connected && echo connected || echo 'not connected')"

@@ -187,11 +187,13 @@ The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
    scripts/phone-setup --wifi SSID_FILE PSK_FILE
    ```
 
-   It connects Wi-Fi, clears stacked Settings screens, walks the wizard to the
-   home screen (gesture navigation, no screen lock), turns on Extra dim, and
-   prints the result. The image already defaults to dark theme, gesture
-   navigation, no lock screen and low brightness. Extra dim has no image
-   default, so the script sets it.
+   It mutes touch sounds, connects Wi-Fi, clears stacked Settings screens, and
+   walks the wizard to the home screen: location off, "Help improve
+   LineageOS" stats unticked, gesture navigation, no screen lock. Then it
+   turns on Extra dim and prints the result. The image already defaults to
+   dark theme, gesture navigation, no lock screen, low brightness, location
+   off and no click sounds, and it never sends LineageOS stats. Extra dim has
+   no image default, so the script sets it.
 
 7. **Open the pull requests and merge** them, one command each however many
    repos the change touched. Paste the `phone-check` and `device-bench`
