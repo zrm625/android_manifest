@@ -393,7 +393,7 @@ def expected_cameras(run) -> tuple[list[int] | None, str]:
     pset = sorted(int(x) for x in re.findall(r"\d+", prop)) if prop else None
     change = run.batch.get("camera_set_change")
     if change:
-        ok, why = verify_camera_change(change)
+        ok, why = verify_camera_change(change, run.batch)
         if not ok:
             return None, f"camera_set_change not confirmed: {why}"
         new = sorted(change.get("set") or [])
@@ -412,17 +412,47 @@ def expected_cameras(run) -> tuple[list[int] | None, str]:
     return sorted(bset), ", ".join(sets)
 
 
-def verify_camera_change(change: dict) -> tuple[bool, str]:
-    url = change.get("url", "")
-    m = re.match(r"https://github\.com/([^/]+/[^/]+)/(?:pull|issues)/(\d+)(?:#issuecomment-(\d+))?", url)
+APPROVAL_URL_RE = re.compile(r"^https://github\.com/(zrm625/[A-Za-z0-9._-]+)/pull/(\d+)"
+                             r"#(issuecomment|pullrequestreview)-(\d+)$")
+APPROVAL_LINE_RE = re.compile(r"(?im)^\s*approve camera set:\s*([0-9][0-9,\s]*)$")
+APPROVER = "zrm625"
+
+
+def verify_camera_change(change: dict, batch: dict, runner=None) -> tuple[bool, str]:
+    """Zak's approval of a camera-set change (A7). The URL must be a comment
+    or review on one of this batch's own PRs in a zrm625 repo (anchored
+    match); its author, not the PR's, must be zrm625; and its body must name
+    the new set on a line "approve camera set: 0,1,2" equal to change["set"]."""
+    runner = runner or (lambda cmd: host_run(cmd, timeout=30))
+    url = change.get("url") or ""
+    m = APPROVAL_URL_RE.match(url)
     if not m:
-        return False, "approval URL is not a GitHub PR or comment"
-    repo, num, comment = m.groups()
-    api = f"repos/{repo}/issues/comments/{comment}" if comment else f"repos/{repo}/pulls/{num}"
-    r = host_run(["gh", "api", api, "--jq", ".user.login"], timeout=30)
+        return False, "approval URL is not a comment or review on a zrm625 pull request"
+    repo, num, kind, cid = m.groups()
+    if {"repo": repo, "number": int(num)} not in [{"repo": p.get("repo"), "number": int(p.get("number", -1))}
+                                                  for p in batch.get("prs") or []]:
+        return False, f"{repo}#{num} is not one of this batch's PRs"
+    api = (f"repos/{repo}/issues/comments/{cid}" if kind == "issuecomment"
+           else f"repos/{repo}/pulls/{num}/reviews/{cid}")
+    r = runner(["gh", "api", api])
     if r.returncode != 0:
         return False, "gh lookup failed"
-    return r.stdout.strip() == "zrm625", f"written by {r.stdout.strip()}"
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return False, "gh returned no JSON"
+    login = (data.get("user") or {}).get("login")
+    if login != APPROVER:
+        return False, f"approval written by {login!r}, not {APPROVER}"
+    parent = data.get("issue_url") if kind == "issuecomment" else data.get("pull_request_url")
+    if not parent or not re.search(rf"/repos/{re.escape(repo)}/(issues|pulls)/{num}$", parent):
+        return False, "the approval does not belong to that pull request"
+    named = APPROVAL_LINE_RE.findall(data.get("body") or "")
+    sets = [sorted(int(x) for x in re.findall(r"\d+", n)) for n in named]
+    want = sorted(change.get("set") or [])
+    if want not in sets:
+        return False, f"the approval does not name the set {want} (found {sets or 'none'})"
+    return True, f"approved by {login} for {want}"
 
 
 def check_cameras(run) -> list[Result]:
@@ -769,17 +799,20 @@ def usb_dev_dir(serial: str) -> Path | None:
     return None
 
 
-def mtp_interface_count() -> list[str]:
-    """USB devices with an MTP interface (class 6, subclass 1, or 'MTP')."""
+def mtp_interface_count(root: Path = Path("/sys/bus/usb/devices")) -> list[str]:
+    """Serials of USB devices with an MTP interface (class 6, subclass 1, or
+    'MTP'). The entries under /sys/bus/usb/devices are symlinks; the
+    interface's real directory sits inside its device's, so resolve it
+    before looking at the parent's serial (A10)."""
     out = []
-    for d in Path("/sys/bus/usb/devices").iterdir():
+    for d in root.iterdir():
         if ":" in d.name:
             try:
                 cls = (d / "bInterfaceClass").read_text().strip()
                 sub = (d / "bInterfaceSubClass").read_text().strip()
                 name = (d / "interface").read_text().strip() if (d / "interface").exists() else ""
                 if (cls == "06" and sub == "01") or "MTP" in name:
-                    parent = d.parent
+                    parent = d.resolve().parent
                     out.append((parent / "serial").read_text().strip() if (parent / "serial").exists() else "?")
             except OSError:
                 pass
@@ -809,17 +842,22 @@ def check_usb(run) -> Result:
         return Result(cid, UNVERIFIED, "watchdog did not start")
     start = stat.rsplit(")", 1)[1].split()[19]
     run.journal.record(RES, "watchdog", pid, None, run_id=run.run_id, extra={"boot_id": st.boot_id, "start": start})
-    listed, how = False, ""
+    listed, how, mtp_error = False, "", None
     try:
-        dev.adb("shell", "svc usb setFunctions mtp", timeout=20)
+        try:
+            dev.adb("shell", "svc usb setFunctions mtp", timeout=20)
+        except TimeoutError:
+            pass   # the switch drops the connection the command came in on
         time.sleep(3)
         try:
             dev.wait_for_device(60)
         except TimeoutError:
             pass
         if dev.state() != "device":
-            raise TimeoutError("adb did not come back after switching to MTP")
-        if host_run(["pgrep", "-x", "gvfsd"], timeout=10).returncode == 0:
+            # Caught here, not raised: losing adb is a FAIL, and the restore
+            # below decides whether the run must halt (A10).
+            mtp_error = "adb did not come back within 60 s after switching to MTP"
+        elif host_run(["pgrep", "-x", "gvfsd"], timeout=10).returncode == 0:
             listed, how = gio_list(run, dev.serial, token)
         else:
             serials = mtp_interface_count()
@@ -830,8 +868,10 @@ def check_usb(run) -> Result:
                 listed = f"river-qa-{token}.txt" in r.stdout
                 how = "mtp-files"
     finally:
-        ok_fn, fmsg = restore_now(run, PHONE, "usb_functions", "usb")
+        # The recovery clock starts at the restore command, so the wait
+        # inside restore_now counts toward the 30 s (A10).
         back = time.monotonic()
+        ok_fn, fmsg = restore_now(run, PHONE, "usb_functions", "usb")
         adb_back = False
         while time.monotonic() - back < 240:
             if dev.state() == "device":
@@ -848,9 +888,11 @@ def check_usb(run) -> Result:
         dev.adb("reverse", f"tcp:{server_cfg(run)['local_port']}", f"tcp:{server_cfg(run)['local_port']}",
                 timeout=20)
     d = {"how": how, "functions_restored": fmsg, "adb_back_s": round(adb_s, 1), "watchdog_killed": ok_wd,
-         "marker_removed": ok_mk}
+         "marker_removed": ok_mk, "mtp_error": mtp_error}
     if run.halted:
         return Result(cid, FAIL, run.halted, d)
+    if mtp_error:
+        return Result(cid, FAIL, f"{mtp_error}; adb back {adb_s:.0f} s after the restore", d)
     if how.startswith("no gvfs, and"):
         return Result(cid, UNVERIFIED, how, d)
     ok = listed and adb_s <= 30 and ok_fn and ok_wd and ok_mk
@@ -901,7 +943,7 @@ def check_gestures(run) -> Result:
                   "-c android.intent.category.HOME").strip().splitlines()[-1:]
     proxy = re.search(r"OverviewProxyService.*?(?=\n\S|\Z)", sysui, re.S)
     proxy_txt = proxy.group(0) if proxy else ""
-    bound = "app.zak.perch" in proxy_txt and re.search(r"isConnected=true|mIsEnabled=true|Connected", proxy_txt)
+    bound = overview_proxy_bound(proxy_txt)
     d = {"navigation_mode": nav, "home": home, "overview_proxy": proxy_txt[:600]}
     problems = []
     if nav != "2":
@@ -961,6 +1003,16 @@ def check_gestures(run) -> Result:
                   helper_terminal=True)
 
 
+PROXY_STATE_RE = re.compile(r"\b(?:m?[Ii]sConnected|mIsEnabled)=true\b")
+
+
+def overview_proxy_bound(proxy_txt: str) -> bool:
+    """SystemUI's overview proxy names Perch and states, positively, that it
+    is connected or enabled (A8). 'isConnected=false' or a bare 'Connected'
+    is not enough."""
+    return "app.zak.perch" in proxy_txt and bool(PROXY_STATE_RE.search(proxy_txt))
+
+
 def screen_size(dev) -> tuple[int, int]:
     m = re.search(r"(\d+)x(\d+)", dev.sh("wm size").splitlines()[-1] if dev.sh("wm size") else "")
     return (int(m.group(1)), int(m.group(2))) if m else (1080, 2270)
@@ -979,6 +1031,41 @@ def alarm_firing(dump: str, label: str) -> bool:
     return False
 
 
+def alarm_observe(dev, label: str) -> tuple[float, float, bool] | None:
+    """One observation, timed on the phone: (phone time before dumpsys,
+    phone time after it returned, firing?). None if the read failed."""
+    r = dev.read("date +%s.%N; dumpsys notification --noredact; date +%s.%N", timeout=30)
+    lines = r.out.rstrip("\n").split("\n")
+    if not r.ok or len(lines) < 2:
+        return None
+    try:
+        t0, t1 = float(lines[0]), float(lines[-1])
+    except ValueError:
+        return None
+    return t0, t1, alarm_firing("\n".join(lines[1:-1]), label)
+
+
+def alarm_verdict(polls: list[tuple[float, float, bool]], target_s: float) -> tuple[str, str]:
+    """Judge firing evidence by phone time (A9). An absence counts only from
+    an observation that started at target - 10.5 s or later and finished by
+    target - 5 s; firing counts only from an observation that finished by
+    target + 10 s. Firing seen in anything that finished before target - 10 s
+    means it fired early."""
+    rel = [(a - target_s, b - target_s, f) for a, b, f in polls]
+    early = [r for r in rel if r[2] and r[1] < -10]
+    if early:
+        return FAIL, f"firing evidence already at {early[0][1]:+.1f} s"
+    window = [r for r in rel if r[0] >= -10.5 and r[1] <= -5]
+    if not window:
+        return FAIL, "no observation inside target - 10.5 s .. target - 5 s"
+    if any(r[2] for r in window):
+        return FAIL, "firing evidence present at target - 10 s"
+    fired = [r for r in rel if r[2] and r[1] <= 10]
+    if not fired:
+        return FAIL, "no firing notification observed by target + 10 s"
+    return PASS, f"absent at {window[-1][1]:+.1f} s, firing by {fired[0][1]:+.1f} s (phone time)"
+
+
 def check_alarms(run) -> Result:
     cid = "system.alarms"
     dev = run.dev
@@ -988,41 +1075,49 @@ def check_alarms(run) -> Result:
     early = helper_result(cid, res)
     if early:
         return early
-    # Host and phone clocks agree within seconds (system.time checks 2 s).
+    # Everything is anchored on phone time: target_ms is the phone's clock,
+    # and each observation is stamped by the phone before and after dumpsys.
     target = int(res.get("target_ms")) / 1000.0
-    shift = -60 if control_active() == "alarm-early" else 0
+    shift = 0
+    if control_active() == "alarm-early":
+        shift = -60
+        run.control_injected = "alarm-early"
     eff = target + shift
+    now0 = alarm_observe(dev, label)
+    if now0 is None:
+        return Result(cid, UNVERIFIED, "cannot read the phone's clock and notifications", helper_terminal=True)
+    mono0, phone0 = time.monotonic(), now0[1]
+
+    def phone_now():
+        return phone0 + (time.monotonic() - mono0)
     time.sleep(2)
     screen_off(dev)
     polls = []
-    while time.time() < eff + 12:
-        now = time.time()
-        if now >= eff - 14:
-            polls.append((round(now - eff, 1), alarm_firing(dev.sh("dumpsys notification --noredact", timeout=30),
-                                                            label)))
-        time.sleep(1.5 if now >= eff - 14 else 3)
-    before = [f for dt_, f in polls if -10.5 <= dt_ <= -8]
-    absent_before = bool(before) and not any(before)
-    present_by = any(f for dt_, f in polls if dt_ <= 10)
+    while phone_now() < eff + 12:
+        if phone_now() >= eff - 14:
+            obs = alarm_observe(dev, label)
+            if obs is not None:
+                polls.append(obs)
+            time.sleep(1.0)
+        else:
+            time.sleep(max(0.2, min(3.0, eff - 14 - phone_now())))
+    state, msg = alarm_verdict(polls, eff)
     activity = top_activity(dev)
-    d = {"label": label, "target_ms": res.get("target_ms"), "tz": res.get("tz"), "polls": polls,
-         "top_after": activity}
+    d = {"label": label, "target_ms": res.get("target_ms"), "shift_s": shift, "tz": res.get("tz"),
+         "polls": [(round(a - eff, 2), round(b - eff, 2), f) for a, b, f in polls], "top_after": activity}
     helper.wake(dev)
     dis = helper.instrument(run, "alarm_dismiss", {"label": label}, timeout=30, need_foreground=False)
     time.sleep(2)
-    still = alarm_firing(dev.sh("dumpsys notification --noredact", timeout=30), label)
+    after = alarm_observe(dev, label)
+    still = after is None or after[2]
     dev.sh("am force-stop com.android.deskclock")
     ok_clear, _ = restore_now(run, RES, "alarm", label)
     d["dismissed"] = dis.terminal and not still
-    if not absent_before:
-        return Result(cid, FAIL, "firing evidence present at target - 10 s (or not sampled)" if before else
-                      "no sample at target - 10 s", d, helper_terminal=True)
-    if not present_by:
-        return Result(cid, FAIL, "no firing notification by target + 10 s", d, helper_terminal=True)
+    if state != PASS:
+        return Result(cid, state, msg, d, helper_terminal=True)
     if still or not ok_clear:
         return Result(cid, FAIL, "alarm fired but was not removed", d, helper_terminal=True)
-    first = min(dt_ for dt_, f in polls if f)
-    return Result(cid, PASS, f"absent at -10 s, firing at {first:+.0f} s, then removed", d, helper_terminal=True)
+    return Result(cid, PASS, msg + ", then removed", d, helper_terminal=True)
 
 
 def check_keyboard(run) -> Result:
@@ -1111,6 +1206,32 @@ def check_video(run) -> Result:
                   d, helper_terminal=True)
 
 
+ELAPSED_RE = re.compile(r"(?:mElapsedRealtimeMillis|elapsedRealtimeMillis)=(\d+)")
+
+
+def network_suggestion_section(dump: str) -> str:
+    """Only the network suggestion history of `dumpsys time_detector`: from
+    its header to the next line indented no deeper (A12). Other sections
+    (telephony, GNSS, external) carry elapsed timestamps too."""
+    lines = dump.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)Network suggestion history:", line) or \
+            re.match(r"^(\s*)\S.*Network suggestion", line)
+        if m:
+            indent = len(m.group(1))
+            out = []
+            for nxt in lines[i + 1:]:
+                if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= indent:
+                    break
+                out.append(nxt)
+            return "\n".join(out)
+    return ""
+
+
+def network_suggestion_newer(dump: str, e0_ms: float) -> bool:
+    return any(int(v) >= e0_ms for v in ELAPSED_RE.findall(network_suggestion_section(dump)))
+
+
 def check_time(run) -> Result:
     cid = "system.time"
     dev = run.dev
@@ -1135,10 +1256,7 @@ def check_time(run) -> Result:
     td = ""
     while time.monotonic() < end and not newer:
         td = dev.sh("dumpsys time_detector", timeout=30)
-        sec = td[td.find("Network suggestion"):] if "Network suggestion" in td else ""
-        for v in re.findall(r"(?:mElapsedRealtimeMillis|elapsedRealtimeMillis)=(\d+)", sec[:2000]):
-            if int(v) >= e0:
-                newer = True
+        newer = network_suggestion_newer(td, e0)
         time.sleep(0.5)
     t_host0 = time.time()
     ph = dev.sh("date +%s.%N").strip()
@@ -1230,6 +1348,19 @@ def ui_dump(dev) -> str:
     return ""
 
 
+def rendered_token(token: str) -> str:
+    """What the test page's script writes into #r: never in the URL or the
+    server-rendered HTML, so it shows that Brave ran the page script."""
+    return "js-" + token[::-1]
+
+
+def brave_rendered(nodes, token: str) -> bool:
+    """The page script's own output is on screen (A13). The URL bar shows the
+    token, so the token itself proves nothing."""
+    want = rendered_token(token)
+    return any(want in (n.get("text", "") + " " + n.get("content-desc", "")) for n in nodes)
+
+
 def check_brave(run) -> Result:
     cid = "apps.brave"
     dev = run.dev
@@ -1246,7 +1377,7 @@ def check_brave(run) -> Result:
     # later, Continue, Start browsing; the last opens the intent's URL.
     buttons = list(param(run, "brave_firstrun_taps", [])) + [
         "Start browsing", "Not now", "Skip", "No thanks", "Continue", "Got it", "Maybe later", "Close", "Done"]
-    steps, seen_token = [], False
+    steps, seen_token, seen_app = [], False, False
     end = time.monotonic() + 120
     reopened = False
     while time.monotonic() < end:
@@ -1256,8 +1387,9 @@ def check_brave(run) -> Result:
             continue
         root = ET.fromstring(x)
         nodes = list(root.iter("node"))
-        texts = [n.get("text", "") for n in nodes] + [n.get("content-desc", "") for n in nodes]
-        if any(token in t for t in texts) and top_activity(dev).startswith(f["package"]):
+        if any(n.get("package") == f["package"] for n in nodes):
+            seen_app = True
+        if brave_rendered(nodes, token) and top_activity(dev).startswith(f["package"]):
             seen_token = True
             break
         tapped = False
@@ -1275,16 +1407,16 @@ def check_brave(run) -> Result:
             # First-run done but the page was not opened: send the intent again.
             dev.sh(f"am start -a android.intent.action.VIEW -d {url} -p {f['package']}")
             reopened = True
-    run.sideload["brave"]["launch"] = True
+    run.sideload["brave"]["launch"] = seen_app   # only if Brave's window was actually seen (A11)
     gets = run.server.find("page", token)
     beacons = run.server.find("beacon", token)
     top = top_activity(dev)
     dev.sh(f"am force-stop {f['package']}; input keyevent KEYCODE_HOME")
-    d = {"first_run_taps": steps, "gets": len(gets), "beacons": len(beacons), "token_on_screen": seen_token,
+    d = {"first_run_taps": steps, "gets": len(gets), "beacons": len(beacons), "script_text_on_screen": seen_token,
          "top": top, "ua": gets[0]["ua"] if gets else None}
     ok = seen_token and gets and beacons
     return Result(cid, PASS if ok else FAIL, f"page GET {'seen' if gets else 'missing'}, beacon "
-                  f"{'seen' if beacons else 'missing'}, token on screen {seen_token} (first-run taps: "
+                  f"{'seen' if beacons else 'missing'}, page-script text on screen {seen_token} (first-run taps: "
                   f"{', '.join(steps) or 'none'})", d)
 
 

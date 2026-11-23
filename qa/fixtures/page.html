@@ -11,9 +11,13 @@
 <body>
 <p>river-qa</p>
 <p id="t">@TOKEN@</p>
+<p id="r"></p>
 <script>
   var token = document.getElementById("t").textContent;
   document.title = token;
+  // Only the script can produce this text (the token reversed): Brave's check
+  // looks for it, because the URL bar shows the token itself.
+  document.getElementById("r").textContent = "js-" + token.split("").reverse().join("");
   var url = "/beacon/" + token;
   if (!(navigator.sendBeacon && navigator.sendBeacon(url, "ok"))) {
     fetch(url, {method: "POST", body: "ok", keepalive: true});

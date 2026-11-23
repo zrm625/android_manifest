@@ -74,7 +74,7 @@
     },
     "page": {
       "file": "page.html",
-      "sha256": "70b8f8e7ffd551bfa692b1bc8f41511aea42d1b638cc27811dc2a554d1653a5c",
+      "sha256": "f597ece351d60ad783b3e031f9fd04e4ca232ff83fe104c964ba7d3490bd48a4",
       "made_by": "qa/fixtures/make-fixtures (copy of qa/fixtures/page.html)"
     }
   }
