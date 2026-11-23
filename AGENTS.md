@@ -119,7 +119,8 @@ The goal is to cut build time and image size against a frozen baseline.
 - **Build benchmark:** `.repo/manifests/scripts/bench/bench <baseline|stripped>`.
   It runs a cold `m bacon` into a separate `out-bench-<tree>/`. Results go to
   `/mnt/storage/lineageos-bench/results/results.csv`. Only one build of any
-  kind runs at a time; the scripts enforce this.
+  kind runs at a time; the scripts enforce this. Run it only when Zak asks for
+  a cold build; changes and milestones are measured with `device-bench`.
 - **Device benchmark:** `.repo/manifests/scripts/bench/device-bench <baseline|stripped> --flash --wipe`.
   It flashes the build from that tree to the Moto G7 test phone (serial
   `ZY225DPT7F`), then records boot time, RAM, processes, packages, partition
