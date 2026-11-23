@@ -6,9 +6,12 @@
    holds the previous kernel's log, which must contain the latest leaving
    marker with no new kernel session after it.
 2. Uptime: /proc/uptime at boot completion must be at least the host time
-   since the first USB disconnect after the reboot command, minus a
-   bootloader allowance A set by calibration. Any unplanned fastboot
-   enumeration counts as an extra boot.
+   since the clock start, minus a bootloader allowance A set by calibration.
+   On the fastboot path the clock starts at the USB disconnect after the
+   final ``fastboot reboot``. On the adb path it starts at the old kernel's
+   reset (amendment A1, reset_anchor), because river's USB gadget drops
+   seconds before the reset. Any unplanned fastboot enumeration counts as an
+   extra boot.
 3. Boot count: dropbox SYSTEM_BOOT entries since the wipe equal the boots
    expected since the wipe.
 """
@@ -62,14 +65,75 @@ TS_RE = re.compile(rb"\[\s*(\d{1,6})\.(\d{6})\]")
 EARLY_END_S = 30.0
 
 
+def stamps(log: bytes) -> list[float]:
+    return [int(a) + int(b) / 1e6 for a, b in TS_RE.findall(log)]
+
+
+def corroborated_last(ts: list[float], run: int = 3, window_s: float = 1.0) -> float | None:
+    """The last timestamp that ends ``run`` consecutive non-decreasing stamps
+    spanning at most ``window_s`` (amendment A1, D2). ramoops flips bits, and
+    a flipped stamp that still parses (120 -> 128, 41.1 -> 45.1) breaks the
+    run, so it can never move the result later. None if no such run."""
+    for i in range(len(ts) - 1, run - 2, -1):
+        seq = ts[i - run + 1:i + 1]
+        if all(x <= y for x, y in zip(seq, seq[1:])) and seq[-1] - seq[0] <= window_s:
+            return ts[i]
+    return None
+
+
 def last_timestamp(log: bytes) -> float | None:
-    """The latest kernel timestamp near the end of a console log, or None.
-    Bit flips can corrupt single timestamps, so take the largest of the last
-    few that parse."""
-    stamps = [int(a) + int(b) / 1e6 for a, b in TS_RE.findall(log[-8192:])]
-    if not stamps:
-        return None
-    return max(stamps[-20:])
+    """The previous kernel's last trustworthy timestamp (see
+    corroborated_last), or None. Used to spot a log that ends seconds into a
+    boot; never the maximum of the last few stamps."""
+    return corroborated_last(stamps(log[-8192:]))
+
+
+def reset_anchor(pstore_log: bytes, marker: str, pair: dict,
+                 tail_bound: tuple[float, float] | None) -> tuple[dict | None, str]:
+    """Map the old kernel's reset onto the host's monotonic clock (A1).
+
+    ``pair`` ties the leaving marker's own printk timestamp (read back from
+    dmesg right after it was written) to the host time of the write:
+    {"printk_ts", "host_mono", "half_width"}. printk and the marker share
+    one clock, so no /proc/uptime (CLOCK_BOOTTIME) is involved. The reset
+    is the last corroborated stamp after the marker in the next boot's
+    pstore; it must not precede the marker. The result is the earliest host
+    time the reset could have been (host_mono - half_width). With
+    ``tail_bound`` (disconnect, disconnect + the largest calibrated shutdown
+    tail) the anchor must fall inside it, allowing for the pairing's
+    uncertainty. Anything ambiguous or out of bounds: (None, why)."""
+    off = find_marker(pstore_log, marker)
+    if off is None:
+        return None, "leaving marker not in the previous kernel's log"
+    after = stamps(pstore_log[off:])
+    anchor = corroborated_last(after)
+    if anchor is None:
+        return None, f"no corroborated timestamps after the marker ({len(after)} stamps)"
+    mts = float(pair["printk_ts"])
+    if anchor < mts:
+        return None, f"reset stamp {anchor:.3f} precedes the marker's {mts:.3f}"
+    hw = float(pair["half_width"])
+    mid = float(pair["host_mono"]) + (anchor - mts)
+    earliest, latest = mid - hw, mid + hw
+    if tail_bound is not None:
+        lo, hi = tail_bound
+        if latest < lo or earliest > hi:
+            return None, (f"reset at {mid - lo:+.2f} s from the USB disconnect is outside "
+                          f"[0, {hi - lo:.2f}] s (the largest calibrated shutdown tail)")
+    return {"printk_ts": anchor, "marker_ts": mts, "host_mono": earliest, "half_width": hw,
+            "tail_s": None if tail_bound is None else round(earliest - tail_bound[0], 3)}, \
+        f"reset at printk {anchor:.3f} s, {anchor - mts:.2f} s after the marker"
+
+
+def marker_printk_ts(dmesg: str, marker: str) -> float | None:
+    """The printk timestamp of the last copy of ``marker`` in live dmesg."""
+    found = None
+    for line in dmesg.splitlines():
+        if marker in line:
+            m = TS_RE.search(line.encode())
+            if m:
+                found = int(m.group(1)) + int(m.group(2)) / 1e6
+    return found
 
 
 def chain_verdict(pstore_log: bytes | None, marker: str | None) -> tuple[str, str]:
@@ -80,7 +144,12 @@ def chain_verdict(pstore_log: bytes | None, marker: str | None) -> tuple[str, st
         return UNVERIFIED, "pstore console-ramoops missing or empty"
     off = find_marker(pstore_log, marker)
     if off is None:
+        # Without the marker this can only be FAIL or UNVERIFIED. A log too
+        # short to corroborate is judged by its few stamps.
         end = last_timestamp(pstore_log)
+        if end is None:
+            few = stamps(pstore_log[-8192:])
+            end = max(few) if few else None
         if end is not None and end < EARLY_END_S:
             return FAIL, (f"previous kernel log ends {end:.1f} s into a boot with no leaving marker: "
                           "another kernel session ran in between")

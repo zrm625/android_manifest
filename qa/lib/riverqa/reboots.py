@@ -2,9 +2,11 @@
 
 Every planned reboot:
 1. writes a leaving marker to /dev/kmsg (as root, several copies);
-2. starts the uptime clock at the first USB disconnect after the harness's
-   reboot command (for the fastboot path: the disconnect after the final
-   ``fastboot reboot``, so time spent writing images never counts);
+2. records the USB disconnect after the harness's reboot command. On the
+   fastboot path the uptime clock starts at the disconnect after the final
+   ``fastboot reboot``, so time spent writing images never counts. On the adb
+   path it starts at the old kernel's reset, mapped onto host time through
+   the marker's own printk timestamp (amendment A1, judge_record);
 3. at boot completion reads boot_id, sys.boot_completed and /proc/uptime in
    one shell command, then judges the kernel-log chain and the uptime.
 
@@ -50,6 +52,9 @@ def chain_survives(path: str, timing: dict | None = None) -> bool | None:
     return ((timing.get("chain") or {}).get(path) or {}).get("survives")
 
 
+MAX_PAIR_CMD_S = 0.3   # the kmsg write must bracket within this, or the pairing is too loose
+
+
 @dataclass
 class BootRecord:
     path: str
@@ -57,7 +62,7 @@ class BootRecord:
     boot_id_before: str | None
     boot_id: str = ""
     uptime: float = 0.0
-    elapsed: float = 0.0                # host seconds from clock start to the status read
+    elapsed: float = 0.0                # host seconds from the clock start to the status read
     host_boot_seconds: float = 0.0      # reboot command (after any image writes) to boot completed
     bootloader_pass: float = 0.0        # elapsed - uptime
     control: str | None = None
@@ -67,6 +72,14 @@ class BootRecord:
     chain: tuple = ("UNVERIFIED", "")
     uptime_check: tuple = ("UNVERIFIED", "")
     completed_wall: float = 0.0
+    # Amendment A1: where the clock starts, and what it is paired with.
+    clock_source: str = "disconnect"    # "disconnect", "reset-anchor" or "none"
+    marker_pair: dict | None = None     # {"printk_ts", "host_mono", "half_width"}
+    disconnect_mono: float = 0.0        # the recorded disconnect event the clock (or bound) uses
+    completed_mono: float = 0.0
+    elapsed_disconnect: float = 0.0
+    anchor: dict | None = None
+    anchor_note: str = ""
 
     def to_json(self):
         d = asdict(self)
@@ -80,21 +93,49 @@ def control_active() -> str | None:
     return os.environ.get("RIVERQA_CONTROL") or None
 
 
-def leave_marker(dev: Device) -> tuple[str | None, str | None]:
-    """Write a leaving marker; returns (marker, boot_id) or (None, None) if
-    adb root is not available (the chain is then UNVERIFIED for this boot)."""
+def leave_marker(dev: Device) -> tuple[str | None, str | None, dict | None]:
+    """Write a leaving marker and pair it with its own printk timestamp:
+    (marker, boot_id, pair). The host brackets the /dev/kmsg write with
+    time.monotonic() (retrying a slow write), then reads the marker's
+    timestamp back from dmesg. pair is None if the write couldn't be
+    bracketed tightly or read back; marker is None if adb root failed (the
+    chain is then UNVERIFIED for this boot)."""
     try:
         dev.root()
         bid = dev.boot_id()
         marker = bootsig.make_marker(bid)
-        dev.kmsg(marker)
-        return marker, bid
+        t0 = t1 = 0.0
+        for _ in range(3):
+            t0 = time.monotonic()
+            dev.kmsg(marker)
+            t1 = time.monotonic()
+            if t1 - t0 <= MAX_PAIR_CMD_S:
+                break
+        pair = None
+        if t1 - t0 <= MAX_PAIR_CMD_S:
+            r = dev.read(f"dmesg | grep -F {marker}", timeout=20)
+            ts = bootsig.marker_printk_ts(r.out, marker) if r.ok else None
+            if ts is not None:
+                pair = {"printk_ts": ts, "host_mono": (t0 + t1) / 2, "half_width": (t1 - t0) / 2}
+        return marker, bid, pair
     except (TimeoutError, RuntimeError):
-        return None, None
+        return None, None, None
+
+
+def _after(w: UsbWatcher, start_mark: int, event) -> list:
+    """Every event recorded after ``event`` (D4): the window is taken from
+    the recorded disconnect itself, never from an index sampled later, so an
+    enumeration that lands before the sample still counts."""
+    events = w.since(start_mark)
+    for i, e in enumerate(events):
+        if e is event:
+            return events[i + 1:]
+    raise RuntimeError("the disconnect event is not in the watcher's log")
 
 
 def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=None,
                    inject_extra_pass: bool = False, mark_planned: bool = True,
+                   inject_early_reboot: bool = False,
                    already_marked: tuple | None = None,
                    watcher: UsbWatcher | None = None) -> BootRecord:
     """Reboot the phone along ``path`` and wait for boot completion.
@@ -104,21 +145,22 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
     ``inject_extra_pass``: control mode only. With ``mark_planned`` false the
     injected pass's fastboot enumerations are not marked planned, so the
     unplanned-enumeration rule must catch it (the second extra-pass control).
+    The uptime verdict comes later, from judge_signals().
     """
     if path not in PATHS:
         raise ValueError(path)
-    if inject_extra_pass and control_active() is None:
-        raise RuntimeError("an extra bootloader pass may only be injected in control mode")
+    if (inject_extra_pass or inject_early_reboot) and control_active() is None:
+        raise RuntimeError("faults may only be injected in control mode")
     own_watcher = watcher is None
     w = watcher or UsbWatcher(dev.serial).start()
     try:
         if already_marked:
-            marker, bid = already_marked
+            marker, bid, pair = (tuple(already_marked) + (None,))[:3]
         elif dev.state() == "device":
-            marker, bid = leave_marker(dev)
+            marker, bid, pair = leave_marker(dev)
         else:
-            marker, bid = None, None
-        rec = BootRecord(path=path, marker=marker, boot_id_before=bid,
+            marker, bid, pair = None, None, None
+        rec = BootRecord(path=path, marker=marker, boot_id_before=bid, marker_pair=pair,
                          control="extra-pass" if inject_extra_pass else None)
         start_mark = w.mark()
         t_cmd = time.monotonic()
@@ -127,16 +169,14 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             if inject_extra_pass:
                 dev.reboot_adb("bootloader")
                 clock = w.wait_gone(start_mark, 120)        # the injected pass begins
-                unmarked_from = w.mark()
                 dev.wait_fastboot(120)
                 planned += 1
                 mark2 = w.mark()
                 dev.reboot_fastboot()
-                w.wait_gone(mark2, 60)
+                final = w.wait_gone(mark2, 60)
             else:
                 dev.reboot_adb()
-                clock = w.wait_gone(start_mark, 120)
-            after_mark = w.mark()
+                clock = final = w.wait_gone(start_mark, 120)
         else:
             if dev.state() == "device":
                 dev.reboot_adb("bootloader")
@@ -149,31 +189,33 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
                 mark2 = w.mark()
                 dev.reboot_fastboot("bootloader")
                 clock = w.wait_gone(mark2, 60)               # the injected pass begins
-                unmarked_from = w.mark()
                 dev.wait_fastboot(120)
                 planned += 1
                 mark3 = w.mark()
                 dev.reboot_fastboot()
-                w.wait_gone(mark3, 60)
+                final = w.wait_gone(mark3, 60)
             else:
                 mark2 = w.mark()
                 dev.reboot_fastboot()
-                clock = w.wait_gone(mark2, 60)               # the final reboot's disconnect
-            after_mark = w.mark()
+                clock = final = w.wait_gone(mark2, 60)       # the final reboot's disconnect
+        # Enumerations after this disconnect are unplanned. Unmarked control:
+        # count from the injected pass's own disconnect instead.
+        window_from = final
         if inject_extra_pass and not mark_planned:
-            after_mark = unmarked_from
+            window_from = clock
             planned -= 1
             rec.control = "extra-pass-unmarked"
+        if inject_early_reboot:
+            rec.control = inject_reboot_before_completion(dev, boot_timeout)
         st = dev.wait_boot_completed(boot_timeout)
         rec.completed_wall = st.host_wall
         rec.boot_id, rec.uptime = st.boot_id, st.uptime
-        rec.elapsed = st.host_mono - clock.t
+        rec.disconnect_mono, rec.completed_mono = clock.t, st.host_mono
+        rec.elapsed = rec.elapsed_disconnect = st.host_mono - clock.t
         rec.host_boot_seconds = round(st.host_mono - t_cmd, 2)
         rec.bootloader_pass = round(rec.elapsed - rec.uptime, 3)
-        events = w.since(start_mark)
-        rec.usb_events = [asdict(e) for e in events]
-        after = w.since(after_mark)
-        rec.unplanned_fastboot = len(fastboot_ids_seen(after))
+        rec.usb_events = [asdict(e) for e in w.since(start_mark)]
+        rec.unplanned_fastboot = len(fastboot_ids_seen(_after(w, start_mark, window_from)))
         rec.planned_fastboot = planned
         return rec
     finally:
@@ -181,7 +223,32 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             w.stop()
 
 
-def judge_signals(dev: Device, rec: BootRecord, timing: dict | None = None) -> None:
+def inject_reboot_before_completion(dev: Device, seconds: float) -> str:
+    """Control only (extra-reboot-*): as soon as adb answers and
+    sys.boot_completed is still unset, `adb reboot` (guarded), with no leaving
+    marker. Returns "early-reboot", or "early-reboot-missed" if boot
+    completed first; the caller records which in batch.json."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if dev.state() == "device":
+            st = dev.boot_status()
+            if st is not None:
+                if st.completed:
+                    return "early-reboot-missed"
+                dev.reboot_adb()
+                return "early-reboot"
+        time.sleep(0.3)
+    return "early-reboot-missed"
+
+
+def tail_bound(rec: BootRecord, timing: dict) -> tuple[float, float] | None:
+    """(disconnect, disconnect + the largest calibrated shutdown tail) for
+    the adb path, or None if calibration recorded no tail."""
+    tail = ((timing.get("paths") or {}).get(rec.path) or {}).get("max_shutdown_tail")
+    return None if tail is None else (rec.disconnect_mono, rec.disconnect_mono + float(tail))
+
+
+def judge_signals(dev: Device, rec: BootRecord, timing: dict | None = None, *, measuring: bool = False) -> None:
     """Fill in the chain and uptime verdicts (reads pstore as root)."""
     timing = load_timing() if timing is None else timing
     try:
@@ -189,9 +256,49 @@ def judge_signals(dev: Device, rec: BootRecord, timing: dict | None = None) -> N
         log = dev.sh_bytes("cat /sys/fs/pstore/console-ramoops* 2>/dev/null", timeout=60)
     except (TimeoutError, RuntimeError):
         log = None
+    judge_record(rec, log, timing, measuring=measuring)
+
+
+def judge_record(rec: BootRecord, log: bytes | None, timing: dict, *, measuring: bool = False) -> None:
+    """The verdicts for one boot from its pstore log. Pure.
+
+    The fastboot path keeps the disconnect clock. The adb path starts the
+    clock at the old kernel's reset (amendment A1): only if this boot's chain
+    is PASS, the marker write was paired with its printk timestamp, and the
+    anchor falls inside the calibrated shutdown tail. Otherwise its uptime
+    signal is UNVERIFIED; it never falls back to the disconnect.
+    ``measuring``: step 1 before any tail is calibrated (no bound)."""
     rec.chain = bootsig.chain_verdict(log, rec.marker)
-    rec.uptime_check = bootsig.uptime_verdict(rec.uptime, rec.elapsed, allowance_for(rec.path, timing),
-                                              rec.unplanned_fastboot)
+    allowance = allowance_for(rec.path, timing)
+    if rec.path != "adb":
+        rec.clock_source = "disconnect"
+        rec.uptime_check = bootsig.uptime_verdict(rec.uptime, rec.elapsed_disconnect, allowance,
+                                                  rec.unplanned_fastboot)
+        return
+    anchor, why = None, ""
+    if rec.chain[0] != PASS:
+        why = f"chain is {rec.chain[0]}, so there is no reset anchor"
+    elif not rec.marker_pair:
+        why = "the leaving marker was not paired with its printk timestamp"
+    else:
+        bound = None if measuring else tail_bound(rec, timing)
+        if bound is None and not measuring:
+            why = "no calibrated shutdown tail for the adb path"
+        else:
+            anchor, why = bootsig.reset_anchor(log, rec.marker, rec.marker_pair, bound)
+    rec.anchor_note = why
+    if anchor is None:
+        rec.clock_source = "none"
+        rec.anchor = None
+        rec.uptime_check = ((FAIL, f"{rec.unplanned_fastboot} unplanned fastboot enumeration(s): extra boot")
+                            if rec.unplanned_fastboot else (UNVERIFIED, f"adb path: {why}"))
+        return
+    rec.clock_source = "reset-anchor"
+    anchor["tail_s"] = round(anchor["host_mono"] - rec.disconnect_mono, 3)
+    rec.anchor = anchor
+    rec.elapsed = rec.completed_mono - anchor["host_mono"]
+    rec.bootloader_pass = round(rec.elapsed - rec.uptime, 3)
+    rec.uptime_check = bootsig.uptime_verdict(rec.uptime, rec.elapsed, allowance, rec.unplanned_fastboot)
 
 
 def combined_verdict(signals: dict, path: str, timing: dict | None = None) -> tuple[str, str]:
