@@ -466,6 +466,34 @@ class PstoreMarkerStamp(unittest.TestCase):
         log = shutdown_log(NORMAL).replace(b"[ 100.000000] RQM", b"[ 100/000000] RQM")
         self.assertEqual(b.marker_stamps_in_log(log, MARKER), [100.0])
 
+    @staticmethod
+    def river_flips_log():
+        """Four copies as ramoops left them on river (step 1, 2026-11-23):
+        the only exact copy has a flipped stamp; the others have flipped
+        marker bytes but intact stamps."""
+        out = b"[    0.000000] Linux version 4.9.337\n[    1.000000] init\n"
+        out += b"[\xa0 100.00\xb3000] " + MARKER.encode() + b"\n"
+        out += b"[ 100.000031] " + MARKER.replace(":1111", ":1i11").encode() + b"\n"
+        out += b"[ 100.000060] " + MARKER.replace(":", "\xaa", 1).encode("latin-1") + b"\n"
+        for t in NORMAL:
+            out += b"[%11.6f] shutdown step\n" % t
+        return out
+
+    def test_fuzzy_copies_count_when_the_exact_copy_stamp_is_damaged(self):
+        stamps = b.marker_stamps_in_log(self.river_flips_log(), MARKER)
+        self.assertEqual([round(t, 6) for t in stamps], [100.000031, 100.00006])
+
+    def test_anchor_from_a_fuzzy_copy_stamp(self):
+        rec = self.judge(dict(record().marker_pair), self.river_flips_log())
+        self.assertEqual(rec.clock_source, "reset-anchor", rec.anchor_note)
+        self.assertAlmostEqual(rec.anchor["marker_ts"], 100.000031)
+
+    def test_merged_line_uses_the_stamp_next_to_the_marker(self):
+        # The newline before the marker flipped, so its line starts with an
+        # earlier message: the stamp next to the marker is the one used.
+        log = shutdown_log(NORMAL).replace(b"init\n[ 100.000000]", b"init\x8a[ 100.000000]")
+        self.assertEqual(b.marker_stamps_in_log(log, MARKER), [100.0])
+
 
 class Enumeration(unittest.TestCase):
     """planned_reboot's enumeration accounting with a fake watcher (E, D4)."""

@@ -39,26 +39,11 @@ def hamming(a: bytes, b: bytes) -> int:
 def find_marker(log: bytes, marker: str, max_flips: int = 3) -> int | None:
     """Offset of the last copy of ``marker`` in ``log``, tolerating up to
     ``max_flips`` wrong characters (ramoops bit flips). None if absent."""
-    m = marker.encode()
-    n = len(m)
-    exact = log.rfind(m)
+    exact = log.rfind(marker.encode())
     if exact >= 0:
         return exact
-    # Anchor on any 6-character slice of the token to keep the scan cheap.
-    best = None
-    for k in range(0, n - 5, 3):
-        piece = m[k:k + 6]
-        start = 0
-        while True:
-            i = log.find(piece, start)
-            if i < 0:
-                break
-            off = i - k
-            if off >= 0 and hamming(log[off:off + n], m) <= max_flips:
-                if best is None or off > best:
-                    best = off
-            start = i + 1
-    return best
+    offs = marker_offsets(log, marker, max_flips)
+    return offs[-1] if offs else None
 
 
 TS_RE = re.compile(rb"\[\s*(\d{1,6})\.(\d{6})\]")
@@ -96,29 +81,41 @@ MARKER_TS_TOL_S = 0.05   # live readback vs pstore: the same write, allowing for
 LOOSE_TS_RE = re.compile(rb"(\d{1,6})[^\d\n](\d{6})")
 
 
+def marker_offsets(log: bytes, marker: str, max_flips: int = 3) -> list[int]:
+    """Offsets of every copy of ``marker`` in ``log``, exact or within
+    ``max_flips`` wrong characters, in log order."""
+    m = marker.encode()
+    n = len(m)
+    hits = set()
+    for k in range(0, n - 5, 3):
+        piece = m[k:k + 6]
+        start = 0
+        while True:
+            i = log.find(piece, start)
+            if i < 0:
+                break
+            off = i - k
+            if off >= 0 and hamming(log[off:off + n], m) <= max_flips:
+                hits.add(off)
+            start = i + 1
+    return sorted(hits)
+
+
 def marker_stamps_in_log(log: bytes, marker: str, max_flips: int = 3) -> list[float]:
     """The printk timestamps of the copies of ``marker`` in a pstore log.
-    Exact copies if there are any, otherwise copies within ``max_flips``
-    wrong characters. The stamp is read from the start of the copy's own
-    line with a tolerant parse (any one byte between the seconds and the
-    microseconds, brackets ignored), because ramoops flips bits there too."""
-    m = marker.encode()
-    offs, start = [], 0
-    while True:
-        i = log.find(m, start)
-        if i < 0:
-            break
-        offs.append(i)
-        start = i + 1
-    if not offs:
-        off = find_marker(log, marker, max_flips)
-        offs = [] if off is None else [off]
+    Every copy within ``max_flips`` wrong characters counts, exact or not:
+    on river ramoops often damages the one exact copy's stamp while a
+    copy with a flipped nonce character keeps its stamp intact (step 1,
+    2026-11-23). The stamp is the last one on the copy's own line before
+    it, read with a tolerant parse (any one byte between the seconds and
+    the microseconds, brackets ignored), because ramoops flips bits there
+    too. A wrong stamp is caught by the caller's live/pstore match."""
     out = []
-    for off in offs:
+    for off in marker_offsets(log, marker, max_flips):
         line = log[log.rfind(b"\n", 0, off) + 1:off]
-        hit = TS_RE.search(line) or LOOSE_TS_RE.search(line)
-        if hit:
-            out.append(int(hit.group(1)) + int(hit.group(2)) / 1e6)
+        hits = list(TS_RE.finditer(line)) or list(LOOSE_TS_RE.finditer(line))
+        if hits:
+            out.append(int(hits[-1].group(1)) + int(hits[-1].group(2)) / 1e6)
     return out
 
 
