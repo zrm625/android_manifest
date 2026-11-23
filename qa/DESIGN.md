@@ -2525,3 +2525,46 @@ wrote `boot_a` and the rest; the second exited 1 in every subcase.
 Gemini's round-11 minors: the `Unstamped` message names `flash stripped
 --wipe` for a phone running a build with other keys (m1); the erase
 timeout (m2) is R11-2; row 3's advice wording is corrected (m3).
+
+## Code review round 12: changes to R11
+
+Round 12 (head `c4064da`): Opus 9 and Gemini approve; Sol 7 objects with
+two majors and says no other blocker or major remains. Fixed in
+`flashing.flash_dev` without new recovery or settle paths; the five
+`fbmode.settle` callers are unchanged.
+
+**R12-1. Before the first baseline, the active slot must be shown to
+boot.** R11-1 took "adb answers with a slot suffix" as proof that the
+active slot boots. A slot can answer adb and never complete boot, and the
+same gap existed with nothing pending: two pre-baseline `--no-reboot`
+flashes both returned 0, and the second wrote the original slot before the
+first target had booted. Now, with no `slot-state.json`, the dev flash
+reads `sys.boot_completed` with the slot suffix and writes only when the
+phone is in Android and the boot has completed. Otherwise it refuses after
+the slot read and before any clear or write: HALT 3 with an obligation
+pending (the `armed_way_back` advice), exit 1 with nothing pending ("boot
+the phone to Android on a slot that works, then flash again"). This
+replaces R11-1's fastboot-only refusal. Before the first baseline with an
+obligation pending, the pre-write halts (failed slot read, unreadable
+slot, failed clear) also give `armed_way_back`, never `flash --recover`.
+
+Ordering row 3, step 3a, now reads: before the first baseline, unless the
+slot was read from Android with `sys.boot_completed=1`, refuse with
+nothing changed.
+
+**R12-2. Timeout advice keeps the caller's `--wipe` choice.** After a
+`--set-active` or wipe timeout (`WipeFailed`), the advice first says to
+check `fastboot getvar current-slot`. Only a flash run with `--wipe`
+mentions erasing userdata; without it, the advice is to reboot the slot
+that is active or go back to the previous one.
+
+**Minors.** Opus m2 (the message said "in fastboot" for a phone found in
+recovery) is covered by R12-1's message, which names where the phone was.
+Opus m3 (single-item test loop) is fixed. Opus m4 (unauthorized adb with a
+slotless entry halts through `Unreachable`) is unchanged and safe.
+
+Regressions: `test_round12.py` (5 tests). At `c4064da` the not-booted case
+wrote all four a partitions, the second `--no-reboot` flash exited 0, the
+slotless pre-write halt named `flash --recover`, and the no-wipe timeout
+advice named an erase and no `getvar current-slot`.
+

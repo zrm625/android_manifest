@@ -326,7 +326,9 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
     obligation pending halts (exit 3). A failed or timed-out `fastboot
     erase userdata` after `--set-active`, or a timed-out `--set-active`,
     always halts (exit 3): the new slot is, or may be, active and its wipe
-    is not confirmed.
+    is not confirmed. The advice starts with `fastboot getvar
+    current-slot`, and names an erase only if the flash was run with
+    `--wipe`.
   - **Before the first baseline** (no `slot-state.json`), the slot the
     obligation was armed on is the only slot known to boot. So, before it
     touches the phone, a dev flash refuses:
@@ -344,12 +346,20 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
     advice is `flash stripped` with the armed slot active. Halts of a
     dev flash in this state never advise `flash --rollback` (it needs
     `slot-state.json`) or another flash.
+    - Whatever is pending, a dev flash before the first baseline writes
+      only when it finds the phone in Android with `sys.boot_completed=1`:
+      that shows the active slot boots, so the other slot is a safe
+      target. In fastboot, or in Android before boot completes, it refuses
+      before anything is cleared or written (exit 3 with an obligation
+      pending, else exit 1). So a second `--no-reboot` flash can't write
+      the original slot before the first one has booted: boot the phone
+      first.
     - An entry from before round 8 records no slot, so nothing says which
-      slot still boots. A dev flash then refuses (exit 3) unless it finds
-      the phone running Android, which shows the active slot boots and
-      makes the other slot a safe target. The advice is to clear fb_mode,
-      find a slot that reaches Android by hand, leave it active and run
-      `flash stripped`; if no slot boots, stop and tell Zak.
+      slot still boots. The advice is to clear fb_mode, find a slot that
+      reaches Android by hand, leave it active and run `flash stripped`;
+      if no slot boots, stop and tell Zak. Every halt before the first
+      baseline with an obligation pending gives this kind of advice, never
+      `flash --recover`.
   - With a known-good slot, `flash stripped --no-reboot` leaves the
     obligation pending and says what settles it. If it wrote the slot and
     build IDs the obligation was armed on, generic recovery (`phone-qa
