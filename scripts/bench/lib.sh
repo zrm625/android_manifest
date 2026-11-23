@@ -63,7 +63,7 @@ run_build() {
   podman run --rm --name "lineageos-build" --userns=keep-id \
     --tmpfs /home/build:exec -e HOME=/home/build -e USER=build \
     -v "$tree:/src:ro" -v "$tree/.repo:/src/.repo:O" -v "$out:/src/out:rw" -w /src \
-    "${ccache_args[@]}" -e BUILD_TARGET="$target" -e BUILD_JOBS="$jobs" -e BUILD_INSTALLCLEAN="$installclean" \
+    "${ccache_args[@]}" ${RIVER_BUILD_ID:+-e RIVER_BUILD_ID="$RIVER_BUILD_ID"} -e BUILD_TARGET="$target" -e BUILD_JOBS="$jobs" -e BUILD_INSTALLCLEAN="$installclean" \
     "$IMAGE" bash -c '
       source build/envsetup.sh >/dev/null
       breakfast river >/dev/null || { echo "90 0 " > out/.bench-result; exit 90; }

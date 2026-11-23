@@ -4,6 +4,7 @@
 # than hours.
 #
 # Usage: build [--tree baseline|stripped] [--installclean] [--clean] [--ccache] [--jobs N] [--target T]
+#              [--build-id ID]
 #
 #   --tree     Which tree to build. Default: stripped (this tree).
 #   --installclean  Delete the staged partitions and images first, but keep
@@ -17,8 +18,15 @@
 #              Pick one setting per output directory and keep it.
 #   --jobs N   Parallel jobs. Default: nproc.
 #   --target T Build target. Default: bacon (flashable images and zip).
+#   --build-id ID  Stamp: written to ro.river.build_id (/system/build.prop) and
+#              ro.vendor.river.build_id (/vendor/build.prop), which phone-qa
+#              checks. Letters, digits, '.', '_' and '-' only. A batch build
+#              passes "<batch id>-<commit set hash>". Default: $RIVER_BUILD_ID
+#              if set, otherwise "dev-<time>-<commit set hash>".
 #
 # Output goes to $BENCH_HOME/out-<tree>/, which is what scripts/flash installs.
+# A successful build also writes out-<tree>/river-build.json: the build ID and
+# the commit set (each fork's HEAD and the manifest's) it was built from.
 # For timing measurements, use scripts/bench/bench instead: it builds cold in a
 # separate directory and never touches this output.
 set -euo pipefail
@@ -26,7 +34,7 @@ source "$(dirname "$(realpath "$0")")/bench/lib.sh"
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-env_name=stripped installclean=0 clean=0 ccache=0 jobs=$(nproc) target=bacon
+env_name=stripped installclean=0 clean=0 ccache=0 jobs=$(nproc) target=bacon build_id=${RIVER_BUILD_ID:-}
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tree) env_name=$2; shift ;;
@@ -35,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     --ccache) ccache=1 ;;
     --jobs) jobs=$2; shift ;;
     --target) target=$2; shift ;;
+    --build-id) build_id=$2; shift ;;
     -h|--help) usage 0 ;;
     *) echo "unknown option: $1" >&2; usage 1 ;;
   esac
@@ -42,6 +51,23 @@ while [[ $# -gt 0 ]]; do
 done
 tree=$(tree_for "$env_name") || usage 1
 [[ -d "$tree/.repo" ]] || { echo "error: no repo tree at $tree" >&2; exit 1; }
+
+# The commit set: one "<path> <sha>" line per fork, plus the manifest. A
+# dirty repo gets "+dirty", so an uncommitted build never looks committed.
+commit_set() {
+  local path
+  { (cd "$tree" && "$REPO" forall -g "$FORK_GROUP" -c 'echo "$REPO_PATH"' 2>/dev/null) || true; } |
+    while read -r path; do
+      printf '%s %s%s\n' "$path" "$(git -C "$tree/$path" rev-parse HEAD)" \
+        "$( [[ -n "$(git -C "$tree/$path" status --porcelain -uno)" ]] && echo +dirty)"
+    done | sort
+  printf '.repo/manifests %s\n' "$(git -C "$tree/.repo/manifests" rev-parse HEAD)"
+}
+commits=$(commit_set)
+commit_hash=$(sha256sum <<<"$commits" | cut -c1-10)
+[[ -n "$build_id" ]] || build_id="dev-$(date +%Y%m%d-%H%M%S)-$commit_hash"
+[[ "$build_id" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || { echo "error: bad build ID '$build_id'" >&2; exit 1; }
+export RIVER_BUILD_ID=$build_id
 
 acquire_build_lock
 # Lowest CPU priority: the build and every compiler it starts yield to
@@ -57,13 +83,20 @@ if [[ "$clean" == 1 ]]; then
 fi
 
 log=$BENCH_HOME/logs/build-$(date +%Y%m%d-%H%M%S)-$env_name.log
-echo "Building $target for $env_name into $out (log: $log)"
+echo "Building $target for $env_name into $out, build ID $build_id (log: $log)"
 rc=0
 run_build "$tree" "$out" "$target" "$jobs" "$ccache" "$log" "$installclean" || rc=$?
 read -r _ wall _ < <(cat "$out/.bench-result" 2>/dev/null || echo "$rc 0 ")
 echo
 if [[ "$rc" == 0 ]]; then
-  echo "Built in ${wall}s. Install with: scripts/flash $env_name"
+  python3 -I -c '
+import json, sys
+build_id, commit_hash, commits, out = sys.argv[1:5]
+rows = [l.split(" ", 1) for l in commits.splitlines() if l.strip()]
+json.dump({"build_id": build_id, "commit_set_hash": commit_hash,
+           "commit_set": {p: s for p, s in rows}}, open(out, "w"), indent=2)
+' "$build_id" "$commit_hash" "$commits" "$out/river-build.json"
+  echo "Built $build_id in ${wall}s. Install with: scripts/flash $env_name"
 else
   echo "Build failed (exit $rc). Log: $log"
 fi
