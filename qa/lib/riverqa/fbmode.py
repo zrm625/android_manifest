@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 
 from . import journal as jmod
 from .core import bench_path, host_boot_id, host_boottime, log, now_iso
+from .slots import UNSTAMPED
 
 KIND = KEY = jmod.FB_MODE
 SLOTS = ("a", "b")
@@ -65,12 +66,18 @@ class WrongSlot(RuntimeError):
 
 
 class SlotUnreadable(RuntimeError):
-    """``getvar current-slot`` gave no slot (R8-2). Never a WrongSlot, never
-    rollback advice: raised before anything is cleared or booted."""
+    """``getvar current-slot`` (or, in Android, ``getprop
+    ro.boot.slot_suffix``) gave no slot (R8-2). Never a WrongSlot, never
+    rollback advice: raised before anything is cleared or booted. The
+    message names the read it came from (R10-6)."""
 
-    def __init__(self, serial: str, got: str):
-        super().__init__(f"cannot read the active slot; recheck with `fastboot -s {serial} getvar current-slot` "
-                         f"(fastboot reported {got!r})")
+    def __init__(self, serial: str, got: str, source: str = "fastboot"):
+        if source == "getprop":
+            super().__init__(f"cannot read the running slot; recheck with `adb -s {serial} shell getprop "
+                             f"ro.boot.slot_suffix` (getprop reported {got!r})")
+        else:
+            super().__init__(f"cannot read the active slot; recheck with `fastboot -s {serial} getvar "
+                             f"current-slot` (fastboot reported {got!r})")
 
 
 class NotVerified(RuntimeError):
@@ -84,13 +91,22 @@ class SlotMismatch(NotVerified):
 
 # --- reads on the booted phone ------------------------------------------------
 
+def stamp(value: str | None) -> str | None:
+    """A build ID, or None for no stamp. device.mk's default
+    (``RIVER_BUILD_ID ?= unstamped``) and an empty value are no stamp
+    (R10-1), as in slots, stage and qa."""
+    return None if not value or value == UNSTAMPED else value
+
+
 def partition_build_ids(dev) -> tuple[str | None, str | None]:
     """ro.river.build_id and ro.vendor.river.build_id read straight from the
-    partitions' build.prop files, as root."""
+    partitions' build.prop files, as root. The ``unstamped`` sentinel is
+    None (R10-1)."""
     dev.root()
     sysp = dev.sh("grep -m1 '^ro.river.build_id=' /system/build.prop").strip()
     venp = dev.sh("grep -m1 '^ro.vendor.river.build_id=' /vendor/build.prop").strip()
-    return (sysp.split("=", 1)[1] if "=" in sysp else None, venp.split("=", 1)[1] if "=" in venp else None)
+    return (stamp(sysp.split("=", 1)[1]) if "=" in sysp else None,
+            stamp(venp.split("=", 1)[1]) if "=" in venp else None)
 
 
 class Unstamped(RuntimeError):
@@ -103,8 +119,9 @@ class Unstamped(RuntimeError):
 def running_identity(dev) -> tuple[str, tuple[str, str]]:
     """In Android: the adb guard, then the running slot and both build IDs.
     Raises RuntimeError on an unreadable slot (also a getprop that gives
-    nothing, R9-9) and Unstamped on a build without both stamps. It
-    changes nothing on the phone."""
+    nothing, R9-9) and Unstamped on a build without both stamps (the
+    ``unstamped`` sentinel on either partition is none, R10-1). It changes
+    nothing on the phone."""
     dev.guard()
     slot = (dev.getprop("ro.boot.slot_suffix") or "").lstrip("_")
     if slot not in SLOTS:
@@ -150,8 +167,9 @@ class Want:
     def __post_init__(self):
         if self.slot not in SLOTS:
             raise ValueError(f"bad slot {self.slot!r}")
-        if self.build_ids is not None and (len(self.build_ids) != 2 or not all(self.build_ids)):
-            raise ValueError(f"bad build IDs {self.build_ids!r}")
+        if self.build_ids is not None and (len(self.build_ids) != 2
+                                           or any(stamp(b) is None for b in self.build_ids)):
+            raise ValueError(f"bad build IDs {self.build_ids!r}")   # R10-1: never the sentinel
         if self.build_ids is None and not self.boot_sha:
             raise ValueError("no build IDs and no boot hash: nothing to verify the build with")
 
@@ -222,15 +240,26 @@ def verify_boot(dev, want: Want) -> VerifiedBoot:
 
 # --- the obligation -----------------------------------------------------------
 
+def armed_slot(e: dict) -> str | None:
+    """The slot an obligation was armed on, if it records one (an entry
+    from before round 8 doesn't). Recorded even when its build IDs are
+    unusable (R10-3)."""
+    slot = (e.get("extra") or {}).get("slot")
+    return slot if slot in SLOTS else None
+
+
 def armed_want(e: dict) -> Want:
-    """The identity the phone had when this obligation was armed (R8-1)."""
+    """The identity the phone had when this obligation was armed (R8-1). An
+    entry with no slot and build IDs (armed before round 8), or with the
+    ``unstamped`` sentinel for either ID (R10-1), has none: no boot can be
+    verified against it, so generic recovery refuses it."""
     x = e.get("extra") or {}
     ids = x.get("build_ids")
-    if x.get("slot") not in SLOTS or not ids or len(ids) != 2 or not all(ids):
-        raise RuntimeError("the fb_mode obligation has no recorded slot and build IDs (armed before round 8), "
-                           "so no boot can be verified against it. A dev flash (flash stripped) settles it with "
-                           "the verified boot of the slot it writes; with a known-good slot, flash --rollback or a "
-                           "batch flash does too")
+    if x.get("slot") not in SLOTS or not ids or len(ids) != 2 or any(stamp(b) is None for b in ids):
+        raise RuntimeError("the fb_mode obligation has no recorded slot and build IDs to verify a boot against "
+                           "(armed before round 8, or on an unstamped build). A dev flash "
+                           "(flash stripped) settles it with the verified boot of the slot it writes; with a "
+                           "known-good slot, flash --rollback or a batch flash does too")
     return Want(x["slot"], (ids[0], ids[1]))
 
 
@@ -310,8 +339,8 @@ def settle(proof: VerifiedBoot, j: jmod.Journal | None = None) -> bool:
     cleared = x.get("cleared_at")
     if cleared is None:
         raise NotSettled("fb_mode_clear was never confirmed for this obligation; not resolving it")
-    if not isinstance(cleared, dict) or not isinstance(cleared.get("boottime"), (int, float)) \
-            or not cleared.get("host_boot_id"):
+    bt = cleared.get("boottime") if isinstance(cleared, dict) else None
+    if isinstance(bt, bool) or not isinstance(bt, (int, float)) or not cleared.get("host_boot_id"):   # R10-6
         raise NotSettled("the clear stamp has no host boot clock (written before round 9); not resolving the "
                          "obligation. Recovery clears and stamps it again.")
     # R9-7: both times are the host's CLOCK_BOOTTIME, which a wall-clock
