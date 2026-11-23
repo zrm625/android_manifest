@@ -997,3 +997,21 @@ first-after-wipe tail) and these:
   status; an unreadable sample is no evidence; absence needs a successful
   sample finished by target − 10 s.
 
+
+## Code review round 3: changes to the amendment and the design
+
+Council code review round 3 (Opus and Gemini approved, Sol objected) asked
+for the strict A1 anchor above (rule 2: one exact marker record, a clean
+tail, otherwise UNVERIFIED; the silent tail) and these:
+
+- **Promotion proof** (see "Recovery checks GitHub first"): the expected PR
+  set is frozen at `merge_started`, each PR must be merged into `river-22.2`
+  of its own zrm625 repo, the tagged tree must be the tested tree, and JSON
+  writes fsync the directory after the rename.
+- **Controls.** The torch control qualifies only when a valid capture
+  finished and the torch assertion itself (`FLASH_STATE_FIRED` or the luma
+  rise) rejected it. `bt-rfkill` honours the exit status of
+  `bluetoothctl show`; a failed show is UNVERIFIED and nothing is stubbed.
+  The extra-reboot controls need the injection's `boot_id` to be present
+  and equal to the injected row's. An injected reboot that is never seen to
+  drop off USB is recorded as missed, so its control is unqualified.

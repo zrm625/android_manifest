@@ -732,7 +732,9 @@ def check_boot_signals(run: Run) -> Result:
         inj = injection_for(run, name)
         label = injected_boot_label(inj, dirs) if inj else None
         st, bid = per.get(label, (None, None)) if label else (None, None)
-        bid_ok = not inj or not inj.get("boot_id") or inj.get("boot_id") == bid
+        # The injection must name the boot it went into, and that boot_id
+        # must be the row's (review round 3): a missing one never matches.
+        bid_ok = bool(inj and inj.get("boot_id") and bid and inj.get("boot_id") == bid)
         details["injected_boot"] = {"record": inj, "row": label, "state": st, "boot_id_matches": bid_ok}
         if inj and label and bid_ok and st == FAIL:
             run.control_injected = name

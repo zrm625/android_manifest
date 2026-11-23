@@ -247,7 +247,8 @@ def inject_reboot_before_completion(dev: Device, seconds: float, watcher: UsbWat
     marker, then wait for the phone to drop off USB, so the boot that was
     just rebooted can't be the one wait_boot_completed() sees complete
     (review round 2). Returns "early-reboot", or "early-reboot-missed" if
-    boot completed first; the caller records which in batch.json."""
+    boot completed first or the phone was never seen to drop off USB
+    (review round 3); the caller records which in batch.json."""
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         if dev.state() == "device":
@@ -258,7 +259,13 @@ def inject_reboot_before_completion(dev: Device, seconds: float, watcher: UsbWat
                 mark = watcher.mark() if watcher is not None else None
                 dev.reboot_adb()
                 if watcher is not None:
-                    watcher.wait_gone(mark, 120)
+                    try:
+                        watcher.wait_gone(mark, 120)
+                    except TimeoutError:
+                        # Never seen to drop off USB: the fault isn't proven
+                        # to have gone in, so the control is unqualified
+                        # (review round 3).
+                        return "early-reboot-missed"
                 return "early-reboot"
         time.sleep(0.3)
     return "early-reboot-missed"

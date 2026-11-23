@@ -215,18 +215,33 @@ class BtSession:
             self.p.kill()
 
 
-def bt_rfkill_stub_took(real: str, stubbed: str) -> bool:
-    """The real `bluetoothctl show` was a valid report of a powered adapter
-    and the stub removed "Powered: yes"."""
-    return (bool(re.search(r"Controller [0-9A-Fa-f:]{17}", real)) and "Powered: yes" in real
+def bt_rfkill_stub_took(real: str, stubbed: str, returncode: int = 0) -> bool:
+    """The real `bluetoothctl show` exited 0 with a valid report of a
+    powered adapter, and the stub removed "Powered: yes" (review round 3:
+    a failed show is no report)."""
+    return (returncode == 0 and bool(re.search(r"Controller [0-9A-Fa-f:]{17}", real)) and "Powered: yes" in real
             and "Powered: yes" not in stubbed)
+
+
+def bt_show() -> tuple[int, str]:
+    """`bluetoothctl show`: (exit status, stdout). A timeout is status -1."""
+    try:
+        r = host_run(["bluetoothctl", "show"], timeout=20)
+    except TimeoutError:
+        return -1, ""
+    return r.returncode, r.stdout
 
 
 def check_bluetooth(run) -> list[Result]:
     cid = "radios.bluetooth"
     dev, cfg = run.dev, server_cfg(run)
     forge = cfg.get("forge_bt_addr", "").upper()
-    show = bt_host("show")
+    rc, show = bt_show()
+    if rc != 0:
+        # Its exit status is honoured: a failed show is no adapter report,
+        # and in the bt-rfkill control nothing was stubbed (review round 3).
+        return [Result(cid, UNVERIFIED, f"`bluetoothctl show` failed (exit {rc}): host adapter state unknown "
+                       "(fixture problem)")]
     if control_active() == "bt-rfkill":
         # Control: only the adapter report is stubbed, as an rfkilled adapter
         # prints it; the parsing below is the real check. It counts as
@@ -235,7 +250,7 @@ def check_bluetooth(run) -> list[Result]:
         real = show
         show = re.sub(r"Powered: yes", "Powered: no", show)
         show = re.sub(r"PowerState: on", "PowerState: off-blocked", show)
-        if bt_rfkill_stub_took(real, show):
+        if bt_rfkill_stub_took(real, show, rc):
             injected(run, "bt-rfkill")
     if "Powered: yes" not in show:
         # The harness never powers the host adapter itself.
@@ -311,8 +326,8 @@ def check_bluetooth(run) -> list[Result]:
         ok_scan, smsg = restore_now(run, PHONE, "bt_scan_mode", "bt")
         ok_pol, _ = restore_now(run, PHONE, "setting", "global/hidden_api_policy")
         ok_on, _ = restore_now(run, PHONE, "bt_enabled", "bt")
-    show2 = bt_host("show")
-    disc_ok = f"Discoverable: {disc}" in show2
+    rc2, show2 = bt_show()
+    disc_ok = rc2 == 0 and f"Discoverable: {disc}" in show2
     details["cleanup"] = {"bond": bmsg, "scan_mode": smsg, "policy": ok_pol, "bt_onoff": ok_on,
                           "host_discoverable": disc_ok}
     if not paired:
@@ -517,7 +532,7 @@ def check_cameras(run) -> list[Result]:
     if 0 in expected:
         iso = param(run, "camera0_photo_iso", 100)
         exp = param(run, "camera0_photo_exposure_ns", 20_000_000)
-        led_note, held_nodes, took = None, [], False
+        led_note, held_nodes, took, held = None, [], False, False
         if control_active() == "torch-disabled":
             took, led_note, held_nodes = disable_torch(run)
         try:
@@ -530,21 +545,26 @@ def check_cameras(run) -> list[Result]:
                 held, hold_note = torch_still_held(run, held_nodes)
                 restore_led(run)
                 led_note = f"{led_note}; after the capture: {hold_note}"
-                if took and held:
-                    injected(run, "torch-disabled")
         early = helper_result(cid, r)
         if early:
             return [early]
-        fs = (r.get("flash_states") or "").split(",")
-        l0, l1 = float(r.get("luma0") or 0), float(r.get("luma1") or 0)
-        s1 = float(r.get("std1") or 0)
+        cap = torch_capture(r)
         delta_min = th(run, "torch_delta", 5.0)
         std_min = th(run, "camera_luma_std", 4.0)
+        fs, l0, l1, s1 = cap["flash_states"], cap["luma_off"], cap["luma_on"], cap["std_on"]
+        torch_ok, torch_why = torch_assertion(cap, delta_min)
         torch_detail = {"flash_states": fs, "luma_off": l0, "luma_on": l1, "std_on": s1, "iso": iso,
-                        "exposure_ns": exp, "led_control": led_note}
+                        "exposure_ns": exp, "led_control": led_note, "valid_capture": cap["valid"],
+                        "torch_assertion": torch_why}
         details["camera0_photo"] = torch_detail
-        fired = len(fs) > 1 and fs[1] == "3"  # FLASH_STATE_FIRED
-        if not (fired and l1 - l0 >= delta_min and l1 >= 20 and s1 >= std_min):
+        if control_active() == "torch-disabled" and took and held and cap["valid"] and not torch_ok:
+            # Only a valid capture that the torch assertion itself rejected
+            # (FLASH_STATE_FIRED or the luma delta) counts, never any other
+            # FAIL of hardware.cameras (review round 3).
+            injected(run, "torch-disabled")
+        if not cap["valid"]:
+            problems.append(f"camera 0 photo: incomplete capture result ({cap['why']})")
+        elif not (torch_ok and l1 >= 20 and s1 >= std_min):
             problems.append(f"camera 0 photo: FLASH_STATE {fs[1] if len(fs) > 1 else '?'}, luma off {l0:.1f} on "
                             f"{l1:.1f} (need +{delta_min}), on >= 20, std {s1:.1f} (need {std_min})")
     for camid in [c for c in expected if c != 0]:
@@ -564,6 +584,36 @@ def check_cameras(run) -> list[Result]:
             f"; torch photo luma {torch_detail['luma_off']:.0f} -> {torch_detail['luma_on']:.0f}, FIRED"
             if torch_detail else ""), details, helper_terminal=True))
     return out
+
+
+def torch_capture(r) -> dict:
+    """The torch photo's result, parsed: valid only if the helper reported
+    the flash states of both frames and both lumas and the "on" std as
+    numbers."""
+    fs = [x for x in (r.get("flash_states") or "").split(",") if x != ""]
+    out = {"flash_states": fs, "luma_off": 0.0, "luma_on": 0.0, "std_on": 0.0, "valid": False, "why": ""}
+    try:
+        out["luma_off"], out["luma_on"] = float(r.get("luma0")), float(r.get("luma1"))
+        out["std_on"] = float(r.get("std1"))
+    except (TypeError, ValueError):
+        out["why"] = "luma or std missing"
+        return out
+    if len(fs) < 2:
+        out["why"] = f"flash states {fs or 'missing'}"
+        return out
+    out["valid"] = True
+    return out
+
+
+def torch_assertion(cap: dict, delta_min: float) -> tuple[bool, str]:
+    """The torch assertion itself: FLASH_STATE_FIRED on the "on" frame and a
+    luma rise of at least ``delta_min``."""
+    fs = cap["flash_states"]
+    if not (len(fs) > 1 and fs[1] == "3"):  # FLASH_STATE_FIRED
+        return False, f"not FIRED (FLASH_STATE {fs[1] if len(fs) > 1 else '?'})"
+    if cap["luma_on"] - cap["luma_off"] < delta_min:
+        return False, f"luma rose {cap['luma_on'] - cap['luma_off']:.1f} (< {delta_min})"
+    return True, "FIRED, luma rose"
 
 
 def torch_leds(run) -> list[str]:

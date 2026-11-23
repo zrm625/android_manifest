@@ -123,10 +123,10 @@ class EarlyReboot(unittest.TestCase):
         w.mark.return_value = 7
         self.assertEqual(reboots.inject_reboot_before_completion(d, 5, w), "early-reboot")
         w.wait_gone.assert_called_once_with(7, 120)
-        # A reboot that never drops off USB is not an injection.
+        # A reboot that never drops off USB is not an injection: the
+        # timeout is caught and the control is unqualified (review round 3).
         w.wait_gone.side_effect = TimeoutError("still on USB")
-        with self.assertRaises(TimeoutError):
-            reboots.inject_reboot_before_completion(self.Dev(False), 5, w)
+        self.assertEqual(reboots.inject_reboot_before_completion(self.Dev(False), 5, w), "early-reboot-missed")
 
     def test_missed_if_already_completed(self):
         d = self.Dev(True)
@@ -194,6 +194,17 @@ class Attribution(unittest.TestCase):
                                                    ("bench dev-1#1", False, FAIL, "OTHER")])
             self.assertIsNone(marked)
 
+    def test_missing_boot_id_never_matches(self):
+        # Review round 3: the injection must carry the boot_id, and the row
+        # must have one too.
+        rows = [("first boot", True, PASS, "B0"), ("bench dev-1#1", False, FAIL, "B1")]
+        no_bid = {k: v for k, v in self.INJ.items() if k != "boot_id"}
+        with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-bench"}):
+            self.assertIsNone(self.run_with([no_bid], rows)[1])
+            self.assertIsNone(self.run_with([dict(self.INJ, boot_id="")], rows)[1])
+            self.assertIsNone(self.run_with([self.INJ], [("first boot", True, PASS, "B0"),
+                                                         ("bench dev-1#1", False, FAIL, None)])[1])
+
     def test_first_boot_injection(self):
         inj = dict(self.INJ, control="extra-reboot-first-boot", where="first boot", boot_id="B0")
         with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "extra-reboot-first-boot"}):
@@ -221,6 +232,71 @@ class Attribution(unittest.TestCase):
         self.assertFalse(features.bt_rfkill_stub_took("No default controller available\n", ""))
         off = real.replace("Powered: yes", "Powered: no")
         self.assertFalse(features.bt_rfkill_stub_took(off, off))
+        # Review round 3: a failed `bluetoothctl show` is no report, whatever it printed.
+        self.assertFalse(features.bt_rfkill_stub_took(real, stub, 1))
+
+    def test_bt_rfkill_failed_show_is_not_injected(self):
+        from riverqa import features
+        real = "Controller AA:BB:CC:DD:EE:FF forge [default]\n\tPowered: yes\n"
+        run = mock.Mock(control_injected=None)
+        with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "bt-rfkill"}), \
+                mock.patch.object(features, "server_cfg", lambda r: {}), \
+                mock.patch.object(features, "bt_show", lambda: (1, real)):
+            res = features.check_bluetooth(run)
+        self.assertEqual(res[0].state, UNVERIFIED)
+        self.assertIn("exit 1", res[0].summary)
+        self.assertIsNone(run.control_injected)
+
+    def torch_run(self, photo, held=True):
+        """check_cameras for camera 0 only, under the torch-disabled control,
+        with the helper's photo result ``photo``."""
+        from riverqa import features, helper
+        run = mock.Mock(control_injected=None, batch={"cameras": {"set": [0]}})
+
+        class R:
+            terminal, ok, error = True, True, None
+
+            def __init__(self, d):
+                self.d = d
+
+            def get(self, k, default=None):
+                return self.d.get(k, default)
+
+        live = R({"timestamps": ",".join(str(i) for i in range(1, 11)), "diffs": "5,5,5,5,5,5,5,5,5"})
+
+        def instrument(run, name, args, **kw):
+            return R({"ids": "0"}) if name == "camera_list" else live if name == "camera_live" else R(photo)
+        with mock.patch.dict(os.environ, {"RIVERQA_CONTROL": "torch-disabled"}), \
+                mock.patch.object(features, "expected_cameras", lambda r: ([0], "batch")), \
+                mock.patch.object(helper, "instrument", instrument), \
+                mock.patch.object(helper, "fg_problem", lambda r: None), \
+                mock.patch.object(features, "disable_torch", lambda r: (True, "capped", ["n"])), \
+                mock.patch.object(features, "torch_still_held", lambda r, n: (held, "held")), \
+                mock.patch.object(features, "restore_led", lambda r: None), \
+                mock.patch.object(features, "th", lambda r, k, d: d), \
+                mock.patch.object(features, "param", lambda r, k, d: d):
+            res = features.check_cameras(run)
+        return res[0], run.control_injected
+
+    def test_torch_needs_the_torch_assertion_to_reject_a_valid_capture(self):
+        dark = {"flash_states": "0,2", "luma0": "40", "luma1": "41", "std1": "9"}
+        r, marked = self.torch_run(dark)
+        self.assertEqual(r.state, FAIL)
+        self.assertEqual(marked, "torch-disabled")
+        # The torch fired and lit the scene, but the photo failed another
+        # assertion (std too low): a FAIL, but not the torch's.
+        lit_flat = {"flash_states": "0,3", "luma0": "40", "luma1": "90", "std1": "1"}
+        r, marked = self.torch_run(lit_flat)
+        self.assertEqual(r.state, FAIL)
+        self.assertIsNone(marked)
+        # An incomplete capture result proves nothing.
+        r, marked = self.torch_run({"flash_states": "0", "luma0": "40", "luma1": "41", "std1": "9"})
+        self.assertEqual(r.state, FAIL)
+        self.assertIsNone(marked)
+        r, marked = self.torch_run({"flash_states": "0,2", "luma0": "40", "std1": "9"})
+        self.assertIsNone(marked)
+        # The cap did not hold through the capture.
+        self.assertIsNone(self.torch_run(dark, held=False)[1])
 
     def test_torch_must_stay_capped_through_the_capture(self):
         from fakes import FakeShell
