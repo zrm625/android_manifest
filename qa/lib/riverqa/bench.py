@@ -260,8 +260,7 @@ def run(a) -> int:
                     flashing.rescue(dev, st, f"bench boot of {a.batch}: {e}")
                     return flashing.EXIT_RESCUED
                 except (flashing.Halt, Exception) as h:  # noqa: BLE001 - halt on anything here
-                    log(f"HALT: {h}")
-                    return flashing.EXIT_HALT
+                    return flashing.recovery_halt(h)     # R7-5: the error: line and the obligation note
             return 1
         if rec.control in ("early-reboot", "early-reboot-missed"):
             b = stage.load(a.batch)

@@ -444,8 +444,7 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
         except (Halt, Unreachable, GuardError) as h:   # C7: a guard failure in rescue halts
             attempt["result"] = f"halt: {h}"
             save_attempt()
-            log(f"HALT: {h}")
-            return EXIT_HALT
+            return recovery_halt(h)                     # R7-5: the error: line and the obligation note
     # Record the first boot's boot_id at once.
     attempt["first_boot"] = {"boot_id": rec.boot_id, "completed_at": now_iso(),
                              "host_boot_seconds": rec.host_boot_seconds}
@@ -468,8 +467,9 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
             save_attempt()
             return EXIT_RESCUED
         except (Halt, Unreachable, GuardError) as h:
-            log(f"HALT: {h}")
-            return EXIT_HALT
+            attempt["result"] = f"halt: {h}"
+            save_attempt()
+            return recovery_halt(h)                     # R7-5
     reboots.judge_signals(dev, rec)
     ev_dir = bdir / "boots" / f"firstboot-{attempt['attempt_id']}"
     count = reboots.read_boot_count(dev, expected=1)

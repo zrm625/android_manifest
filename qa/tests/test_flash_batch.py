@@ -118,6 +118,21 @@ class FlashBatch(unittest.TestCase):
         self.assertEqual(rc, flashing.EXIT_HALT)
         self.assertEqual(st["pair"]["batch"], "b1")   # still reserved for recovery
 
+    def test_rescue_failure_prints_an_error_line(self):
+        """R7-5: a failed rescue goes through recovery_halt: an error: line,
+        then HALT (62f73de printed only 'HALT: <reason>')."""
+        def guard_fails(dev, st, reason, attempt_id=None):
+            raise GuardError("bootloader reports product 'lynx', not river. Refusing.")
+        with bench_home() as h:
+            stage_batch(h)
+            with mock.patch.object(flashing, "Device", lambda *a: FakePhone(h)), \
+                    mock.patch.object(reboots, "planned_reboot", failing_reboot), \
+                    mock.patch.object(flashing, "rollback", guard_fails), redirect_stderr(io.StringIO()) as err:
+                rc = flashing.flash_batch("b1", None, True)
+        self.assertEqual(rc, flashing.EXIT_HALT)
+        self.assertIn("error: bootloader reports product 'lynx'", err.getvalue())
+        self.assertIn("HALT: notify Zak.", err.getvalue())
+
     def test_running_slot_must_be_known_good(self):
         with bench_home() as h:
             stage_batch(h)
