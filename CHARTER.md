@@ -118,7 +118,9 @@ Building and testing are the bottleneck, so changes are tested in batches.
    phone for every batch is fine.
 4. **Clean batch.** If everything passes, the tester merges every change in the
    batch and tags the known-good state. Zak doesn't have to approve anything
-   else.
+   else. The tester merges through one batch pull request per repo, holding
+   exactly the commits that were tested, and closes the changes' own pull
+   requests as merged.
 5. **Failed batch.**
    - A batch of several changes is split: each change is tested again on its
      own, in its own batch.
