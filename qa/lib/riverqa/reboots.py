@@ -241,8 +241,10 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
         # disconnect (the last poll that saw the phone) and stops at the end
         # of the status read, so every uncertainty makes elapsed longer.
         # judge_record bounds both brackets.
-        rec.disconnect_gap = None if clock.gap is None else round(clock.gap, 3)
-        rec.status_read_s = round(st.read_s, 3)
+        # Full precision (R5-8): the 0.5 s / 1.0 s bounds are applied to
+        # these values; only displays round.
+        rec.disconnect_gap = clock.gap
+        rec.status_read_s = st.read_s
         start = clock.last_present if clock.last_present is not None else clock.t
         rec.elapsed = st.t1 - start
         # Boot time is when boot completion was first seen (R5-2): a retry

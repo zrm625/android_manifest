@@ -102,6 +102,23 @@ class DisconnectBracket(unittest.TestCase):
         self.assertIsNotNone(bootsig.timing_bracket_problem(bootsig.DISCONNECT_BOUND_S + 0.01, 0.1))
 
 
+class FullPrecision(unittest.TestCase):
+    """R5-8: the bounds apply to the measured values, never to rounded ones."""
+
+    def test_gap_just_over_the_bound_is_unverified(self):
+        uptime = 140.0 - 100.0 - 9.9
+        rec, _ = judged(100.0, 100.0 + bootsig.DISCONNECT_BOUND_S + 0.0004, [status(uptime, 140.0)])
+        self.assertGreater(rec.disconnect_gap, bootsig.DISCONNECT_BOUND_S)
+        self.assertEqual(rec.uptime_check[0], UNVERIFIED)
+
+    def test_read_just_over_the_bound_is_unverified(self):
+        uptime = 140.0 - 100.0 - 9.9
+        slow = bootsig.STATUS_READ_BOUND_S + 0.0004
+        rec, _ = judged(100.0, 100.06, [status(uptime, 140.0, read_s=slow)] + [None] * 3)
+        self.assertGreater(rec.status_read_s, bootsig.STATUS_READ_BOUND_S)
+        self.assertEqual(rec.uptime_check[0], UNVERIFIED)
+
+
 class StatusRead(unittest.TestCase):
     def test_slow_status_read_is_unverified(self):
         uptime = 140.0 - 100.0 - 9.9

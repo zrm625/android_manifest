@@ -143,12 +143,12 @@ def timing_bracket_problem(disconnect_gap_s: float | None, status_read_s: float 
     if disconnect_gap_s is None:
         return "the USB disconnect has no last-present poll to bracket it"
     if disconnect_gap_s > DISCONNECT_BOUND_S:
-        return (f"the USB disconnect is bracketed only to {disconnect_gap_s:.2f} s "
+        return (f"the USB disconnect is bracketed only to {disconnect_gap_s:.4f} s "
                 f"(first_gone - last_present > {DISCONNECT_BOUND_S} s): the host was too busy to poll")
     if status_read_s is None:
         return "the completion status read has no recorded latency"
     if status_read_s > STATUS_READ_BOUND_S:
-        return f"the completion status read took {status_read_s:.2f} s (> {STATUS_READ_BOUND_S} s)"
+        return f"the completion status read took {status_read_s:.4f} s (> {STATUS_READ_BOUND_S} s)"
     return None
 
 
