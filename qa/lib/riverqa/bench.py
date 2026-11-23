@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import evidence, fbmode, flashing, reboots, stage
 from .core import BENCH_HOME, SERIAL, batch_dir, bench_path, log, now_iso, read_json, write_json
-from .device import Device, GuardError
+from .device import Device, GuardError, Unreachable
 from .lock import DeviceLock, LockError
 
 COLUMNS = ["run_id", "env", "boot", "host_boot_seconds", "uptime_at_boot_completed", "mem_total_kb",
@@ -218,7 +218,11 @@ def run(a) -> int:
         dev.guard()     # flash_dev guards itself, in adb or in fastboot
     if a.flash:
         product = BENCH_HOME / f"out-{a.env}" / "target/product/river"
-        rc = flashing.flash_dev(product, a.wipe, True)
+        try:
+            rc = flashing.flash_dev(product, a.wipe, True)
+        except Unreachable as e:       # R10-4: a halt, as in scripts/flash
+            log(f"HALT: {e}")
+            return flashing.EXIT_HALT
         if rc != 0:
             return rc
     batch = stage.load(a.batch) if a.batch else None

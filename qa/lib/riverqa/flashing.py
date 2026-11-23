@@ -238,6 +238,11 @@ def check_images(images_dir: Path, expected: dict | None) -> dict:
     return got
 
 
+class WipeFailed(RuntimeError):
+    """``fastboot erase userdata`` failed after ``--set-active``: the target
+    slot is active and unwiped (R10-5)."""
+
+
 def write_images(dev: Device, images_dir: Path, target: str, wipe: bool, attempt: dict,
                  st: dict | None) -> None:
     dev.fastboot_guard()
@@ -259,7 +264,7 @@ def write_images(dev: Device, images_dir: Path, target: str, wipe: bool, attempt
         log("  erase userdata")
         r = dev.fastboot("erase", "userdata", timeout=300)
         if r.returncode != 0:
-            raise RuntimeError(f"fastboot erase userdata failed: {(r.stderr or r.stdout).strip()[-300:]}")
+            raise WipeFailed(f"fastboot erase userdata failed: {(r.stderr or r.stdout).strip()[-300:]}")
         seq = journal.record_wipe(qa_home(), attempt["attempt_id"], "flash")
         attempt["wipe"] = {"ok": True, "seq": seq, "at": now_iso()}
 
@@ -289,17 +294,40 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     if st and st.get("pair"):
         raise SystemExit(f"error: batch {st['pair']['batch']} holds an unresolved slot pair; "
                          "resolve it first (flash --recover)")
+    owed = fbmode.pending()
+    if st is None and owed is not None and not reboot:
+        # R10-3: before the first baseline, a flash that leaves the obligation
+        # pending also leaves the slot it was armed on (the only slot known to
+        # boot) as the next flash's target. Refused before the phone is
+        # touched.
+        log("error: an fb_mode obligation is pending and there is no known-good slot yet (no slot-state.json), "
+            "so flash --no-reboot is refused: it would leave the obligation pending with another slot active, "
+            "and the next flash would write the slot the obligation was armed on.")
+        log(armed_way_back(owed, None))
+        return EXIT_ERROR
     # Only now, with the inputs and the pair checked (R7-3), is the phone
     # touched. R9-4: the active slot is read first, before anything is
     # cleared; before the first baseline it chooses the write target, so an
-    # unreadable one halts with nothing changed.
-    if dev.state() == "device":
-        dev.guard()
-        got = dev.getprop("ro.boot.slot_suffix") or ""
-    else:
-        to_fastboot(dev, 30)
-        dev.fastboot_guard()
-        got = dev.getvar("current-slot")
+    # unreadable one halts with nothing changed. R10-4: a failed read is a
+    # clean stop: HALT 3 with an obligation pending or before the first
+    # baseline (a guard failure only with an obligation pending), else exit
+    # 1; Unreachable goes to main, which halts.
+    source = "getprop" if dev.state() == "device" else "fastboot"
+    try:
+        if source == "getprop":
+            dev.guard()
+            got = dev.getprop("ro.boot.slot_suffix") or ""
+        else:
+            to_fastboot(dev, 30)
+            dev.fastboot_guard()
+            got = dev.getvar("current-slot")
+    except Unreachable:
+        raise
+    except (RuntimeError, TimeoutError) as e:
+        if owed is not None or (st is None and not isinstance(e, GuardError)):
+            return recovery_halt(RuntimeError(f"cannot read the active slot: {e}"))
+        log(f"error: cannot read the active slot: {e}")
+        return EXIT_ERROR
     current = got.lstrip("_")
     if st:
         # Never overwrite the known-good slot.
@@ -307,7 +335,14 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     elif current in slots.SLOTS:
         target = slots.other(current)
     else:
-        return recovery_halt(fbmode.SlotUnreadable(dev.serial, got))
+        return recovery_halt(fbmode.SlotUnreadable(dev.serial, got, source))
+    if st is None and owed is not None and fbmode.armed_slot(owed) == target:
+        # R10-3: before the first baseline the armed slot is the only slot
+        # known to boot. Refused before anything is cleared or written.
+        return recovery_halt(RuntimeError(
+            f"slot {current} is active, so this flash would write slot {target}, where the pending fb_mode "
+            f"obligation was armed. With no known-good slot yet, slot {target} is the only slot known to boot; "
+            "not writing it"), advice=armed_way_back(owed, current))
     # A leftover fb_mode would stop every boot in fastboot. A dev flash
     # only needs fastboot, so this never boots (R5-16, R6-4): the active
     # slot may be one that doesn't boot. It clears and never settles: the
@@ -325,6 +360,14 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     def in_fb():
         write_images(dev, product, target, wipe, attempt, None)
 
+    def way_back(active: str | None) -> str:
+        """Where to go with the obligation pending (R10-3): before the first
+        baseline never a flash or flash --rollback."""
+        if st is None:
+            return armed_way_back(fbmode.pending(), active)
+        return ("The fb_mode obligation stays pending. Flash again, or return with flash --rollback (it wipes "
+                "userdata).")
+
     def write_failed(e: RuntimeError) -> int:
         # R9-5: write_images clears again, and a failed clear with the
         # obligation pending raises ClearFailed before any image is written;
@@ -333,10 +376,15 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         if isinstance(e, fbmode.ClearFailed):
             return recovery_halt(e, advice=f"The fb_mode obligation stays pending. Clear it by hand (fastboot -s "
                                  f"{SERIAL} oem fb_mode_clear), then run the flash again.")
+        if isinstance(e, WipeFailed):
+            # R10-5: slot target is active and unwiped; always a halt.
+            return recovery_halt(RuntimeError(f"the dev flash of slot {target} stopped after --set-active: {e}"),
+                                 advice=f"Slot {target} is active and userdata was not erased. " + (
+                                     way_back(target) if fbmode.pending() is not None else
+                                     f"Erase it by hand (fastboot -s {SERIAL} erase userdata, then fastboot -s "
+                                     f"{SERIAL} reboot), or go back with fastboot -s {SERIAL} --set-active={back}."))
         if fbmode.pending() is not None:
-            return recovery_halt(RuntimeError(f"the dev flash of slot {target} stopped: {e}"),
-                                 advice="The fb_mode obligation stays pending. Flash again, or return with "
-                                 "flash --rollback (it wipes userdata).")
+            return recovery_halt(RuntimeError(f"the dev flash of slot {target} stopped: {e}"), advice=way_back(None))
         log(f"error: the dev flash of slot {target} stopped: {e}")
         return EXIT_ERROR
 
@@ -344,26 +392,32 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         try:
             to_fastboot(dev)
             in_fb()
+        except Unreachable:            # R10-4: main halts (3)
+            raise
         except RuntimeError as e:
             return write_failed(e)
         log(f"Done. Phone is in the bootloader, slot {target} active.")
-        if fbmode.pending() is not None:
-            log("The fb_mode obligation stays pending: nothing was booted. A flash that boots (without "
-                "--no-reboot) or flash --rollback settles it once it has verified the slot it boots. Until then "
-                "phone-qa --quick halts (exit 3): the phone no longer runs the build the obligation was armed on.")
+        e = fbmode.pending()
+        if e is not None:
+            log(no_reboot_note(e, want))
         return EXIT_OK
     log("Waiting for boot (the first boot after a wipe takes a few minutes)")
     try:
         rec = reboots.planned_reboot(dev, "fastboot", boot_timeout=FIRST_BOOT_TIMEOUT, in_fastboot=in_fb)
+    except Unreachable:                # R10-4
+        raise
     except RuntimeError as e:
         return write_failed(e)
     except TimeoutError as e:
         if fbmode.pending() is not None:
+            if st is None:
+                return recovery_halt(e, advice=way_back(None))
             return recovery_halt(e, advice=f"The fb_mode obligation stays pending. Roll back with flash --rollback "
                                  f"(it wipes userdata), or fastboot -s {SERIAL} --set-active={back} and phone-qa "
                                  "recover.")
         log(f"error: {e}. Roll back to the {'known-good' if st else 'previous'} slot: "
-            f"flash --rollback, or fastboot -s {SERIAL} --set-active={back}")
+            + (f"flash --rollback, or fastboot -s {SERIAL} --set-active={back}" if st else
+               f"fastboot -s {SERIAL} --set-active={back}"))
         return EXIT_ERROR
     # R8-1: the boot of the slot written must be verified, and that proof
     # alone settles a pending obligation. R9-5: the version shown below is
@@ -375,10 +429,10 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     except (RuntimeError, TimeoutError) as e:
         if fbmode.pending() is not None:
             return recovery_halt(RuntimeError(f"the dev flash of slot {target} could not be verified: {e}"),
-                                 advice="The fb_mode obligation stays pending. Flash again, or return with "
-                                 "flash --rollback (it wipes userdata).")
-        log(f"error: the dev flash of slot {target} could not be verified: {e}. Flash again, or return to slot "
-            f"{back} with flash --rollback.")
+                                 advice=way_back(None))
+        log(f"error: the dev flash of slot {target} could not be verified: {e}. "
+            + (f"Flash again, or return to slot {back} with flash --rollback." if st else
+               f"Return to slot {back} with fastboot -s {SERIAL} --set-active={back}."))
         return EXIT_ERROR
     if st:
         st.setdefault("history", []).append({"event": "dev-flash", "at": now_iso(), "slot": target})
@@ -388,6 +442,54 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         log(f"Note: known_good_slot is {st['known_good_slot']}; a batch flash first returns to it "
             "(flash --rollback).")
     return EXIT_OK
+
+
+def armed_way_back(e: dict | None, active: str | None) -> str:
+    """Before the first baseline, with an obligation pending: the way back
+    (R10-3). The slot it was armed on is the only slot known to boot, so the
+    advice never names a flash that could write it, nor flash --rollback
+    (it needs slot-state.json). ``active`` is the active slot if known."""
+    slot = fbmode.armed_slot(e or {})
+    if slot is None:
+        return ("The fb_mode obligation stays pending. It records no slot (armed before round 8): a dev flash that "
+                "boots (flash stripped, without --no-reboot) settles it once it has verified the slot it writes.")
+    if active == slot:
+        first = ""
+    elif active:
+        first = f"set slot {slot} active by hand (fastboot -s {SERIAL} --set-active={slot}), then "
+    else:
+        first = (f"if fastboot -s {SERIAL} getvar current-slot reports another slot, set slot {slot} active by "
+                 f"hand (fastboot -s {SERIAL} --set-active={slot}), then ")
+    try:
+        fbmode.armed_want(e)
+        then = (f"run phone-qa recover: it boots slot {slot}, verifies it against the armed identity and settles "
+                "the obligation. Then flash again.")
+    except RuntimeError:
+        # R10-1: an identity generic recovery can't verify (the unstamped
+        # sentinel): the verified boot of a dev flash of the other slot
+        # settles it.
+        then = (f"run flash stripped with slot {slot} active: it writes slot {slots.other(slot)} and settles the "
+                "obligation once that boot is verified.")
+    how = first + then
+    return (f"The fb_mode obligation stays pending. With no known-good slot yet, slot {slot} (where it was armed) "
+            f"is the only slot known to boot. {how[:1].upper()}{how[1:]}")
+
+
+def no_reboot_note(e: dict, want: fbmode.Want) -> str:
+    """After flash --no-reboot with an obligation pending (R10-7): whether
+    generic recovery can settle it, which it can only if the slot written,
+    now active, and its build IDs are the armed identity."""
+    try:
+        armed = fbmode.armed_want(e)
+    except RuntimeError:
+        armed = None
+    if armed is not None and armed.slot == want.slot and armed.build_ids == want.build_ids:
+        return (f"The fb_mode obligation stays pending: nothing was booted. Slot {want.slot} with build IDs "
+                f"{'/'.join(want.build_ids)} is what it was armed on, so generic recovery (phone-qa recover, or "
+                "the preflight of phone-qa --quick) boots it, verifies it and settles the obligation.")
+    return ("The fb_mode obligation stays pending: nothing was booted. A flash that boots (without --no-reboot) "
+            "or flash --rollback settles it once it has verified the slot it boots. Until then phone-qa --quick "
+            "halts (exit 3): the phone no longer runs the build the obligation was armed on.")
 
 
 def first_run_proof(dev: Device) -> fbmode.VerifiedBoot:
@@ -815,7 +917,9 @@ Usage:
   baseline|stripped  Use $BENCH_HOME/out-<env>/target/product/river.
   PRODUCT_DIR        Any directory with boot.img, dtbo.img, system.img and vendor.img.
   --wipe       Factory reset (fastboot erase userdata; river's bootloader rejects -w).
-  --no-reboot  Stay in the bootloader after flashing.
+  --no-reboot  Stay in the bootloader after flashing. Refused before the first
+               baseline while an fb_mode obligation is pending: run
+               phone-qa recover first.
   --batch ID   Flash a staged batch ($BENCH_HOME/batches/ID). Checks every image hash
                before writing, fixes the slot pair in slot-state.json and batch.json
                before the first write, records the first boot's boot_id, signals and
@@ -823,6 +927,8 @@ Usage:
 
 The images go to the slot that is not the known-good one (or, before the first
 baseline, the inactive slot), so the known-good slot stays as the fallback.
+Before the first baseline, a flash that would write the slot a pending fb_mode
+obligation was armed on is refused: that is the only slot known to boot.
 Every adb and fastboot wait has a deadline. Only the phone with serial
 ZY225DPT7F is touched (fixed in the code; BENCH_DEVICE may only repeat it),
 and only if it reports itself as river.
