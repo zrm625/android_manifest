@@ -1443,3 +1443,19 @@ only at the posted section (`features.posted_records`: from its header to
 the next section, `mMaxPackageEnqueueRate=`, `hideSilentStatusBar=`,
 `mArchive=` or the enqueued list). A DeskClock firing record that is only
 enqueued never counts.
+
+**R4-7. Smaller changes.**
+- **The banner within 3 flips (Opus 2).** The new-session check now matches
+  `Linux version ` within 3 wrong characters (`bootsig.banner_offsets`,
+  through `bootsig.fuzzy_offsets`, which splits the pattern into 4 disjoint
+  pieces so every copy within 3 flips keeps one intact). On river every
+  saved pstore log since baseline-1 starts with the banner damaged as
+  `Linu\xf8 ver\xf3ion` (2 flips), so the exact match never saw a banner at
+  all. No other match within 3 flips appears in the 21 saved logs.
+- **What the chain relies on.** The chain's FAIL for an extra kernel rests
+  on `persistent_ram_zap` at ramoops init (`ramoops_init_prz`,
+  `kernel/motorola/sdm632/fs/pstore/ram.c:495`): each kernel saves the
+  previous log as its pstore file, then zaps the live buffer and logs its own
+  boot into it. A kernel that ran past ramoops init therefore replaces the
+  marker kernel's log. A batch that touches the kernel must keep that
+  behaviour, or the chain proves nothing.

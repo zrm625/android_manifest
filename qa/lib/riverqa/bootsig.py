@@ -26,7 +26,7 @@ import secrets
 from .results import FAIL, PASS, UNVERIFIED
 
 MARKER_PREFIX = "RQM"
-BANNER_RE = re.compile(rb"Linux version \d+\.\d+")
+BANNER = b"Linux version "   # a kernel session's first line; matched within MAX_MARKER_FLIPS (R4-7)
 
 
 NONCE_HEX = 16           # 64 random bits (amendment A2.1)
@@ -71,12 +71,44 @@ def marker_offsets(log: bytes, marker: str, max_flips: int = MAX_MARKER_FLIPS) -
     return sorted(hits)
 
 
+def fuzzy_offsets(log: bytes, pattern: bytes, max_flips: int = MAX_MARKER_FLIPS) -> list[int]:
+    """Offsets of every copy of ``pattern`` in ``log`` within ``max_flips``
+    wrong characters. The pattern is cut into max_flips + 1 disjoint
+    pieces; a copy with at most max_flips flips keeps at least one piece
+    intact, so every such copy is found. Pure."""
+    n = len(pattern)
+    k = max_flips + 1
+    if n < k:
+        raise ValueError("pattern too short for the flip budget")
+    bounds = [round(i * n / k) for i in range(k + 1)]
+    hits = set()
+    for a, b in zip(bounds, bounds[1:]):
+        piece, start = pattern[a:b], 0
+        while True:
+            i = log.find(piece, start)
+            if i < 0:
+                break
+            off = i - a
+            if off >= 0 and off + n <= len(log) and hamming(log[off:off + n], pattern) <= max_flips:
+                hits.add(off)
+            start = i + 1
+    return sorted(hits)
+
+
+def banner_offsets(log: bytes) -> list[int]:
+    """Kernel session banners (``Linux version ``) within MAX_MARKER_FLIPS
+    wrong characters, like the marker (review round 4: on river the banner
+    at the start of every saved pstore log reads ``Linu\xf8 ver\xf3ion``,
+    which an exact match never found)."""
+    return fuzzy_offsets(log, BANNER)
+
+
 def chain_verdict(pstore_log: bytes | None, marker: str | None) -> tuple[str, str]:
     """Judge the kernel-log chain for one boot (amendment A2.1).
 
     PASS: the previous kernel's log holds at least one copy of this
     attempt's marker (within MAX_MARKER_FLIPS) and no new kernel session
-    after the first copy. The nonce alone shows the log belongs to the
+    banner (also within MAX_MARKER_FLIPS) after the first copy. The nonce alone shows the log belongs to the
     kernel that wrote this marker; printk stamps play no part. An extra
     kernel that ran past ramoops init replaces the log, so a readable log
     with no copy, or a new session after one, is a FAIL. No marker, or a
@@ -89,7 +121,7 @@ def chain_verdict(pstore_log: bytes | None, marker: str | None) -> tuple[str, st
     if not offs:
         return FAIL, ("the previous kernel's log holds no copy of this attempt's leaving marker: another kernel "
                       "ran after ramoops init and replaced it")
-    if BANNER_RE.search(pstore_log[offs[0]:]):
+    if any(b > offs[0] for b in banner_offsets(pstore_log)):
         return FAIL, "a new kernel session started after the leaving marker"
     exact = pstore_log.count(marker.encode())
     return PASS, (f"previous kernel log holds {len(offs)} copies of the leaving marker ({exact} exact) "

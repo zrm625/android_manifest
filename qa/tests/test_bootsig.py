@@ -157,6 +157,50 @@ class Chain(unittest.TestCase):
                 self.assertEqual(b.chain_verdict(bytes(bad), MARKER)[0], PASS, (i, bit))
 
 
+class Banner(unittest.TestCase):
+    """Review round 4 (Opus 2): the new-session check matches the banner
+    within 3 flips, like the marker."""
+
+    def session_after(self, banner: bytes) -> bytes:
+        return shutdown_log() + line(0.0, banner + b"4.9.337") + line(1.0, b"init")
+
+    def test_damaged_banner_after_the_marker_fails(self):
+        self.assertEqual(b.chain_verdict(self.session_after(b"Linux version "), MARKER)[0], FAIL)
+        # The damage river's ramoops really does to the banner (every saved
+        # pstore log since baseline-1 starts with this): 2 flips.
+        self.assertEqual(b.chain_verdict(self.session_after(b"Linu\xf8 ver\xf3ion "), MARKER)[0], FAIL)
+        for flips in ((0,), (0, 7), (2, 6, 13)):
+            damaged = flip_bytes(b.BANNER, flips)
+            self.assertEqual(b.chain_verdict(self.session_after(damaged), MARKER)[0], FAIL, flips)
+        # Four wrong characters is not a banner.
+        self.assertEqual(b.chain_verdict(self.session_after(flip_bytes(b.BANNER, (0, 3, 7, 11))), MARKER)[0],
+                         PASS)
+
+    def test_every_three_flip_banner_is_found(self):
+        log = b"x" * 40
+        for flips in itertools.combinations(range(len(b.BANNER)), 3):
+            text = log + flip_bytes(b.BANNER, flips) + log
+            self.assertIn(40, b.banner_offsets(text), flips)
+
+    def test_damaged_banner_before_the_marker_passes(self):
+        log = line(0.0, b"Linu\xf8 ver\xf3ion 4.9.337") + shutdown_log()[len(line(0.0, b"Linux version 4.9.337")):]
+        self.assertEqual(b.banner_offsets(log), [len(b"[    0.000000] ")])
+        self.assertEqual(b.chain_verdict(log, MARKER)[0], PASS)
+
+    def test_fuzzy_offsets_matches_a_brute_force_scan(self):
+        import random
+        rnd = random.Random(4)
+        pat = b"Linux version "
+        for _ in range(200):
+            text = bytearray(rnd.choice(b"Linux vrsio") for _ in range(120))
+            for _ in range(3):
+                at = rnd.randrange(0, 100)
+                text[at:at + len(pat)] = flip_bytes(pat, rnd.sample(range(len(pat)), rnd.randrange(0, 5)))
+            text = bytes(text)
+            brute = [i for i in range(len(text) - len(pat) + 1) if b.hamming(text[i:i + len(pat)], pat) <= 3]
+            self.assertEqual(b.fuzzy_offsets(text, pat, 3), brute)
+
+
 class Uptime(unittest.TestCase):
     def test_rule(self):
         tight = {"disconnect_gap_s": 0.06, "status_read_s": 0.1}
