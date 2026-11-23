@@ -565,7 +565,9 @@ The known-good build on `river-22.2` still runs Trebuchet, and the gestures
 check requires Perch. The steps run in this order, and each one finishes
 before the next starts:
 
-1. **Boot-timing calibration, with no flash.** On the build running now, do
+1. **Boot-timing calibration, with no flash.** On the build running now (a
+   stamped build from this tree, dev-flashed first: see "Code review round
+   9", R9-3), do
    planned reboots on each path that matters: the immediate `sysrq` reboot
    and a reboot through fastboot with no writes ([amendment
    A2](#amendment-a2-drop-the-pstore-reset-anchor-and-add-an-immediate-reboot-bench-path);
@@ -2081,3 +2083,207 @@ wipe).**
   both build IDs, and only then resolved the entry (the watcher saw it go
   with the phone back in adb). Exit 0.
 - Final state: slot a, `known_good_slot` a, no pair, journal empty.
+
+## Code review round 9: changes to R8
+
+Status: specified 2026-11-23 from the round-9 code review of `100df60`.
+Round 8 stands except as changed here: one proof type (`VerifiedBoot`, sealed
+by `verify_boot`), one settle (`fbmode.settle`), and the same settle callers.
+Every change is on the paths before the first baseline and on the bootstrap.
+Where this section and an earlier one disagree, this one wins.
+
+**R9-1. The first baseline is seeded from its proof.** With no
+`slot-state.json`, `flash --batch` calls `first_run_proof`:
+- With an obligation pending, `recover` runs with `want` = the armed identity
+  plus `hash_boot`. It verifies slot, both build IDs and the whole
+  `boot_<slot>` hash, then settles with that proof.
+- With nothing pending, `recover` only boots a phone found in fastboot
+  (nothing to settle). Then `running_identity` reads the slot and both build
+  IDs in Android, and `verify_boot` checks them with `hash_boot`.
+- `slots.first_run(proof.slot, proof.boot_sha)` seeds the state, and the pair
+  is reserved with `proof.boot_sha`. Nothing is read after the settle.
+- A failed read (a hash timeout, say) halts (exit 3) with the obligation
+  pending and no `slot-state.json`.
+
+**R9-2. Only a path that boots needs the armed identity.** `recover` decides
+whether it will boot before it changes anything, and reads the armed identity
+only on a path that boots and has no `want`. `recover(boot=False)` (the dev
+flash) only clears and stamps, so an entry armed before round 8 (no slot, no
+build IDs) no longer stops a dev flash. The dev flash then settles it with
+the verified boot of the slot it wrote. On a path that boots, such an entry
+still raises before anything is changed.
+
+**Old entries (corrects round 8).** An entry with no identity is settled:
+- by a dev flash (`flash stripped`), always;
+- with a `slot-state.json`, also by `flash --rollback` and by a batch flash,
+  which verify `known_good_slot` against its record.
+Generic recovery and the first-baseline flash halt (exit 3) on it, with this
+advice.
+
+**R9-3. Stamped builds only for calibration and the first baseline.** There
+is no boot-hash armed identity. `fbmode.running_identity(dev)` runs the adb
+guard and reads the running slot and both build IDs. It raises
+`fbmode.Unstamped` ("running build is unstamped; dev-flash a build from this
+tree first (`flash stripped`)") if either ID is missing. Three paths use it:
+- `phone-qa boot-timing` and `phone-qa controls --boot-timing` exit 1 on it.
+  The check runs after `recover_fb_mode`, which reboots only a phone left in
+  fastboot or with an obligation pending, and before any calibration reboot.
+- The first-baseline flash, with nothing pending, exits 1 with nothing
+  written.
+- The `sysrq` arm, which says "cannot arm fb_mode".
+
+Every build from this tree is stamped by `device.mk` (device PR #7). The
+bootstrap now starts with a dev flash of such a build (see below), and a dev
+flash needs no calibration: it times nothing and judges no signal.
+
+`build_id_verdict`'s unstamped-baseline fallback (`qa.py`) is unchanged. It
+judges the build being flashed, not the running one, and a baseline built
+from `river-22.2` HEAD is stamped anyway.
+
+**R9-4. A dev flash reads the slot before it clears.** `flash_dev` reads the
+active slot first: `ro.boot.slot_suffix` in Android, else `getvar
+current-slot` in fastboot. Before the first baseline that slot picks the
+write target, so an unreadable one halts (exit 3, `SlotUnreadable`) with
+fb_mode untouched. With a `slot-state.json` the target is the other slot of
+`known_good_slot`, and the slot read is only logged.
+
+**R9-5. Nothing read after a dev flash settles; no traceback.**
+- `ro.lineage.display.version` is read between `verify_boot` and `settle`.
+- `write_images` still clears fb_mode, which also clears an fb_mode set with
+  no obligation. With an obligation pending, a failure of that second clear
+  is a `ClearFailed`. That, and any other fastboot failure in the writes,
+  halts (exit 3) with the obligation pending. Before, it escaped `main` as a
+  traceback. The second case (a failed `fastboot flash`) was found in the
+  self-review. With nothing pending, these failures exit 1 with an
+  `error:` line.
+
+**R9-7. The freshness check uses the host's boot clock.** `cleared_at` is
+now `{"boottime", "host_boot_id", "wall"}`:
+- `boottime` is the host's `CLOCK_BOOTTIME` and `host_boot_id` is
+  `/proc/sys/kernel/random/boot_id`. `wall` is only for people.
+- `BootStatus.host_boottime` is `CLOCK_BOOTTIME` just before the status read.
+  `VerifiedBoot.booted_at` is that value minus the phone's uptime, so at the
+  latest the boot's start.
+- A wall-clock step (NTP, a date change) moves neither value.
+- `settle` refuses in these cases:
+  - the host booted again after the clear, because the two clocks can't be
+    compared;
+  - a round-8 float stamp;
+  - a boot that began before the clear.
+- A rerun of the recovery clears and stamps again, so each refusal fails
+  safe.
+
+**R9-8. `replace` can't carry the seal.** `VerifiedBoot._seal` is
+`field(init=False)`. `verify_boot` sets it with `object.__setattr__` after
+construction, and nothing else sets it. So a direct construction, or
+`dataclasses.replace` of a sealed proof, gives an unsealed object, and
+`settle` refuses it (`TypeError`). The single-settle test now also checks
+two things: only `verify_boot` sets `_seal`, and no module but `fbmode`
+mentions it.
+
+**R9-9.** A `getprop` that gives nothing while arming is the clean error
+"cannot arm fb_mode: cannot read the running slot ('')", not an
+`AttributeError`.
+
+**R9-10.** `flash ... --no-reboot` with an obligation pending says what
+happens next. Until a flash that boots, or `flash --rollback`, verifies its
+slot, `phone-qa --quick` halts (exit 3), because the phone no longer runs the
+armed build.
+
+**R9-11.** The `--set-active` and `erase userdata` halts in rollback name
+their own command ("flash --rollback finishes it").
+
+**Who settles, with what proof.** The callers are the same as in round 8,
+and the AST test still pins them. One `want` changed: the first-baseline
+`flash --batch` with an obligation pending passes the armed identity with
+`hash_boot` (R9-1).
+
+| Caller | Proof it passes to `settle` |
+| --- | --- |
+| `fbmode.recover` (generic recovery; `flash --batch` preflight, first baseline included; `--promote` and `--recover`'s promote path) | `verify_boot` after its own boot, against the caller's `want` or the armed identity |
+| `flashing.rollback` | `verify_boot` of `known_good_slot` (build IDs, or the boot hash for a provisional record) |
+| `flashing.recover_fb_mode_to_known_good` | as for rollback |
+| `flashing.flash_dev` (dev flash, `device-bench --flash`) | `verify_boot` of the slot it wrote |
+| `reboots.planned_reboot` (`sysrq` extra pass) | `verify_boot` against the armed identity |
+
+**State-change ordering (rows changed or added; the rest of round 8's table
+stands).**
+
+1. `fbmode.recover`, boot case. Step 1 is now: read the entry and `fastboot
+   devices`, decide whether this path boots, and on a path that boots with no
+   `want`, read the armed identity. No identity: raise, nothing changed.
+   Steps 2 to 7 are unchanged. The `cleared_at` stamp in step 4 is the host
+   boot clock (R9-7).
+2. `fbmode.recover(boot=False)`, exactly as the code runs it:
+   1. Read the entry and `fastboot devices`. Nothing pending and not in
+      fastboot: return, nothing changed.
+   2. In Android (an obligation pending): check the adb state (neither adb
+      nor fastboot: raise, nothing changed), then `adb reboot bootloader`
+      (guarded) and wait for fastboot. Die: entry pending, fb_mode set, phone
+      in fastboot.
+   3. No `getvar current-slot` and no armed identity. This path boots
+      nothing, and its caller has already read the slot (row 3).
+   4. `fb_mode_clear`, then the stamp. Fail: entry pending, fb_mode set. Die
+      between: entry pending and unstamped.
+   5. Return. The entry stays pending and the phone stays in fastboot.
+3. `flash_dev`:
+   1. Images, product and pair checks. The phone is untouched.
+   2. Read the active slot (R9-4): in Android, the guard and
+      `ro.boot.slot_suffix`; otherwise `to_fastboot`, `fastboot_guard` and
+      `getvar current-slot`. With no `slot-state.json`, an unreadable slot
+      halts (3) with nothing changed.
+   3. Row 2.
+   4. `write_images`: guard, clear and stamp, flash, `--set-active`,
+      optional wipe. `ClearFailed` (before any write) or any other fastboot
+      failure: HALT 3 with the entry pending, or exit 1 if nothing is
+      pending. `--no-reboot` ends here: entry pending, and the output says
+      `--quick` halts until a verified boot (R9-10).
+   5. Reboot. Timeout: HALT 3 with the entry pending.
+   6. `verify_boot` of the target, read the version, `settle`. Fail: HALT 3
+      with the entry pending, or exit 1 if nothing was pending.
+   7. History and log. Nothing is read from the phone.
+
+   States left:
+   - Die before the first write: entry pending, active slot unchanged.
+   - Die after `--set-active`: entry pending. Generic recovery halts; the
+     next dev flash or `flash --rollback` settles it.
+4. `flash_batch` with a `slot-state.json`: unchanged from round 8.
+
+4a. `flash_batch`, first baseline (new):
+   1. Batch, image and control checks, then `slots.preflight` (disk only).
+      The phone is untouched.
+   2. With an obligation pending: row 1 with `want` = the armed identity
+      plus `hash_boot`.
+   3. With nothing pending: row 1 with no `want` (it boots only a phone
+      found in fastboot and settles nothing). Then `running_identity`, then
+      `verify_boot` of that slot and those IDs with `hash_boot`.
+   4. Any failure in steps 2 and 3: HALT 3, the entry pending, no
+      `slot-state.json`. An unstamped running build exits 1 with nothing
+      written.
+   5. `first_run(proof.slot, proof.boot_sha)` and `save_state`. Die between
+      `settle` and `save_state`: entry resolved, no state. A rerun has
+      nothing pending, so it verifies the phone as it is and seeds the
+      state.
+   6. `reserve` with `proof.boot_sha`, `save_state`, then the writes, as
+      in row 4.
+8. `planned_reboot`, `sysrq` extra pass. Step 1 is now `running_identity`:
+   the guard, the slot and both IDs. Unreadable or unstamped: "cannot arm
+   fb_mode", nothing changed. The rest is unchanged.
+
+10. Calibration (`boot-timing`, `controls --boot-timing`) (new):
+   1. `recover_fb_mode`: row 1 when an obligation is pending or the phone is
+      in fastboot; otherwise nothing.
+   2. `running_identity`. Unstamped or unreadable: exit 1 before any
+      calibration reboot.
+   3. The measurements.
+
+**Bootstrap order (corrects "Calibration and bootstrap").** The order is:
+1. a dev flash of a stamped build from this tree (`scripts/build`, then
+   `flash stripped`);
+2. `phone-qa boot-timing`;
+3. the baseline batch;
+4. Perch calibration, thresholds and controls, as before.
+
+The dev flash needs no `boot-timing.json`, and before the first baseline it
+writes the slot that isn't active. Its verified boot settles any leftover
+obligation, old ones included (R9-2).

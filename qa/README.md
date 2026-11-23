@@ -91,8 +91,19 @@ Groups: `preflight`, `identity`, `health`, `radios`, `hardware`, `system`,
 
 ## Calibration and bootstrap
 
-The steps run in this order (DESIGN.md, "Calibration and bootstrap"):
+The steps run in this order (DESIGN.md, "Calibration and bootstrap" and
+"Code review round 9"):
 
+0. Dev-flash a stamped build from this tree: build `river-22.2` with
+   `scripts/build`, then `flash stripped`. Every build from this tree
+   carries `ro.river.build_id` and `ro.vendor.river.build_id` (`device.mk`).
+   A dev flash needs no calibration: it times nothing. Steps 1 and 2 need a
+   stamped running build. `phone-qa boot-timing`, `phone-qa controls
+   --boot-timing` and the first `--baseline` flash refuse an unstamped one
+   (exit 1) before any calibration reboot or write: "running build is
+   unstamped; dev-flash a build from this tree first (`flash stripped`)".
+   The dev flash also settles any leftover fb_mode obligation, including one
+   from before round 8.
 1. `phone-qa boot-timing`. It flashes nothing itself and writes
    `$BENCH_HOME/qa/boot-timing.json`. It sets A for the two gated reboot
    paths (amendment A2): the fastboot path and the immediate `sysrq`
@@ -120,7 +131,9 @@ The steps run in this order (DESIGN.md, "Calibration and bootstrap"):
    ```
 
    The first `--baseline` flash also performs the first-run transition: the
-   slot running now becomes the provisional known-good slot. A clean baseline
+   slot running now (the stamped build from step 0) becomes the provisional
+   known-good slot. Its slot and boot hash come from the verified boot, so a
+   failed read halts with nothing written. A clean baseline
    closes its own pair and writes `$BENCH_HOME/qa/known-good.json` with the
    seeded RAM reference. A failed baseline leaves the pair open. Roll it back
    with `flash --rollback`, then run the baseline again.
@@ -282,9 +295,21 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
     the fallback is verified.
   - A dev flash (also `device-bench --flash`) clears fb_mode and writes,
     but only after it has checked its images and that no slot pair is
-    reserved: a refused flash never touches the phone. It resolves the
-    obligation once the slot it wrote has booted with its build IDs.
-    `flash --no-reboot` leaves it pending and says so.
+    reserved: a refused flash never touches the phone. It reads the active
+    slot before it clears anything; before the first baseline an unreadable
+    slot halts (exit 3). It resolves the obligation once the slot it wrote
+    has booted with its build IDs, also an obligation armed before round 8
+    (no recorded identity). A failed clear or fastboot write with the
+    obligation pending halts (exit 3).
+  - `flash stripped --no-reboot` leaves the obligation pending and says so.
+    Until a flash that boots (without `--no-reboot`) or `flash --rollback`
+    verifies its slot, `phone-qa --quick` and `phone-qa recover` halt
+    (exit 3): the active slot or build is no longer the one the obligation
+    was armed on.
+  - The clear is stamped with the host's boot clock (`CLOCK_BOOTTIME` and
+    the host boot_id), so a wall-clock step can't make an old boot look
+    newer. If the host reboots between the clear and the verified boot, the
+    obligation stays pending; the next recovery clears and stamps it again.
   - With no pair and a dev slot active, `flash --recover` clears fb_mode,
     leaves the phone in fastboot with the obligation pending, and halts
     (exit 3). Either run `flash --rollback` (back to `known_good_slot`; it
