@@ -196,9 +196,10 @@ def armed_want(e: dict) -> Want:
     x = e.get("extra") or {}
     ids = x.get("build_ids")
     if x.get("slot") not in SLOTS or not ids or len(ids) != 2 or not all(ids):
-        raise RuntimeError("the fb_mode obligation has no recorded slot and build IDs, so no boot can be "
-                           f"verified against it; check the phone, then: fastboot -s {x.get('serial')} oem "
-                           "fb_mode_clear, and flash a build (a verified dev or batch flash settles it)")
+        raise RuntimeError("the fb_mode obligation has no recorded slot and build IDs (armed before round 8), "
+                           "so no boot can be verified against it. A dev flash (flash stripped) settles it with "
+                           "the verified boot of the slot it writes; with a known-good slot, flash --rollback or a "
+                           "batch flash does too")
     return Want(x["slot"], (ids[0], ids[1]))
 
 
@@ -314,15 +315,23 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, want: W
     WrongSlot, both before anything is cleared (R6-8, R8-2). After the
     boot, verify_boot checks the phone, and only then does settle resolve
     the obligation. With ``boot`` False (a dev flash) it clears and never
-    settles: the flash settles with a proof of the slot it writes. Raises
-    if it could not finish; the obligation then stays pending."""
+    settles: the flash settles with a proof of the slot it writes. Only a
+    path that boots reads the armed identity (R9-2). Raises if it could
+    not finish; the obligation then stays pending."""
     j = j or journal()
     e = pending(j)
     in_fb = dev.in_fastboot()
     if e is None and not in_fb:
         return Recovery(None, verify_boot(dev, want) if want is not None else None)
-    expect = want if want is not None else (armed_want(e) if e is not None else None)
-    took = False
+    # Not in fastboot means an obligation is pending (above), so a phone
+    # taken from Android always boots again unless ``boot`` is False.
+    will_boot = boot is True or (boot is None and e is not None)
+    # R9-2: the armed identity is needed only to verify a boot. A path that
+    # never boots (a dev flash) only clears and stamps, so an entry armed
+    # before round 8, with no identity, never stops it.
+    expect = want
+    if expect is None and will_boot and e is not None:
+        expect = armed_want(e)
     if not in_fb:
         st = dev.state()
         if st not in ("device", "recovery"):
@@ -331,8 +340,6 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, want: W
                                "fb_mode_clear")
         dev.reboot_adb("bootloader")
         dev.wait_fastboot(120)
-        took = True
-    will_boot = boot is True or (boot is None and (took or e is not None))
     active = None
     if will_boot:
         got = dev.getvar("current-slot")

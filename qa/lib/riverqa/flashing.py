@@ -287,48 +287,73 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         raise SystemExit(f"error: batch {st['pair']['batch']} holds an unresolved slot pair; "
                          "resolve it first (flash --recover)")
     # Only now, with the inputs and the pair checked (R7-3), is the phone
-    # touched. A leftover fb_mode would stop every boot in fastboot. A dev
-    # flash only needs fastboot, so this never boots (R5-16, R6-4): the
-    # active slot may be one that doesn't boot. It clears and never
-    # settles: the obligation stays pending until the boot of the slot
-    # written here is verified below (R8-1).
-    try:
-        fbmode.recover(dev, BOOT_TIMEOUT, boot=False)
-    except (RuntimeError, TimeoutError) as e:     # R5-11, R6-1: HALT, not EXIT_ERROR
-        return recovery_halt(RuntimeError(f"fb_mode recovery failed: {e}"))
+    # touched. R9-4: the active slot is read first, before anything is
+    # cleared; before the first baseline it chooses the write target, so an
+    # unreadable one halts with nothing changed.
     if dev.state() == "device":
         dev.guard()
-        current = running_slot(dev)
+        got = dev.getprop("ro.boot.slot_suffix") or ""
     else:
         to_fastboot(dev, 30)
         dev.fastboot_guard()
-        current = dev.getvar("current-slot").lstrip("_")
+        got = dev.getvar("current-slot")
+    current = got.lstrip("_")
     if st:
         # Never overwrite the known-good slot.
         target = slots.other(st["known_good_slot"])
     elif current in slots.SLOTS:
         target = slots.other(current)
     else:
-        return recovery_halt(fbmode.SlotUnreadable(dev.serial, current))
+        return recovery_halt(fbmode.SlotUnreadable(dev.serial, got))
+    # A leftover fb_mode would stop every boot in fastboot. A dev flash
+    # only needs fastboot, so this never boots (R5-16, R6-4): the active
+    # slot may be one that doesn't boot. It clears and never settles: the
+    # obligation stays pending until the boot of the slot written here is
+    # verified below (R8-1).
+    try:
+        fbmode.recover(dev, BOOT_TIMEOUT, boot=False)
+    except (RuntimeError, TimeoutError) as e:     # R5-11, R6-1: HALT, not EXIT_ERROR
+        return recovery_halt(RuntimeError(f"fb_mode recovery failed: {e}"))
     want = product_want(product, target)
     attempt = {"attempt_id": new_id("devflash"), "target": target}
-    log(f"Flashing {product} to slot {target} (current slot: {current})")
+    log(f"Flashing {product} to slot {target} (current slot: {current or '?'})")
+    back = st["known_good_slot"] if st else current
 
     def in_fb():
         write_images(dev, product, target, wipe, attempt, None)
 
+    def write_failed(e: RuntimeError) -> int:
+        # R9-5: write_images clears again, and a failed clear with the
+        # obligation pending raises ClearFailed before any image is written;
+        # that, or any other fastboot failure on the way, halts cleanly with
+        # the obligation pending instead of escaping as a traceback.
+        if isinstance(e, fbmode.ClearFailed):
+            return recovery_halt(e, advice=f"The fb_mode obligation stays pending. Clear it by hand (fastboot -s "
+                                 f"{SERIAL} oem fb_mode_clear), then run the flash again.")
+        if fbmode.pending() is not None:
+            return recovery_halt(RuntimeError(f"the dev flash of slot {target} stopped: {e}"),
+                                 advice="The fb_mode obligation stays pending. Flash again, or return with "
+                                 "flash --rollback (it wipes userdata).")
+        log(f"error: the dev flash of slot {target} stopped: {e}")
+        return EXIT_ERROR
+
     if not reboot:
-        to_fastboot(dev)
-        in_fb()
+        try:
+            to_fastboot(dev)
+            in_fb()
+        except RuntimeError as e:
+            return write_failed(e)
         log(f"Done. Phone is in the bootloader, slot {target} active.")
         if fbmode.pending() is not None:
             log("The fb_mode obligation stays pending: nothing was booted. A flash that boots (without "
-                "--no-reboot) or flash --rollback settles it once it has verified the slot it boots.")
+                "--no-reboot) or flash --rollback settles it once it has verified the slot it boots. Until then "
+                "phone-qa --quick halts (exit 3): the phone no longer runs the build the obligation was armed on.")
         return EXIT_OK
     log("Waiting for boot (the first boot after a wipe takes a few minutes)")
-    back = st["known_good_slot"] if st else current
     try:
         rec = reboots.planned_reboot(dev, "fastboot", boot_timeout=FIRST_BOOT_TIMEOUT, in_fastboot=in_fb)
+    except RuntimeError as e:
+        return write_failed(e)
     except TimeoutError as e:
         if fbmode.pending() is not None:
             return recovery_halt(e, advice=f"The fb_mode obligation stays pending. Roll back with flash --rollback "
@@ -338,9 +363,11 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
             f"flash --rollback, or fastboot -s {SERIAL} --set-active={back}")
         return EXIT_ERROR
     # R8-1: the boot of the slot written must be verified, and that proof
-    # alone settles a pending obligation.
+    # alone settles a pending obligation. R9-5: the version shown below is
+    # read before the settle; nothing is read from the phone after it.
     try:
         proof = fbmode.verify_boot(dev, want)
+        version = dev.getprop("ro.lineage.display.version") or "?"
         fbmode.settle(proof)
     except (RuntimeError, TimeoutError) as e:
         if fbmode.pending() is not None:
@@ -353,8 +380,7 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     if st:
         st.setdefault("history", []).append({"event": "dev-flash", "at": now_iso(), "slot": target})
         save_state(st)
-    log(f"Booted {dev.getprop('ro.lineage.display.version')} on slot {target} "
-        f"in {rec.host_boot_seconds:.0f} s ({proof.describe()})")
+    log(f"Booted {version} on slot {target} in {rec.host_boot_seconds:.0f} s ({proof.describe()})")
     if st:
         log(f"Note: known_good_slot is {st['known_good_slot']}; a batch flash first returns to it "
             "(flash --rollback).")
