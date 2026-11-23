@@ -1,0 +1,10 @@
+#!/usr/bin/env -S python3 -I
+# phone-qa: the QA harness for river batches. See qa/README.md and qa/DESIGN.md,
+# or run phone-qa --help.
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "qa", "lib"))
+from riverqa.qa import main  # noqa: E402
+
+sys.exit(main(sys.argv[1:]))

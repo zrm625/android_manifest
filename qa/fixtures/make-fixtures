@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Generate the phone-qa fixtures that are made, not downloaded, into
+# $BENCH_HOME/qa/fixtures/: the 5 s H.264 testsrc2 clip, its reference frames
+# (luma planes of the frames the helper samples), and the test page. Prints
+# the SHA-256 of each; pin them in qa/fixtures.json.
+#
+# Usage: qa/fixtures/make-fixtures
+set -euo pipefail
+BENCH_HOME=${BENCH_HOME:-/mnt/storage/lineageos-bench}
+out=$BENCH_HOME/qa/fixtures
+here=$(dirname "$(realpath "$0")")
+mkdir -p "$out"
+# Baseline profile, one thread, no B-frames: every AVC decoder plays it.
+ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=640x352:rate=30 -t 5 \
+  -c:v libx264 -profile:v baseline -level 3.0 -pix_fmt yuv420p -threads 1 -g 30 -bf 0 \
+  -x264-params "bframes=0:threads=1:sliced-threads=0" -movflags +faststart "$out/testsrc2-640x352.mp4"
+# The reference is the decoded Y plane exactly as the bitstream gives it (TV
+# range). -pix_fmt gray would expand it to full range, so write yuv420p and
+# keep the first width*height bytes.
+for i in 0 30 60 90 120 149; do
+  ffmpeg -hide_banner -loglevel error -y -i "$out/testsrc2-640x352.mp4" \
+    -vf "select=eq(n\,$i)" -fps_mode passthrough -frames:v 1 -pix_fmt yuv420p -f rawvideo "$out/.frame.yuv"
+  head -c $((640 * 352)) "$out/.frame.yuv" > "$out/testsrc2-frame-$i.gray"
+done
+rm -f "$out/.frame.yuv"
+cp "$here/page.html" "$out/page.html"
+cd "$out" && sha256sum testsrc2-640x352.mp4 testsrc2-frame-*.gray page.html

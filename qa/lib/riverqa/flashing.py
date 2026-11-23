@@ -1,0 +1,523 @@
+"""scripts/flash: install a build on the test phone, with the slot pair,
+rollback and slot rescue from DESIGN.md ("The batch sequence", step 2)."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from . import evidence, journal, reboots, recovery, slots, stage
+from .core import (BENCH_HOME, CODENAME, SERIAL, Deadline, batch_dir, bench_path, log, new_id,
+                   now_iso, read_json, sha256_file, write_json)
+from .device import Device, GuardError, Unreachable
+from .lock import DeviceLock, LockError
+
+IMAGES = ("boot", "dtbo", "system", "vendor")
+STATE_FILE = "slot-state.json"
+FIRST_BOOT_TIMEOUT = 900
+BOOT_TIMEOUT = 600
+
+EXIT_OK, EXIT_ERROR, EXIT_HALT, EXIT_RESCUED = 0, 1, 3, 4
+
+
+class Halt(RuntimeError):
+    """Stop the pipeline and notify Zak."""
+
+
+def state_path() -> Path:
+    return bench_path(STATE_FILE)
+
+
+def load_state() -> dict | None:
+    return read_json(state_path())
+
+
+def save_state(st: dict) -> None:
+    write_json(state_path(), st)
+
+
+def qa_home() -> Path:
+    return bench_path("qa")
+
+
+# --- phone reads ---------------------------------------------------------------
+
+def running_slot(dev: Device) -> str:
+    s = dev.getprop("ro.boot.slot_suffix").lstrip("_")
+    if s not in slots.SLOTS:
+        raise RuntimeError(f"cannot read the running slot ({s!r})")
+    return s
+
+
+def boot_partition_sha(dev: Device, slot: str, nbytes: int | None = None) -> str:
+    """SHA-256 of boot_<slot> as root: the whole partition, or its first
+    nbytes. A short read raises."""
+    dev.root()
+    part = f"/dev/block/by-name/boot_{slot}"
+    if nbytes is None:
+        out = dev.sh(f"sha256sum {part}", timeout=120).split()
+    else:
+        size = int(dev.sh(f"blockdev --getsize64 {part}").strip() or 0)
+        if size < nbytes:
+            raise RuntimeError(f"{part} is {size} bytes, shorter than {nbytes}")
+        out = dev.sh(f"head -c {int(nbytes)} {part} | sha256sum", timeout=120).split()
+    if not out or len(out[0]) != 64:
+        raise RuntimeError(f"could not hash {part}")
+    return out[0]
+
+
+def partition_build_ids(dev: Device) -> tuple[str | None, str | None]:
+    """ro.river.build_id and ro.vendor.river.build_id read straight from the
+    partitions' build.prop files, as root."""
+    dev.root()
+    sysp = dev.sh("grep -m1 '^ro.river.build_id=' /system/build.prop").strip()
+    venp = dev.sh("grep -m1 '^ro.vendor.river.build_id=' /vendor/build.prop").strip()
+    return (sysp.split("=", 1)[1] if "=" in sysp else None, venp.split("=", 1)[1] if "=" in venp else None)
+
+
+# --- getting to fastboot, rollback and rescue -----------------------------------
+
+def to_fastboot(dev: Device, seconds: float = 180) -> None:
+    """Get to fastboot. If fastboot answers, use it. If adb answers (booted or
+    not), write a marker when possible and `adb reboot bootloader`."""
+    d = Deadline(seconds, "fastboot or adb to answer")
+    while True:
+        if dev.in_fastboot():
+            return
+        if dev.state() in ("device", "recovery"):
+            st = dev.boot_status()
+            if st and st.completed:
+                reboots.leave_marker(dev)
+            dev.adb("reboot", "bootloader", timeout=30)
+            dev.wait_fastboot(120)
+            return
+        if d.expired():
+            raise Unreachable(f"{dev.serial}: neither adb nor fastboot answers. Someone has to hold the power "
+                              "button. Pipeline stopped.")
+        import time
+        time.sleep(1)
+
+
+def verify_slot_build(dev: Device, slot: str, build_id: str | None, boot_sha: str | None) -> str:
+    """Check the running slot and build. Returns a description; raises on mismatch."""
+    have = running_slot(dev)
+    if have != slot:
+        raise RuntimeError(f"running slot {have}, expected {slot}")
+    if build_id:
+        s, v = partition_build_ids(dev)
+        if s != build_id or v != build_id:
+            raise RuntimeError(f"build IDs system={s} vendor={v}, expected {build_id}")
+        return f"slot {slot}, build ID {build_id}"
+    if not boot_sha:
+        raise RuntimeError("no build ID and no boot hash to verify the fallback with")
+    got = boot_partition_sha(dev, slot)
+    if got != boot_sha:
+        raise RuntimeError(f"boot_{slot} hash {got[:12]} differs from the saved {boot_sha[:12]}")
+    return f"slot {slot}, boot hash {boot_sha[:12]}"
+
+
+def rollback(dev: Device, st: dict, reason: str, attempt_id: str | None = None) -> dict:
+    """The one rollback procedure: --set-active the fallback (always
+    known_good_slot), `fastboot erase userdata` (must succeed; recorded),
+    reboot, then check the slot and build. Only then is the pair released.
+    Works without a pair too (back to known_good_slot after a dev flash)."""
+    pair = st.get("pair")
+    kg = st["known_good_slot"]
+    fallback = pair["fallback"] if pair else kg
+    if fallback != kg:
+        raise Halt(f"pair fallback {fallback} is not known_good_slot {kg}")
+    attempt_id = attempt_id or new_id("rollback")
+    log(f"Rollback to slot {fallback}: {reason}")
+    to_fastboot(dev)
+    dev.fastboot_guard()
+    dev.fastboot_ok(f"--set-active={fallback}", timeout=60)
+    r = dev.fastboot("erase", "userdata", timeout=300)
+    if r.returncode != 0:
+        raise Halt(f"rollback: fastboot erase userdata failed: {(r.stderr or r.stdout).strip()[-300:]}")
+    seq = journal.record_wipe(qa_home(), attempt_id, "rollback")
+    dev.fastboot_ok("reboot", timeout=60)
+    try:
+        dev.wait_for_device(FIRST_BOOT_TIMEOUT)
+        dev.wait_boot_completed(FIRST_BOOT_TIMEOUT)
+        kgrec = st.get("known_good") or {}
+        how = verify_slot_build(dev, fallback, kgrec.get("build_id"),
+                                (pair or {}).get("fallback_boot_sha256") or kgrec.get("boot_sha256"))
+    except (TimeoutError, RuntimeError) as e:
+        raise Halt(f"rollback to slot {fallback} could not be verified: {e}") from e
+    if pair:
+        slots.rolled_back(st, fallback, f"{reason}; wipe #{seq}; {how}", now_iso())
+    else:
+        st.setdefault("history", []).append({"event": "returned-to-known-good", "at": now_iso(),
+                                             "how": how, "reason": reason})
+    save_state(st)
+    log(f"Rolled back: {how}. The phone is wiped and sits in the setup wizard.")
+    return {"attempt_id": attempt_id, "wipe_seq": seq, "verified": how}
+
+
+def rescue(dev: Device, st: dict, reason: str, attempt_id: str | None = None) -> dict:
+    """Slot rescue after a failed boot: get to fastboot (adb reboot bootloader
+    if adb answers without boot completed), then the rollback procedure."""
+    log(f"Slot rescue: {reason}")
+    return rollback(dev, st, f"rescue: {reason}", attempt_id)
+
+
+# --- the flash itself ---------------------------------------------------------------
+
+def check_images(images_dir: Path, expected: dict | None) -> dict:
+    """Hash every image before anything is written. Returns {name: sha}."""
+    got = {}
+    for name in IMAGES:
+        p = images_dir / f"{name}.img"
+        if not p.exists():
+            raise SystemExit(f"error: missing {p}")
+        got[name] = sha256_file(p)
+        if expected is not None:
+            want = (expected.get(name) or {}).get("sha256")
+            if got[name] != want:
+                raise SystemExit(f"error: {p} hash {got[name][:12]} does not match batch.json {str(want)[:12]}")
+    return got
+
+
+def write_images(dev: Device, images_dir: Path, target: str, wipe: bool, attempt: dict,
+                 st: dict | None) -> None:
+    dev.fastboot_guard()
+    if st is not None:
+        slots.mark_written(st, attempt["attempt_id"], now_iso())
+        save_state(st)
+    for name in IMAGES:
+        log(f"  flash {name}_{target}")
+        dev.fastboot_ok("flash", f"{name}_{target}", str(images_dir / f"{name}.img"), timeout=600)
+    dev.fastboot_ok(f"--set-active={target}", timeout=60)
+    if wipe:
+        # Not fastboot -w: river's bootloader also tries to erase a metadata
+        # partition the phone doesn't have, and fails.
+        log("  erase userdata")
+        r = dev.fastboot("erase", "userdata", timeout=300)
+        if r.returncode != 0:
+            raise RuntimeError(f"fastboot erase userdata failed: {(r.stderr or r.stdout).strip()[-300:]}")
+        seq = journal.record_wipe(qa_home(), attempt["attempt_id"], "flash")
+        attempt["wipe"] = {"ok": True, "seq": seq, "at": now_iso()}
+
+
+def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
+    """Day-to-day flash of an output directory (no batch)."""
+    dev = Device(SERIAL)
+    check_images(product, None)
+    built_for = stage.read_prop(product / "system/build.prop", "ro.product.system.device") or \
+        stage.read_prop(product / "system/build.prop", "ro.product.device")
+    if built_for and built_for != CODENAME:
+        raise SystemExit(f"error: {product} was built for {built_for!r}, not {CODENAME}")
+    st = load_state()
+    if st and st.get("pair"):
+        raise SystemExit(f"error: batch {st['pair']['batch']} holds an unresolved slot pair; "
+                         "resolve it first (flash --recover)")
+    if dev.state() == "device":
+        dev.guard()
+        current = running_slot(dev)
+    else:
+        to_fastboot(dev, 30)
+        dev.fastboot_guard()
+        current = dev.getvar("current-slot").lstrip("_")
+    if st:
+        # Never overwrite the known-good slot.
+        target = slots.other(st["known_good_slot"])
+    else:
+        target = slots.other(current)
+    attempt = {"attempt_id": new_id("devflash"), "target": target}
+    log(f"Flashing {product} to slot {target} (current slot: {current})")
+
+    def in_fb():
+        write_images(dev, product, target, wipe, attempt, None)
+
+    if not reboot:
+        to_fastboot(dev)
+        in_fb()
+        log(f"Done. Phone is in the bootloader, slot {target} active.")
+        return EXIT_OK
+    log("Waiting for boot (the first boot after a wipe takes a few minutes)")
+    try:
+        rec = reboots.planned_reboot(dev, "fastboot", boot_timeout=FIRST_BOOT_TIMEOUT, in_fastboot=in_fb)
+    except TimeoutError as e:
+        log(f"error: {e}. Roll back: fastboot -s {SERIAL} --set-active={current}")
+        return EXIT_ERROR
+    if st:
+        st.setdefault("history", []).append({"event": "dev-flash", "at": now_iso(), "slot": target})
+        save_state(st)
+    log(f"Booted {dev.getprop('ro.lineage.display.version')} on slot {target} "
+        f"in {rec.host_boot_seconds:.0f} s")
+    if st:
+        log(f"Note: known_good_slot is {st['known_good_slot']}; a batch flash first returns to it "
+            "(flash --rollback).")
+    return EXIT_OK
+
+
+def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
+    batch = stage.load(batch_id)
+    bdir = batch_dir(batch_id)
+    images_dir = images_dir or bdir / "images"
+    kind = batch["kind"]
+    if not wipe:
+        raise SystemExit("error: a batch flash always wipes (--wipe)")
+    hashes = check_images(images_dir, batch["images"])
+    dev = Device(SERIAL)
+    dev.guard()
+    current = running_slot(dev)
+    st = load_state()
+    if st is None and kind == "baseline":
+        # First-run transition: the running slot becomes a provisional
+        # known_good_slot, its boot hash checked live.
+        sha = boot_partition_sha(dev, current)
+        st = slots.first_run(current, sha, now_iso())
+        save_state(st)
+        log(f"First run: slot {current} is the provisional known-good slot (boot {sha[:12]})")
+    errs = slots.preflight(st, batch_id, kind, current)
+    if errs:
+        for e in errs:
+            log(f"error: {e}")
+        return EXIT_ERROR
+    kg = st["known_good_slot"]
+    live = boot_partition_sha(dev, kg)
+    saved = (st.get("known_good") or {}).get("boot_sha256")
+    if saved and live != saved:
+        log(f"error: boot_{kg} hash {live[:12]} differs from the known-good record {saved[:12]}; "
+            "the known-good slot was changed outside the harness")
+        return EXIT_HALT
+    pair = slots.reserve(st, batch_id, kind, live, now_iso())
+    save_state(st)
+    batch["pair"] = dict(pair)
+    stage.save(batch)
+    target = pair["target"]
+
+    flash_rec_path = bdir / "flash.json"
+    frec = read_json(flash_rec_path, {"attempts": []})
+    attempt = {"attempt_id": new_id("flash"), "started_at": now_iso(), "target": target,
+               "fallback": pair["fallback"], "kind": kind, "image_sha256": hashes, "hashes_checked": True,
+               "wipe": None, "first_boot": None, "result": "started"}
+    frec["attempts"].append(attempt)
+    write_json(flash_rec_path, frec)
+
+    def save_attempt():
+        write_json(flash_rec_path, frec)
+
+    def in_fb():
+        write_images(dev, images_dir, target, True, attempt, st)
+        save_attempt()
+
+    log(f"Batch {batch_id} ({kind}): flashing slot {target}; fallback {pair['fallback']}")
+    try:
+        rec = reboots.planned_reboot(dev, "fastboot", boot_timeout=FIRST_BOOT_TIMEOUT, in_fastboot=in_fb)
+    except (TimeoutError, RuntimeError) as e:
+        attempt["result"] = f"boot failed: {e}"
+        save_attempt()
+        try:
+            r = rescue(dev, st, f"batch {batch_id}: {e}", attempt["attempt_id"])
+            attempt["rescue"] = r
+            attempt["result"] = "rescued; batch failed"
+            save_attempt()
+            return EXIT_RESCUED
+        except (Halt, Unreachable) as h:
+            attempt["result"] = f"halt: {h}"
+            save_attempt()
+            log(f"HALT: {h}")
+            return EXIT_HALT
+    # Record the first boot's boot_id at once.
+    attempt["first_boot"] = {"boot_id": rec.boot_id, "completed_at": now_iso(),
+                             "host_boot_seconds": rec.host_boot_seconds}
+    save_attempt()
+    batch["first_boot_seconds"] = rec.host_boot_seconds
+    stage.save(batch)
+    # A bootloader that fell back to the old slot by itself fails the batch.
+    slot_now = running_slot(dev)
+    if slot_now != target:
+        attempt["result"] = f"bootloader fell back to slot {slot_now}; batch failed"
+        save_attempt()
+        try:
+            attempt["rescue"] = rollback(dev, st, f"bootloader fell back to slot {slot_now}", attempt["attempt_id"])
+            save_attempt()
+            return EXIT_RESCUED
+        except (Halt, Unreachable) as h:
+            log(f"HALT: {h}")
+            return EXIT_HALT
+    reboots.judge_signals(dev, rec)
+    ev_dir = bdir / "boots" / f"firstboot-{attempt['attempt_id']}"
+    count = reboots.read_boot_count(dev, expected=1)
+    signals = {"path": "fastboot", "chain": list(rec.chain), "uptime": list(rec.uptime_check),
+               "boot_count": list(count), "reboot": rec.to_json()}
+    meta = evidence.collect(dev, ev_dir, expected_boot_id=rec.boot_id,
+                            context={"flash_attempt": attempt["attempt_id"], "batch": batch_id,
+                                     "kind": "first-boot"})
+    write_json(ev_dir / "signals.json", signals)
+    attempt["first_boot"]["evidence"] = str(ev_dir.relative_to(bdir))
+    attempt["first_boot"]["signals"] = {k: signals[k] for k in ("chain", "uptime", "boot_count")}
+    attempt["result"] = "booted"
+    save_attempt()
+    log(f"Booted slot {target} in {rec.host_boot_seconds:.0f} s (boot_id {rec.boot_id[:8]}). "
+        f"Signals: chain {rec.chain[0]}, uptime {rec.uptime_check[0]}, count {count[0]}. "
+        f"Evidence boot_id {'matches' if meta['boot_id_at_collection'] == rec.boot_id else 'MISMATCH'}.")
+    return EXIT_OK
+
+
+def promote_batch(batch_id: str) -> int:
+    st = load_state()
+    if not st or not st.get("pair") or st["pair"]["batch"] != batch_id:
+        log(f"error: no reserved pair for {batch_id}")
+        return EXIT_ERROR
+    batch = stage.load(batch_id)
+    dev = Device(SERIAL)
+    dev.guard()
+    target = st["pair"]["target"]
+    if running_slot(dev) != target:
+        log(f"error: the phone is not running the candidate slot {target}")
+        return EXIT_ERROR
+    s, v = partition_build_ids(dev)
+    if s != batch["build_id"] or v != batch["build_id"]:
+        log(f"error: candidate build IDs {s}/{v} differ from batch.json {batch['build_id']}")
+        return EXIT_ERROR
+    sha = boot_partition_sha(dev, target)
+    if batch["pair"]["kind"] == "baseline":
+        slots.close_baseline(st, batch_id, s, sha, now_iso())
+    else:
+        slots.promote(st, batch_id, s, sha, now_iso())
+    save_state(st)
+    log(f"Promoted {batch_id}: known_good_slot is now {target}")
+    return EXIT_OK
+
+
+def recover(runner=None) -> int:
+    st = load_state()
+    if not st or not st.get("pair"):
+        log("No unresolved pair.")
+        return EXIT_OK
+    pair = st["pair"]
+    batch = read_json(batch_dir(pair["batch"]) / "batch.json", {}) or {}
+    look = None if pair["kind"] != "batch" else recovery.lookup(batch, *( [runner] if runner else []))
+    decision, why = slots.decide_recovery(pair, look)
+    log(f"Recovery for {pair['batch']} ({pair['kind']}): {decision}: {why}")
+    st.setdefault("history", []).append({"event": "recovery-decision", "at": now_iso(),
+                                         "batch": pair["batch"], "decision": decision, "why": why})
+    save_state(st)
+    dev = Device(SERIAL)
+    if decision == slots.HALT:
+        log("HALT: notify Zak.")
+        return EXIT_HALT
+    try:
+        if decision == slots.PROMOTE:
+            return promote_batch(pair["batch"])
+        dev.guard() if dev.state() == "device" else None
+        rollback(dev, st, f"recovery: {why}")
+        return EXIT_OK
+    except (Halt, Unreachable) as h:
+        log(f"HALT: {h}")
+        return EXIT_HALT
+
+
+def show_status() -> int:
+    st = load_state()
+    if st is None:
+        print("No slot-state.json yet (the first --baseline flash creates it).")
+        return EXIT_OK
+    kg = st.get("known_good") or {}
+    print(f"known_good_slot: {st['known_good_slot']} ({'provisional' if kg.get('provisional') else 'confirmed'}; "
+          f"build {kg.get('build_id')}; boot {str(kg.get('boot_sha256'))[:12]})")
+    print(f"baseline closed: {st.get('baseline_closed')}")
+    p = st.get("pair")
+    print("pair: none" if not p else f"pair: batch {p['batch']} ({p['kind']}), target {p['target']}, "
+          f"fallback {p['fallback']}, written {p['written']}")
+    return EXIT_OK
+
+
+USAGE = """\
+Install a build on the Moto G7 test phone with fastboot.
+
+Usage:
+  flash <baseline|stripped|PRODUCT_DIR> [--wipe] [--no-reboot]
+  flash --batch ID [--images DIR] --wipe
+  flash --rollback        Return to known_good_slot: --set-active, fastboot erase
+                          userdata, reboot, verify slot and build; releases the pair.
+  flash --recover         Resolve an unresolved pair: look up the batch's merge and
+                          tag state (gh, git ls-remote) and promote, roll back or halt.
+  flash --promote ID      The batch was merged and tagged: make its slot known-good.
+  flash --status          Show slot-state.json.
+
+  baseline|stripped  Use $BENCH_HOME/out-<env>/target/product/river.
+  PRODUCT_DIR        Any directory with boot.img, dtbo.img, system.img and vendor.img.
+  --wipe       Factory reset (fastboot erase userdata; river's bootloader rejects -w).
+  --no-reboot  Stay in the bootloader after flashing.
+  --batch ID   Flash a staged batch ($BENCH_HOME/batches/ID). Checks every image hash
+               before writing, fixes the slot pair in slot-state.json and batch.json
+               before the first write, records the first boot's boot_id, signals and
+               health evidence, and runs slot rescue if the boot fails.
+
+The images go to the slot that is not the known-good one (or, before the first
+baseline, the inactive slot), so the running build stays as a fallback. Every
+adb and fastboot wait has a deadline. Only the phone with serial $BENCH_DEVICE
+(default ZY225DPT7F) is touched, and only if it reports itself as river.
+
+Exit codes: 0 done, 1 error, 3 halted (needs Zak), 4 boot failed and the phone
+was rescued back to the known-good slot (the batch failed).
+"""
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="flash", usage=USAGE, add_help=False)
+    ap.add_argument("src", nargs="?")
+    ap.add_argument("--wipe", action="store_true")
+    ap.add_argument("--no-reboot", action="store_true")
+    ap.add_argument("--batch")
+    ap.add_argument("--images", type=Path)
+    ap.add_argument("--rollback", action="store_true")
+    ap.add_argument("--recover", action="store_true")
+    ap.add_argument("--promote")
+    ap.add_argument("--status", action="store_true")
+    ap.add_argument("-h", "--help", action="store_true")
+    a = ap.parse_args(argv)
+    if a.help:
+        print(USAGE)
+        return 0
+    if a.status:
+        return show_status()
+    try:
+        with DeviceLock():
+            if a.rollback:
+                st = load_state()
+                if not st:
+                    log("error: no slot-state.json")
+                    return EXIT_ERROR
+                dev = Device(SERIAL)
+                if dev.state() == "device":
+                    dev.guard()
+                rollback(dev, st, "requested (flash --rollback)")
+                return EXIT_OK
+            if a.recover:
+                return recover()
+            if a.promote:
+                return promote_batch(a.promote)
+            if a.batch:
+                return flash_batch(a.batch, a.images, a.wipe)
+            if a.images and not a.src:
+                return flash_dev(a.images, a.wipe, not a.no_reboot)
+            if a.src in ("baseline", "stripped"):
+                product = BENCH_HOME / f"out-{a.src}" / "target/product" / CODENAME
+            elif a.src:
+                product = Path(a.src)
+            else:
+                print(USAGE)
+                return EXIT_ERROR
+            return flash_dev(product, a.wipe, not a.no_reboot)
+    except (LockError, GuardError) as e:
+        log(f"error: {e}")
+        return EXIT_ERROR
+    except Halt as e:
+        log(f"HALT: {e}")
+        return EXIT_HALT
+    except Unreachable as e:
+        log(f"HALT: {e}")
+        return EXIT_HALT
+    except TimeoutError as e:
+        log(f"error: {e}")
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
