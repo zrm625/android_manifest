@@ -2643,3 +2643,9 @@ docstrings, the `--no-reboot` help and recover's "Next:" message describe
 the boot-only path. README step 0 runs `phone-qa recover` before the
 reboot when an obligation is pending. `test_round12`'s main guard is at
 the end of the file.
+
+Gemini's round-14 minors: the R12-1 message reads "the phone is now in
+fastboot (found in recovery, …)"; tests pin the boot-only edges (another
+slot active → `WrongSlot` before any clear; without `boot_only_ok` the
+entry is still refused with nothing touched). Its docstring and parser
+notes are the Opus follow-ups above.

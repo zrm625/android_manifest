@@ -248,5 +248,28 @@ class R14OpusMinors(unittest.TestCase):
                         self.assertEqual(d.slot_boot_state(), want)
 
 
+class R14GeminiMinors(unittest.TestCase):
+    def test_boot_only_edges(self):
+        """Gemini round 14 (m4): with a sentinel entry armed on a and slot b
+        active, phone-qa recover raises WrongSlot before any clear; and
+        fbmode.recover without boot_only_ok still refuses the entry."""
+        from test_round8 import arm_entry
+        from test_round10 import recover_cmd
+        with bench_home():
+            p = R9Phone(where="fastboot", active="b", bootable=("a", "b"), builds={"a": BID, "b": DEV_BID})
+            arm_entry("a", ids=("unstamped", "unstamped"))
+            rc, out = recover_cmd(p)
+            self.assertEqual(rc, 3, out)
+            self.assertNotIn(("fb_mode_clear",), p.calls)
+            self.assertEqual(p.boots, [])
+            self.assertIsNotNone(fbmode.pending())
+        with bench_home():
+            p = R9Phone(where="fastboot", active="a", bootable=("a", "b"), builds={"a": BID, "b": DEV_BID})
+            arm_entry("a", ids=("unstamped", "unstamped"))
+            with self.assertRaisesRegex(RuntimeError, "no recorded slot and build IDs"):
+                fbmode.recover(p, 10, boot=True)
+            self.assertEqual((p.calls, p.boots), ([], []))
+
+
 if __name__ == "__main__":
     unittest.main()

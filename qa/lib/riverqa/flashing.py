@@ -363,8 +363,8 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         # have completed boot. This also stops a second --no-reboot flash
         # from writing the original slot before the first one has booted.
         where = {"device": "in Android but has not completed boot",
-                 "recovery": "was found in recovery (moved to fastboot to read the slot)",
-                 "unauthorized": "was found with adb unauthorized (moved to fastboot to read the slot)"}.get(
+                 "recovery": "now in fastboot (found in recovery, moved to fastboot to read the slot)",
+                 "unauthorized": "now in fastboot (found with adb unauthorized, moved to fastboot to read the slot)"}.get(
             found, "in fastboot")
         msg = (f"slot {current} is active and the phone is {where}; with no known-good slot yet, nothing "
                f"shows that slot {current} boots, so this flash would not write slot {target}")
