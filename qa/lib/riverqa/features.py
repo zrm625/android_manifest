@@ -611,10 +611,13 @@ def torch_capture(r) -> dict:
     ``flash_on`` is the "on" frame's FLASH_STATE, only if the helper
     reported a real value (0-4): a missing capture result comes back as
     ``null`` and is never usable (review round 4). ``luma_valid``: both
-    lumas and the "on" std are finite numbers. ``valid`` needs both."""
+    lumas and the "on" std are finite numbers. ``valid`` needs both.
+    ``complete`` (R5-5) also needs exactly two frames, both with a real
+    flash state: only a complete capture can qualify the torch-disabled
+    control."""
     fs = [x for x in (r.get("flash_states") or "").split(",") if x != ""]
     out = {"flash_states": fs, "flash_on": None, "luma_off": 0.0, "luma_on": 0.0, "std_on": 0.0,
-           "luma_valid": False, "valid": False, "why": ""}
+           "luma_valid": False, "valid": False, "complete": False, "why": ""}
     why = []
     if len(fs) > 1 and fs[1].isdigit() and int(fs[1]) in FLASH_STATES:
         out["flash_on"] = int(fs[1])
@@ -626,6 +629,10 @@ def torch_capture(r) -> dict:
     else:
         out.update(luma_off=l0, luma_on=l1, std_on=s1, luma_valid=True)
     out["valid"] = out["luma_valid"] and out["flash_on"] is not None
+    off_ok = len(fs) == 2 and fs[0].isdigit() and int(fs[0]) in FLASH_STATES
+    if len(fs) != 2 or not off_ok:
+        why.append(f"torch-off frame metadata missing or extra frames ({fs or 'missing'})")
+    out["complete"] = out["valid"] and off_ok
     out["why"] = "; ".join(why)
     return out
 
@@ -646,8 +653,12 @@ def torch_rejections(cap: dict, delta_min: float) -> list[str]:
     """The evidence that the torch itself was rejected, for the
     torch-disabled control (review round 4). Only two things count: a
     usable torch-on flash state that says not fired, and a valid luma pair
-    that fails the delta check. A missing capture result or missing
-    metadata never counts."""
+    that fails the delta check. Missing required evidence is checked first
+    (R5-5): a capture with any frame's capture-result metadata missing, or
+    missing lumas, records no rejection at all, even when the luma pair it
+    has fails the delta."""
+    if not cap.get("complete"):
+        return []
     out = []
     if cap["flash_on"] is not None and cap["flash_on"] != FLASH_STATE_FIRED:
         out.append(f"FLASH_STATE {cap['flash_on']}, not FIRED")

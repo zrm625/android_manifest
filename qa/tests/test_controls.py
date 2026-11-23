@@ -346,20 +346,28 @@ class Attribution(unittest.TestCase):
         self.assertIsNone(self.torch_run(dark, held=False)[1])
 
     def test_torch_missing_metadata_never_qualifies(self):
-        """Review round 4: the helper reports ``2,null`` when the torch
-        frame's capture result never came. That is no evidence."""
+        """Review rounds 4 and 5: the helper reports ``2,null`` when a
+        frame's capture result never came. Missing required evidence is
+        rejected first: only a complete capture (two frames, both with a real
+        flash state, and a finite luma pair) can qualify the control, even
+        when the luma it has fails the delta (R5-5)."""
         cases = (
             # (photo, qualifies)
-            ({"flash_states": "2,null", "luma0": "40", "std1": "9"}, False),               # Sol's case
+            ({"flash_states": "2,null", "luma0": "40", "std1": "9"}, False),
             ({"flash_states": "2,null"}, False),
-            ({"flash_states": "0,2"}, True),                                                 # usable, not fired
-            ({"flash_states": "0,2", "luma0": "40", "std1": "9"}, True),
-            ({"flash_states": "2,null", "luma0": "40", "luma1": "41", "std1": "9"}, True),  # luma fails by itself
-            ({"flash_states": "2,null", "luma0": "40", "luma1": "90", "std1": "9"}, False), # luma rose: no rejection
-            ({"flash_states": "0", "luma0": "40", "luma1": "41", "std1": "9"}, True),
-            ({"flash_states": "0", "luma0": "40", "luma1": "nan", "std1": "9"}, False),
-            ({"flash_states": "2,7", "luma0": "40", "std1": "9"}, False),                   # not a flash state
+            ({"flash_states": "0,2"}, False),                                                # no lumas
+            ({"flash_states": "0,2", "luma0": "40", "std1": "9"}, False),                   # no luma1
+            ({"flash_states": "2,null", "luma0": "40", "luma1": "41", "std1": "9"}, False), # Sol R5-5: luma fails, metadata missing
+            ({"flash_states": "null,2", "luma0": "40", "luma1": "41", "std1": "9"}, False), # off frame's metadata missing
+            ({"flash_states": "2,null", "luma0": "40", "luma1": "90", "std1": "9"}, False),
+            ({"flash_states": "0", "luma0": "40", "luma1": "41", "std1": "9"}, False),      # one frame
+            ({"flash_states": "0,2,2", "luma0": "40", "luma1": "41", "std1": "9"}, False),  # extra frame
+            ({"flash_states": "0,2", "luma0": "40", "luma1": "nan", "std1": "9"}, False),
+            ({"flash_states": "2,7", "luma0": "40", "luma1": "41", "std1": "9"}, False),    # not a flash state
             ({"flash_states": "", "luma0": "40", "luma1": "", "std1": "9"}, False),
+            ({"flash_states": "0,2", "luma0": "40", "luma1": "41", "std1": "9"}, True),     # complete, not fired
+            ({"flash_states": "0,2", "luma0": "40", "luma1": "90", "std1": "9"}, True),     # complete, not fired, lit
+            ({"flash_states": "0,3", "luma0": "40", "luma1": "41", "std1": "9"}, True),     # complete, fired, no rise
         )
         for photo, want in cases:
             r, marked = self.torch_run(photo)
