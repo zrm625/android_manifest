@@ -2479,3 +2479,41 @@ stand).**
    nothing changed.
 10. Calibration, step 2: the sentinel on either partition exits 1 before
     any calibration reboot.
+
+## Code review round 11: changes to R10
+
+Round 11 (head `0fb68fa`): Opus 9 and Gemini approve; Sol 7 objects with
+two majors, both in the dev flash. Fixed in `flashing.py` without new
+recovery or settle paths; the five `fbmode.settle` callers are unchanged.
+
+**R11-1. A slotless entry before the first baseline.** An obligation from
+before round 8 records no slot. With no `slot-state.json` and slot b left
+active by an interrupted flash, slot a may be the only slot that boots,
+and the R10 advice ("a dev flash that boots") wrote all four a
+partitions. Now, before the first baseline with such an entry pending, a
+dev flash goes on only if it found the phone running Android: that shows
+the active slot boots, and the target is the other slot. In fastboot it
+halts (3) after the slot read and before any clear or write. The advice
+(`armed_way_back`) names no flash until a slot has been shown to boot:
+clear fb_mode by hand, set a slot active, reboot, check that it reaches
+Android, leave it active and run `flash stripped`; if no slot boots, stop
+and tell Zak.
+
+Ordering row 3 gains a step 3a: before the first baseline, with a
+slotless entry pending and the slot read from fastboot, HALT 3 with
+nothing changed.
+
+**R11-2. Timeouts at `--set-active` and the wipe.** `write_images` turns
+a `TimeoutError` from `--set-active` or from `fastboot erase userdata`
+into `WipeFailed`, so the dev flash halts (3) in both `--no-reboot` and
+the rebooting mode, saying the slot is, or may be, active and its wipe is
+not confirmed. Rollback's own erase already halted on any failure (R6-1).
+
+**Minors.** The README describes the slot-read exit codes as R10-4 does
+(Opus m1). Advice to set a slot active from Android says to reboot to the
+bootloader first (Opus m2).
+
+Regressions: `test_round9.test_legacy_obligation_in_fastboot_writes_nothing`
+and `test_round10.R11_2WriteTimeouts` (8 subcases). At `0fb68fa` the first
+wrote `boot_a` and the rest; the second exited 1 in every subcase.
+

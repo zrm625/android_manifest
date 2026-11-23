@@ -315,16 +315,17 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   - A dev flash (also `device-bench --flash`) clears fb_mode and writes,
     but only after it has checked its images and that no slot pair is
     reserved: a refused flash never touches the phone. It reads the active
-    slot before it clears anything. Before the first baseline an unreadable
-    slot, a timeout on that read, or (with an obligation pending) a guard
-    failure halts (exit 3); a failed read otherwise exits 1 with an
-    `error:` line. It resolves the obligation once the slot it wrote has
+    slot before it clears anything. With an obligation pending, any
+    failure of that read halts (exit 3), a guard failure included. Before
+    the first baseline, any failed read except a guard failure halts (exit
+    3). Otherwise a failed read exits 1 with an `error:` line. It resolves the obligation once the slot it wrote has
     booted with its build IDs, also an obligation armed before round 8 or
     with the `unstamped` sentinel (neither has an identity generic
     recovery can verify). A failed clear or fastboot write with the
-    obligation pending halts (exit 3). A failed `fastboot erase userdata`
-    after `--set-active` always halts (exit 3): the new slot is active and
-    unwiped.
+    obligation pending halts (exit 3). A failed or timed-out `fastboot
+    erase userdata` after `--set-active`, or a timed-out `--set-active`,
+    always halts (exit 3): the new slot is, or may be, active and its wipe
+    is not confirmed.
   - **Before the first baseline** (no `slot-state.json`), the slot the
     obligation was armed on is the only slot known to boot. So, before it
     touches the phone, a dev flash refuses:
@@ -336,11 +337,18 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
     Both say what to do: run `phone-qa recover`, which boots the armed
     slot, verifies it and settles the obligation, then flash again. If
     another slot is active, set the armed slot active by hand first
-    (`fastboot -s ZY225DPT7F --set-active=<armed slot>`). For an entry
+    (from Android, `adb -s ZY225DPT7F reboot bootloader` first; then
+    `fastboot -s ZY225DPT7F --set-active=<armed slot>`). For an entry
     with the `unstamped` sentinel, which generic recovery refuses, the
     advice is `flash stripped` with the armed slot active. Halts of a
     dev flash in this state never advise `flash --rollback` (it needs
     `slot-state.json`) or another flash.
+    - An entry from before round 8 records no slot, so nothing says which
+      slot still boots. A dev flash then refuses (exit 3) unless it finds
+      the phone running Android, which shows the active slot boots and
+      makes the other slot a safe target. The advice is to clear fb_mode,
+      find a slot that reaches Android by hand, leave it active and run
+      `flash stripped`; if no slot boots, stop and tell Zak.
   - With a known-good slot, `flash stripped --no-reboot` leaves the
     obligation pending and says what settles it. If it wrote the slot and
     build IDs the obligation was armed on, generic recovery (`phone-qa
