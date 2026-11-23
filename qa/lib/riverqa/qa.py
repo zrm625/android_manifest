@@ -705,8 +705,8 @@ def full_run(run: Run, lock_result: Result) -> int:
 
 
 USAGE = """\
-phone-qa: QA for river batches on the Moto G7 test phone (serial $BENCH_DEVICE,
-default ZY225DPT7F). Design: qa/DESIGN.md. Usage notes: qa/README.md.
+phone-qa: QA for river batches on the Moto G7 test phone (serial ZY225DPT7F,
+fixed in the code). Design: qa/DESIGN.md. Usage notes: qa/README.md.
 
 Usage:
   phone-qa --quick [--wait]            Health checks on the running build (the

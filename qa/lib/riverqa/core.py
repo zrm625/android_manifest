@@ -19,7 +19,10 @@ SCRIPTS_DIR = MANIFEST_DIR / "scripts"
 TOP = MANIFEST_DIR.parents[1]                         # the repo tree
 
 BENCH_HOME = Path(os.environ.get("BENCH_HOME", "/mnt/storage/lineageos-bench"))
-SERIAL = os.environ.get("BENCH_DEVICE", "ZY225DPT7F")
+# The only phone the harness may ever touch. It is not configurable: BENCH_DEVICE
+# may only repeat it (device.Device refuses anything else), and tests reach
+# fake serials only through device.TEST_SERIALS.
+SERIAL = "ZY225DPT7F"
 CODENAME = "river"
 
 

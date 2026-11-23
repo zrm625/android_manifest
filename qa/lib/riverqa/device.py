@@ -32,27 +32,85 @@ class BootStatus:
     host_wall: float
 
 
+# Test seam: unit tests add fake serials here. Nothing else may; the
+# environment cannot widen the set.
+TEST_SERIALS: set[str] = set()
+
+
+def allowed_serial(serial: str) -> str:
+    """The serial, if the harness may touch it: only the test phone."""
+    env = os.environ.get("BENCH_DEVICE")
+    if env and env != SERIAL:
+        raise GuardError(f"BENCH_DEVICE={env} is not the test phone {SERIAL}. Refusing.")
+    if serial != SERIAL and serial not in TEST_SERIALS:
+        raise GuardError(f"serial {serial!r} is not the test phone {SERIAL}. Refusing.")
+    return serial
+
+
+@dataclass
+class Read:
+    """The outcome of one diagnostic read: callers must check ``ok`` before
+    trusting ``out`` (a failed read is UNVERIFIED, never an empty PASS)."""
+    rc: int
+    out: str
+    err: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.rc == 0
+
+
+def _is_reboot(args: tuple) -> bool:
+    return bool(args) and str(args[0]).startswith("reboot")
+
+
 class Device:
     def __init__(self, serial: str = SERIAL):
         if not serial:
             raise GuardError("no serial")
-        self.serial = serial
+        self.serial = allowed_serial(serial)
 
     # --- adb -------------------------------------------------------------
     def adb(self, *args: str, timeout: float = 30, input=None, text=True):
+        if _is_reboot(args):
+            raise GuardError("reboot only through Device.reboot_adb(), which guards first")
+        return self._adb(*args, timeout=timeout, input=input, text=text)
+
+    def _adb(self, *args: str, timeout: float = 30, input=None, text=True):
         return run(["adb", "-s", self.serial, *args], timeout=timeout, input=input, text=text)
 
     def sh(self, cmd: str, timeout: float = 30) -> str:
-        """Run a shell command; return stdout with CRs removed (errors ignored)."""
+        """Run a shell command; return stdout with CRs removed. Errors are
+        ignored: use read() for anything a verdict depends on."""
         return self.adb("shell", cmd, timeout=timeout).stdout.replace("\r", "")
 
     def sh_rc(self, cmd: str, timeout: float = 30) -> tuple[int, str, str]:
         r = self.adb("shell", cmd, timeout=timeout)
         return r.returncode, r.stdout.replace("\r", ""), r.stderr.replace("\r", "")
 
+    def read(self, cmd: str, timeout: float = 30) -> Read:
+        """A diagnostic read that carries its return code and stderr."""
+        rc, out, err = self.sh_rc(cmd, timeout=timeout)
+        return Read(rc, out, err)
+
     def sh_bytes(self, cmd: str, timeout: float = 60) -> bytes:
+        return self.sh_bytes_rc(cmd, timeout=timeout)[1]
+
+    def sh_bytes_rc(self, cmd: str, timeout: float = 60) -> tuple[int, bytes, str]:
         r = run(["adb", "-s", self.serial, "exec-out", cmd], timeout=timeout, text=False)
-        return r.stdout
+        return r.returncode, r.stdout, (r.stderr or b"").decode(errors="replace")
+
+    def reboot_adb(self, target: str | None = None, timeout: float = 30):
+        """``adb reboot [target]``, only after the river guard passes (adb
+        device or recovery mode, ro.product.device and ro.serialno)."""
+        self.reboot_guard()
+        return self._adb(*(["reboot", target] if target else ["reboot"]), timeout=timeout)
+
+    def reboot_guard(self) -> None:
+        st = self.state()
+        if st not in ("device", "recovery"):
+            raise GuardError(f"{self.serial} is not in adb device or recovery mode (state: {st or 'none'})")
+        self._check_identity()
 
     def state(self) -> str:
         try:
@@ -69,6 +127,9 @@ class Device:
         st = self.state()
         if st != "device":
             raise GuardError(f"{self.serial} is not in adb device mode (state: {st or 'none'})")
+        self._check_identity()
+
+    def _check_identity(self) -> None:
         codename = self.getprop("ro.product.device")
         if codename != CODENAME:
             raise GuardError(f"{self.serial} is {codename!r}, not {CODENAME}. Refusing.")
@@ -144,7 +205,21 @@ class Device:
 
     # --- fastboot --------------------------------------------------------
     def fastboot(self, *args: str, timeout: float = 120):
+        if _is_reboot(args):
+            raise GuardError("reboot only through Device.reboot_fastboot(), which guards first")
+        return self._fastboot(*args, timeout=timeout)
+
+    def _fastboot(self, *args: str, timeout: float = 120):
         return run(["fastboot", "-s", self.serial, *args], timeout=timeout)
+
+    def reboot_fastboot(self, target: str | None = None, timeout: float = 60) -> None:
+        """``fastboot reboot [target]``, only after the bootloader reports
+        product river (fastboot_guard)."""
+        self.fastboot_guard()
+        args = ["reboot", target] if target else ["reboot"]
+        r = self._fastboot(*args, timeout=timeout)
+        if r.returncode != 0:
+            raise RuntimeError(f"fastboot {' '.join(args)} failed: {(r.stderr or r.stdout).strip()[-400:]}")
 
     def in_fastboot(self) -> bool:
         try:

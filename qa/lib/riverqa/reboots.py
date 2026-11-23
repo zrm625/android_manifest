@@ -125,21 +125,21 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
         planned = 0
         if path == "adb":
             if inject_extra_pass:
-                dev.adb("reboot", "bootloader", timeout=30)
+                dev.reboot_adb("bootloader")
                 clock = w.wait_gone(start_mark, 120)        # the injected pass begins
                 unmarked_from = w.mark()
                 dev.wait_fastboot(120)
                 planned += 1
                 mark2 = w.mark()
-                dev.fastboot_ok("reboot", timeout=60)
+                dev.reboot_fastboot()
                 w.wait_gone(mark2, 60)
             else:
-                dev.adb("reboot", timeout=30)
+                dev.reboot_adb()
                 clock = w.wait_gone(start_mark, 120)
             after_mark = w.mark()
         else:
             if dev.state() == "device":
-                dev.adb("reboot", "bootloader", timeout=30)
+                dev.reboot_adb("bootloader")
             dev.wait_fastboot(120)
             planned += 1
             if in_fastboot is not None:
@@ -147,17 +147,17 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
                 t_cmd = time.monotonic()  # time the boot, not the image writes
             if inject_extra_pass:
                 mark2 = w.mark()
-                dev.fastboot_ok("reboot", "bootloader", timeout=60)
+                dev.reboot_fastboot("bootloader")
                 clock = w.wait_gone(mark2, 60)               # the injected pass begins
                 unmarked_from = w.mark()
                 dev.wait_fastboot(120)
                 planned += 1
                 mark3 = w.mark()
-                dev.fastboot_ok("reboot", timeout=60)
+                dev.reboot_fastboot()
                 w.wait_gone(mark3, 60)
             else:
                 mark2 = w.mark()
-                dev.fastboot_ok("reboot", timeout=60)
+                dev.reboot_fastboot()
                 clock = w.wait_gone(mark2, 60)               # the final reboot's disconnect
             after_mark = w.mark()
         if inject_extra_pass and not mark_planned:

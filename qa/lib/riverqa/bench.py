@@ -118,7 +118,7 @@ Usage: device-bench <baseline|stripped|current> [--flash] [--wipe] [--boots N] [
 Every boot records its boot_id when it sees boot completed; that boot's
 evidence must carry the same boot_id. Results are appended to
 $BENCH_HOME/results/device.csv (an old header is migrated to the new columns).
-Only the phone with serial $BENCH_DEVICE (default ZY225DPT7F) is touched.
+Only the phone with serial ZY225DPT7F is touched (fixed in the code).
 """
 
 

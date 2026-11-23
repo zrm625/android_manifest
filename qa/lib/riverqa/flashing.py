@@ -89,7 +89,7 @@ def to_fastboot(dev: Device, seconds: float = 180) -> None:
             st = dev.boot_status()
             if st and st.completed:
                 reboots.leave_marker(dev)
-            dev.adb("reboot", "bootloader", timeout=30)
+            dev.reboot_adb("bootloader")
             dev.wait_fastboot(120)
             return
         if d.expired():
@@ -136,7 +136,7 @@ def rollback(dev: Device, st: dict, reason: str, attempt_id: str | None = None) 
     if r.returncode != 0:
         raise Halt(f"rollback: fastboot erase userdata failed: {(r.stderr or r.stdout).strip()[-300:]}")
     seq = journal.record_wipe(qa_home(), attempt_id, "rollback")
-    dev.fastboot_ok("reboot", timeout=60)
+    dev.reboot_fastboot()
     try:
         dev.wait_for_device(FIRST_BOOT_TIMEOUT)
         dev.wait_boot_completed(FIRST_BOOT_TIMEOUT)
@@ -451,8 +451,9 @@ Usage:
 
 The images go to the slot that is not the known-good one (or, before the first
 baseline, the inactive slot), so the running build stays as a fallback. Every
-adb and fastboot wait has a deadline. Only the phone with serial $BENCH_DEVICE
-(default ZY225DPT7F) is touched, and only if it reports itself as river.
+adb and fastboot wait has a deadline. Only the phone with serial ZY225DPT7F is touched (fixed in the code;
+BENCH_DEVICE may only repeat it), and only if it reports itself as river.
+Every reboot command is guarded first.
 
 Exit codes: 0 done, 1 error, 3 halted (needs Zak), 4 boot failed and the phone
 was rescued back to the known-good slot (the batch failed).
