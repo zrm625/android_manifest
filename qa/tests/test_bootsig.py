@@ -254,6 +254,38 @@ class Anchor(unittest.TestCase):
         self.assertEqual(rec.uptime_check[0], FAIL)       # 30 < 45 - 12
 
 
+class CheckedPstoreRead(unittest.TestCase):
+    """The boot judge reads pstore through the checked binary read (R2-4)."""
+
+    def judge(self, files):
+        from fakes import FakeShell
+        dev = FakeShell({}, {r"console-ramoops": files})
+        rec = record()
+        reboots.judge_signals(dev, rec, TIMING)
+        return rec
+
+    def test_good_read_passes(self):
+        rec = self.judge((0, shutdown_log(NORMAL)))
+        self.assertEqual(rec.chain[0], PASS)
+        self.assertEqual(rec.uptime_check[0], PASS)
+
+    def test_failed_or_partial_read_is_unverified(self):
+        log = shutdown_log(NORMAL)
+        import base64
+        cut = f"__FILE__ {len(log) + 100} /sys/fs/pstore/console-ramoops-0\n" + \
+            base64.encodebytes(log).decode() + "__EOF__\n__RC__ 1\n"
+        for files in ((1, log), (0, cut), (0, b"")):
+            rec = self.judge(files)
+            self.assertEqual(rec.chain[0], UNVERIFIED, files[0])
+            self.assertEqual(rec.uptime_check[0], UNVERIFIED)
+            self.assertTrue(rec.pstore_read_error)
+            sig = {"chain": list(rec.chain), "uptime": list(rec.uptime_check), "boot_count": [PASS, "ok"],
+                   "reboot": rec.to_json()}
+            # Even on a path whose chain "doesn't survive", a failed read is UNVERIFIED.
+            self.assertEqual(reboots.combined_verdict(sig, "adb", {"chain": {"adb": {"survives": False}}})[0],
+                             UNVERIFIED)
+
+
 class Pairing(unittest.TestCase):
     class Dev:
         """kmsg() results are taken from ``writes_ok`` in order; dmesg holds

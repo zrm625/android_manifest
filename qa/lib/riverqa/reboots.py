@@ -80,6 +80,7 @@ class BootRecord:
     elapsed_disconnect: float = 0.0
     anchor: dict | None = None
     anchor_note: str = ""
+    pstore_read_error: str = ""         # non-empty: the checked pstore read failed (review round 2)
 
     def to_json(self):
         d = asdict(self)
@@ -264,13 +265,15 @@ def tail_bound(rec: BootRecord, timing: dict) -> tuple[float, float] | None:
 
 def judge_signals(dev: Device, rec: BootRecord, timing: dict | None = None, *, measuring: bool = False) -> None:
     """Fill in the chain and uptime verdicts (reads pstore as root)."""
+    from .evidence import read_pstore
     timing = load_timing() if timing is None else timing
     try:
         dev.root()
-        log = dev.sh_bytes("cat /sys/fs/pstore/console-ramoops* 2>/dev/null", timeout=60)
-    except (TimeoutError, RuntimeError):
-        log = None
-    judge_record(rec, log, timing, measuring=measuring)
+        ok, log, why = read_pstore(dev, "console-ramoops*")
+    except (TimeoutError, RuntimeError) as e:
+        ok, log, why = False, b"", str(e)
+    rec.pstore_read_error = "" if ok else (why or "pstore read failed")
+    judge_record(rec, log if ok else None, timing, measuring=measuring)
 
 
 def judge_record(rec: BootRecord, log: bytes | None, timing: dict, *, measuring: bool = False) -> None:
@@ -283,6 +286,8 @@ def judge_record(rec: BootRecord, log: bytes | None, timing: dict, *, measuring:
     signal is UNVERIFIED; it never falls back to the disconnect.
     ``measuring``: step 1 before any tail is calibrated (no bound)."""
     rec.chain = bootsig.chain_verdict(log, rec.marker)
+    if rec.pstore_read_error:
+        rec.chain = (UNVERIFIED, f"pstore read failed: {rec.pstore_read_error}")
     allowance = allowance_for(rec.path, timing)
     if rec.path != "adb":
         rec.clock_source = "disconnect"
@@ -324,6 +329,12 @@ def combined_verdict(signals: dict, path: str, timing: dict | None = None) -> tu
     """
     timing = load_timing() if timing is None else timing
     states, notes = [], []
+    read_err = (signals.get("reboot") or {}).get("pstore_read_error")
+    if read_err:
+        # A failed pstore read is never the same as a chain that doesn't
+        # survive this path: the whole verdict is UNVERIFIED.
+        states.append(UNVERIFIED)
+        notes.append(f"pstore read failed: {read_err}")
     chain = signals.get("chain") or ["UNVERIFIED", "missing"]
     if chain[0] == UNVERIFIED and chain_survives(path, timing) is False:
         notes.append(f"chain: not used on the {path} path ({chain[1]})")

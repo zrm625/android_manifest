@@ -37,13 +37,22 @@ class FakeShell:
         rc, out, err = self.sh_rc(cmd, timeout)
         return Read(rc, out, err)
 
-    def sh_bytes_rc(self, cmd, timeout=60):
-        self.cmds.append(cmd)
-        rc, out = self._match(self.bytes_replies, cmd, (0, b""))
-        return rc, out, ""
-
-    def sh_bytes(self, cmd, timeout=60):
-        return self.sh_bytes_rc(cmd, timeout)[1]
+    def read_files(self, glob, timeout=60):
+        """Device.read_files through the real parser. ``bytes_replies`` maps a
+        regex (searched in the glob) to (rc, files): files is bytes (one file,
+        none if empty), a list of (path, bytes), or str (the raw remote
+        output, to simulate a cut-off or corrupt transfer)."""
+        import base64
+        from riverqa.device import b64_script, parse_b64_dump
+        self.cmds.append(b64_script(glob))
+        rc, files = self._match(self.bytes_replies, glob, (0, []))
+        if isinstance(files, str):
+            return parse_b64_dump(rc, files)
+        if isinstance(files, bytes):
+            files = [(glob.replace("*", "0"), files)] if files else []
+        text = "".join(f"__FILE__ {len(b)} {p}\n" + base64.encodebytes(b).decode() + "__EOF__\n"
+                       for p, b in files) + f"__RC__ {len(files)}\n"
+        return parse_b64_dump(rc, text)
 
     def boot_id(self):
         return self._boot_id

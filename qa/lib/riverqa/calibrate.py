@@ -50,7 +50,8 @@ def one(dev: Device, w: UsbWatcher, path: str, timing: dict, *, inject=False, ma
         if inject:
             os.environ.pop("RIVERQA_CONTROL", None)
     reboots.judge_signals(dev, rec, timing, measuring=measuring)
-    log_bytes = dev.sh_bytes("cat /sys/fs/pstore/console-ramoops* 2>/dev/null", timeout=60)
+    from .evidence import read_pstore
+    _ok, log_bytes, _why = read_pstore(dev, "console-ramoops*")
     exact = log_bytes.count(rec.marker.encode()) if rec.marker else 0
     fuzzy = bootsig.find_marker(log_bytes, rec.marker) is not None if rec.marker else False
     d = rec.to_json()

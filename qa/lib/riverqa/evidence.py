@@ -116,19 +116,17 @@ def checked_read(dev, kind: str, cmd: str, timeout: float = 60) -> tuple[bool, s
 
 
 def read_pstore(dev, pattern: str = "*") -> tuple[bool, bytes, str]:
-    """(ok, bytes, why) for /sys/fs/pstore/<pattern>. exec-out carries no exit
-    status, so the files are listed first over the shell protocol; a failed
-    listing, a failed transfer or no bytes at all is not a clean read. With
-    pattern "*" an empty pstore is a clean, empty read."""
-    rc, out, err = dev.sh_rc(f"ls /sys/fs/pstore/{pattern}" if pattern != "*" else "ls /sys/fs/pstore")
-    if rc != 0:
-        return False, b"", f"cannot list /sys/fs/pstore/{pattern} (exit {rc}: {err.strip()[-120:]})"
-    if pattern == "*" and not out.split():
-        return True, b"", ""
-    rc2, data, _ = dev.sh_bytes_rc(f"cat /sys/fs/pstore/{pattern} 2>/dev/null", timeout=60)
-    if rc2 != 0 or not data:
-        return False, data, f"reading /sys/fs/pstore/{pattern} failed (adb exit {rc2}, {len(data)} bytes)"
-    return True, data, ""
+    """(ok, bytes, why) for /sys/fs/pstore/<pattern>, through the checked
+    binary read (Device.read_files): a remote failure, a partial read or a
+    failure on any one file is not a clean read (review round 2). With
+    pattern "*" an empty pstore is a clean, empty read; a named pattern
+    that matches nothing is not."""
+    r = dev.read_files(f"/sys/fs/pstore/{pattern}", timeout=60)
+    if not r.ok:
+        return False, r.data, f"reading /sys/fs/pstore/{pattern} failed: {r.why}"
+    if pattern != "*" and not r.files:
+        return False, b"", f"no /sys/fs/pstore/{pattern}"
+    return True, r.data, ""
 
 
 def collect(dev, out: Path, *, expected_boot_id: str, context: dict) -> dict:
@@ -180,6 +178,10 @@ def judge(ev_dir: Path, *, first_boot: bool = False) -> tuple[str, str, dict]:
     captured = meta.get("captured")
     if not isinstance(captured, dict):
         return UNVERIFIED, "evidence has no capture record (collected by an older harness)", meta
+    # The capture record is trusted only for files that are really there.
+    missing = [f for f in CAPTURED_FILES if not (ev_dir / f).is_file()]
+    if missing:
+        return UNVERIFIED, "evidence file missing: " + ", ".join(missing), meta
     bad = [f"{f} ({(captured.get(f) or {}).get('why') or 'not recorded'})" for f in CAPTURED_FILES
            if not (captured.get(f) or {}).get("ok")]
     if bad:

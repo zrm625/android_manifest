@@ -3,7 +3,10 @@ deadline; nothing here ever talks to another device."""
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
+import re
 import shlex
 import threading
 import time
@@ -60,6 +63,66 @@ class Read:
         return self.rc == 0
 
 
+@dataclass
+class FilesRead:
+    """The outcome of Device.read_files: (path, bytes) per file, in glob
+    order. Callers must check ``ok``."""
+    ok: bool
+    files: list
+    why: str = ""
+
+    @property
+    def data(self) -> bytes:
+        return b"".join(b for _p, b in self.files)
+
+
+def b64_script(glob: str) -> str:
+    """The remote side of read_files. ``glob`` is expanded by the shell, so
+    it must be a harness constant, never outside input."""
+    if not re.fullmatch(r"[A-Za-z0-9_./*-]+", glob):
+        raise ValueError(f"unsafe glob {glob!r}")
+    return ('n=0; for f in ' + glob + '; do [ -e "$f" ] || continue; n=$((n+1)); '
+            's=$(stat -c %s "$f") || exit 3; echo "__FILE__ $s $f"; base64 "$f" || exit 4; echo "__EOF__"; '
+            'done; echo "__RC__ $n"')
+
+
+def parse_b64_dump(rc: int, text: str, err: str = "") -> FilesRead:
+    """Parse b64_script's output. Pure."""
+    if rc != 0:
+        return FilesRead(False, [], f"remote exit {rc}: {err.strip()[-200:]}")
+    lines = text.replace("\r", "").split("\n")
+    files, cur, size, chunks = [], None, 0, []
+    for line in lines:
+        if line.startswith("__FILE__ "):
+            if cur is not None:
+                return FilesRead(False, files, f"{cur}: no end sentinel")
+            parts = line.split(" ", 2)
+            if len(parts) != 3 or not parts[1].isdigit():
+                return FilesRead(False, files, f"bad file header {line[:80]!r}")
+            size, cur, chunks = int(parts[1]), parts[2], []
+        elif line == "__EOF__":
+            if cur is None:
+                return FilesRead(False, files, "end sentinel without a file")
+            try:
+                data = base64.b64decode("".join(chunks), validate=True)
+            except (binascii.Error, ValueError) as e:
+                return FilesRead(False, files, f"{cur}: bad base64 ({e})")
+            if len(data) != size:
+                return FilesRead(False, files, f"{cur}: read {len(data)} bytes, stat says {size} (partial read)")
+            files.append((cur, data))
+            cur = None
+        elif line.startswith("__RC__ "):
+            if cur is not None:
+                return FilesRead(False, files, f"{cur}: no end sentinel")
+            n = line.split(" ", 1)[1].strip()
+            if not n.isdigit() or int(n) != len(files):
+                return FilesRead(False, files, f"closing line says {n} files, read {len(files)}")
+            return FilesRead(True, files, "")
+        elif cur is not None:
+            chunks.append(line.strip())
+    return FilesRead(False, files, "no closing line: the read did not finish")
+
+
 def _is_reboot(args: tuple) -> bool:
     return bool(args) and str(args[0]).startswith("reboot")
 
@@ -93,12 +156,18 @@ class Device:
         rc, out, err = self.sh_rc(cmd, timeout=timeout)
         return Read(rc, out, err)
 
-    def sh_bytes(self, cmd: str, timeout: float = 60) -> bytes:
-        return self.sh_bytes_rc(cmd, timeout=timeout)[1]
-
-    def sh_bytes_rc(self, cmd: str, timeout: float = 60) -> tuple[int, bytes, str]:
-        r = run(["adb", "-s", self.serial, "exec-out", cmd], timeout=timeout, text=False)
-        return r.returncode, r.stdout, (r.stderr or b"").decode(errors="replace")
+    def read_files(self, glob: str, timeout: float = 60) -> "FilesRead":
+        """Every file matching ``glob``, read binary-safe (review round 2).
+        ``adb exec-out`` reports 0 even when the remote command failed, so
+        each file goes over the shell protocol as base64 between sentinels,
+        with its size from stat and a closing line that carries the file
+        count. FilesRead.ok is False on any remote failure, a missing
+        sentinel, or a decoded size that differs from stat (a partial read)."""
+        try:
+            rc, out, err = self.sh_rc(b64_script(glob), timeout=timeout)
+        except TimeoutError:
+            return FilesRead(False, [], "timed out")
+        return parse_b64_dump(rc, out, err)
 
     def reboot_adb(self, target: str | None = None, timeout: float = 30):
         """``adb reboot [target]``, only after the river guard passes (adb
@@ -205,9 +274,6 @@ class Device:
         except TimeoutError:
             return False
         return rc == 0
-
-    def read_file_root(self, path: str, timeout: float = 30) -> bytes:
-        return self.sh_bytes(f"cat {shlex.quote(path)}", timeout=timeout)
 
     # --- fastboot --------------------------------------------------------
     def fastboot(self, *args: str, timeout: float = 120):

@@ -52,6 +52,8 @@ class Judge(unittest.TestCase):
         (d / "meta.json").write_text(json.dumps(m))
         (d / "dmesg.txt").write_text(DMESG)
         (d / "crash.txt").write_text("")
+        (d / "dropbox.txt").write_text(DROPBOX_EMPTY)
+        (d / "pstore.bin").write_bytes(b"")
         return d
 
     def test_clean(self):
@@ -108,10 +110,37 @@ class Reads(unittest.TestCase):
         self.assertEqual(st, PASS, msg)
 
     def test_failed_read_is_unverified(self):
-        for key in (r"^logcat -b crash -d$", r"^dmesg$", r"^dumpsys dropbox$", r"^ls /sys/fs/pstore"):
+        for key in (r"^logcat -b crash -d$", r"^dmesg$", r"^dumpsys dropbox$"):
             st, msg, _ = ev.judge(self.collect(self.fake(**{key: (1, "")})))
             self.assertEqual(st, UNVERIFIED, key)
             self.assertIn("not captured cleanly", msg)
+
+    def test_failed_or_partial_pstore_read_is_unverified(self):
+        good = "__FILE__ 11 /sys/fs/pstore/console-ramoops-0\nWyAxLjBdIGxvZwo=\n__EOF__\n"
+        for files in ((1, [("/sys/fs/pstore/console-ramoops-0", b"[ 1.0] log\n")]),   # remote failure
+                      (0, good.replace("__FILE__ 11", "__FILE__ 4096")),             # partial read
+                      (0, good),                                                     # never finished
+                      (0, good + "__RC__ 2\n"),                                      # a file went missing
+                      (0, good.replace("__EOF__\n", "")),                            # cut off mid-file
+                      (0, b"")):                                                     # no console-ramoops
+            dev = self.fake()
+            dev.bytes_replies = [(r"pstore", files)]
+            st, msg, _ = ev.judge(self.collect(dev))
+            self.assertEqual(st, UNVERIFIED, files)
+            self.assertIn("pstore.bin", msg)
+        dev = self.fake()
+        dev.bytes_replies = [(r"pstore", (0, good + "__RC__ 1\n"))]
+        self.assertEqual(ev.judge(self.collect(dev))[0], PASS)
+
+    def test_capture_record_needs_the_files(self):
+        d = self.collect(self.fake())
+        self.assertEqual(ev.judge(d)[0], PASS)
+        for f in ("pstore.bin", "dropbox.txt"):
+            d = self.collect(self.fake())
+            (d / f).unlink()
+            st, msg, _ = ev.judge(d)
+            self.assertEqual(st, UNVERIFIED, f)
+            self.assertIn(f, msg)
 
     def test_stream_that_exits_early_is_unverified(self):
         # dumpsys dropbox cut off before its header; dmesg empty.
@@ -129,13 +158,17 @@ class Reads(unittest.TestCase):
         (d / "crash.txt").write_text("")
         self.assertEqual(ev.judge(d)[0], UNVERIFIED)
 
-    def test_pstore_listing_failure(self):
-        dev = FakeShell({r"^ls /sys/fs/pstore$": (1, "")})
-        self.assertFalse(ev.read_pstore(dev, "*")[0])
-        dev = FakeShell({r"^ls /sys/fs/pstore$": (0, "")})
-        self.assertEqual(ev.read_pstore(dev, "*"), (True, b"", ""))
-        dev = FakeShell({r"^ls /sys/fs/pstore$": (0, "console-ramoops-0\n")}, {r"cat": (0, b"")})
-        self.assertFalse(ev.read_pstore(dev, "*")[0])
+    def test_pstore_read(self):
+        self.assertFalse(ev.read_pstore(FakeShell({}, {r"pstore": (1, [])}), "*")[0])
+        self.assertEqual(ev.read_pstore(FakeShell({}, {r"pstore": (0, [])}), "*"), (True, b"", ""))
+        two = [("/sys/fs/pstore/console-ramoops-0", b"\x00\xffab"), ("/sys/fs/pstore/pmsg-ramoops-0", b"cd")]
+        self.assertEqual(ev.read_pstore(FakeShell({}, {r"pstore": (0, two)}), "*"), (True, b"\x00\xffabcd", ""))
+        self.assertFalse(ev.read_pstore(FakeShell({}, {r"pstore": (0, [])}), "console-ramoops*")[0])
+
+    def test_unsafe_glob_is_refused(self):
+        from riverqa.device import b64_script
+        with self.assertRaises(ValueError):
+            b64_script("/sys/fs/pstore/*; reboot")
 
 
 class FinalHealth(unittest.TestCase):
