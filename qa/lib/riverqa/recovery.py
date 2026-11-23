@@ -16,18 +16,100 @@ use it, never a later edit of ``prs``.
 
 ``gh`` and ``git ls-remote`` are called through ``runner`` so tests can stub
 them. flash --recover and flash --promote use the same lookup, and the same
-decision (slots.decide_recovery). Any error makes the whole lookup fail
-(None): a failed lookup never counts as "none merged".
+decision (slots.decide_recovery).
+
+**Typed lookup** (H11, batch-runner design S-M7). ``lookup`` returns a
+``Lookup(outcome, data, evidence)``:
+
+- ``ok``: ``data`` is the dict below;
+- ``transport``: a timeout, an ``OSError``, no server answer, HTTP 5xx or
+  429, 403 with rate-limit evidence, or a GraphQL rate-limit or server error;
+- ``refused``: ``gh`` or ``git`` reports HTTP 401, 403 without rate-limit
+  evidence, 404 or 422, or another GraphQL error (NOT_FOUND, FORBIDDEN,
+  "Could not resolve to ...");
+- ``malformed``: unparsable JSON, a missing field, or a non-SHA tree.
+
+``evidence`` is ``{"repo", "status", "line"}`` for anything but ``ok``. A
+non-``ok`` lookup never counts as "none merged". ``classify`` is shared with
+the batch runner (qa/lib/riverbatch/github.py).
 """
 
 from __future__ import annotations
 
 import json
+import re
+from typing import NamedTuple
 
 from .core import run
 from .stage import SHA_RE
 
 PR_FIELDS = "number,state,mergedAt,url,mergeCommit,headRefOid,baseRefName"
+
+OK, TRANSPORT, REFUSED, MALFORMED = "ok", "transport", "refused", "malformed"
+AUTH = "auth"      # classify() only: a refusal that is HTTP 401, or 403 without rate-limit evidence
+
+
+class Lookup(NamedTuple):
+    outcome: str
+    data: dict | None
+    evidence: dict | None
+
+
+class Malformed(ValueError):
+    pass
+
+
+_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)|HTTP[/ ](?:\d(?:\.\d)? )?(\d{3})\b|status(?: code)?:? (\d{3})\b", re.I)
+_RATE_RE = re.compile(r"rate.?limit|secondary rate|x-ratelimit-remaining: 0|retry-after|abuse detection", re.I)
+_TRANSPORT_RE = re.compile(r"timed? ?out|timeout|connection (refused|reset)|could not resolve host|"
+                           r"no such host|network is unreachable|temporary failure in name resolution|"
+                           r"tls handshake|unexpected eof|\bEOF\b|i/o timeout|dial tcp|"
+                           r"something went wrong|server error|bad gateway|service unavailable|"
+                           r"the remote end hung up|early eof|rpc failed", re.I)
+_AUTH_RE = re.compile(r"bad credentials|authentication failed|requires authentication|"
+                      r"gh auth login|not logged in|invalid username or password", re.I)
+_GRAPHQL_REFUSED_RE = re.compile(r"GraphQL: .*(could not resolve to|not_found|forbidden|"
+                                 r"must have|does not have|not accessible|unprocessable)", re.I)
+_GIT_REFUSED_RE = re.compile(r"repository not found|\[rejected\]|\[remote rejected\]|"
+                             r"! \[.*\]|permission to .* denied|does not appear to be a git repository|"
+                             r"stale info|protected branch", re.I)
+
+
+def classify(returncode: int | None, stdout: str = "", stderr: str = "") -> tuple[str, int | None, str]:
+    """(class, HTTP status or None, first error line) of a failed ``gh`` or
+    ``git`` call: ``transport``, ``auth`` or ``refused`` (R11.6, H11). A
+    failure with no recognizable server answer is ``transport``."""
+    text = f"{stderr}\n{stdout}"
+    line = next((ln.strip() for ln in (stderr or stdout or "").splitlines() if ln.strip()), "")[:300]
+    m = _STATUS_RE.search(text)
+    status = next((int(g) for g in m.groups() if g), None) if m else None
+    rate = bool(_RATE_RE.search(text))
+    if status is not None:
+        if status >= 500 or status == 429:
+            return TRANSPORT, status, line
+        if status == 403:
+            return (TRANSPORT if rate else AUTH), status, line
+        if status == 401:
+            return AUTH, status, line
+        if 400 <= status < 500:
+            return REFUSED, status, line
+    if rate:
+        return TRANSPORT, status, line
+    if _AUTH_RE.search(text):
+        return AUTH, 401, line
+    if "GraphQL:" in text:
+        if _GRAPHQL_REFUSED_RE.search(text):
+            return REFUSED, status, line
+        return TRANSPORT, status, line
+    if _GIT_REFUSED_RE.search(text) and not _TRANSPORT_RE.search(text):
+        return REFUSED, status, line
+    return TRANSPORT, status, line
+
+
+class _Failed(Exception):
+    def __init__(self, outcome: str, evidence: dict):
+        super().__init__(outcome)
+        self.outcome, self.evidence = outcome, evidence
 
 
 def default_runner(cmd: list[str]):
@@ -50,23 +132,34 @@ def prs_to_look_up(batch: dict) -> list[dict]:
     return list(batch.get("prs") or [])
 
 
-def tree_of(runner, repo: str, commit: str) -> str | None:
-    """The tree hash of ``commit`` in ``repo`` (owner/name), or None."""
-    r = runner(["gh", "api", f"repos/{repo}/git/commits/{commit}", "--jq", ".tree.sha"])
+def _call(runner, cmd: list[str], repo: str):
+    try:
+        r = runner(cmd)
+    except (OSError, TimeoutError) as e:
+        raise _Failed(TRANSPORT, {"repo": repo, "status": None, "line": str(e)[:300]}) from e
     if r.returncode != 0:
-        return None
+        cls, status, line = classify(r.returncode, r.stdout or "", r.stderr or "")
+        raise _Failed(REFUSED if cls == AUTH else cls, {"repo": repo, "status": status, "line": line})
+    return r
+
+
+def tree_of(runner, repo: str, commit: str) -> str:
+    """The tree hash of ``commit`` in ``repo`` (owner/name). Raises _Failed."""
+    r = _call(runner, ["gh", "api", f"repos/{repo}/git/commits/{commit}", "--jq", ".tree.sha"], repo)
     t = r.stdout.strip()
     # Only a real tree hash (review round 4): an error page or a partial
-    # answer with exit 0 is a failed lookup.
-    return t if SHA_RE.match(t) else None
+    # answer with exit 0 is malformed.
+    if not SHA_RE.match(t):
+        raise _Failed(MALFORMED, {"repo": repo, "status": None, "line": f"not a tree hash: {t[:80]!r}"})
+    return t
 
 
-def lookup(batch: dict, runner=None, slugs: dict[str, str] | None = None) -> dict | None:
-    """The batch's merge and tag state, or None if any lookup failed.
+def lookup(batch: dict, runner=None, slugs: dict[str, str] | None = None) -> Lookup:
+    """The batch's merge and tag state, typed (H11).
 
-    {"prs": [{"repo", "number", "url", "merged", "merge_commit", "head", "base"}],
-     "tags": [{"repo", "present", "commit", "tree"}],   # commit: what the tag points at
-     "tested_trees": {"<owner/name>": tree}}            # tree of each tested commit
+    data: {"prs": [{"repo", "number", "url", "state", "merged", "merge_commit", "head", "base"}],
+           "tags": [{"repo", "present", "commit", "tree"}],   # commit: what the tag points at
+           "tested_trees": {"<owner/name>": tree}}            # tree of each tested commit
 
     ``slugs`` maps commit_set paths to owner/name, for the tested trees.
     """
@@ -76,39 +169,39 @@ def lookup(batch: dict, runner=None, slugs: dict[str, str] | None = None) -> dic
     tag = batch.get("tag")
     try:
         for pr in prs_to_look_up(batch):
-            r = runner(["gh", "pr", "view", str(pr["number"]), "--repo", pr["repo"], "--json", PR_FIELDS])
-            if r.returncode != 0:
-                return None
-            data = json.loads(r.stdout)
-            merged = data.get("state") == "MERGED"
+            repo = slug(str(pr.get("repo")))
+            r = _call(runner, ["gh", "pr", "view", str(pr["number"]), "--repo", pr["repo"], "--json", PR_FIELDS],
+                      repo)
+            try:
+                data = json.loads(r.stdout)
+                state = data["state"]
+                if not isinstance(data, dict) or not isinstance(state, str):
+                    raise Malformed("not a PR object")
+            except (ValueError, KeyError, TypeError) as e:
+                raise _Failed(MALFORMED, {"repo": repo, "status": None, "line": f"gh pr view: {e}"[:300]}) from e
+            merged = state == "MERGED"
             commit = (data.get("mergeCommit") or {}).get("oid")
-            prs.append({"repo": slug(pr["repo"]), "number": data.get("number", pr["number"]),
-                        "url": data.get("url"), "merged": merged, "merge_commit": commit if merged else None,
+            prs.append({"repo": repo, "number": data.get("number", pr["number"]),
+                        "url": data.get("url"), "state": state, "merged": merged,
+                        "merge_commit": commit if merged else None,
                         "head": data.get("headRefOid"), "base": data.get("baseRefName")})
         for repo in batch.get("tag_repos") or []:
             if not tag:
-                return None
+                raise _Failed(MALFORMED, {"repo": slug(repo), "status": None, "line": "tag_repos without a tag"})
             ref = f"refs/tags/{tag}"
-            r = runner(["git", "ls-remote", "--tags", repo, ref, ref + "^{}"])
-            if r.returncode != 0:
-                return None
+            r = _call(runner, ["git", "ls-remote", "--tags", repo, ref, ref + "^{}"], slug(repo))
             refs = dict(reversed(line.split("\t", 1)) for line in r.stdout.splitlines() if "\t" in line)
             # An annotated tag's commit is its peeled ref; a lightweight tag's is the ref.
             commit = refs.get(ref + "^{}") or refs.get(ref)
-            tree = None
-            if commit:
-                tree = tree_of(runner, slug(repo), commit)
-                if tree is None:
-                    return None
+            tree = tree_of(runner, slug(repo), commit) if commit else None
             tags.append({"repo": slug(repo), "present": ref in refs, "commit": commit, "tree": tree})
         tagged = {t["repo"] for t in tags if t["commit"]}
         for path, sha in sorted((batch.get("commit_set") or {}).items()):
             s = slugs.get(path)
             if s and s in tagged:
-                tree = tree_of(runner, s, sha)
-                if tree is None:
-                    return None
-                tested[s] = tree
-    except (OSError, ValueError, KeyError, TimeoutError, AttributeError, TypeError):
-        return None
-    return {"prs": prs, "tags": tags, "tested_trees": tested}
+                tested[s] = tree_of(runner, s, sha)
+    except _Failed as f:
+        return Lookup(f.outcome, None, f.evidence)
+    except (ValueError, KeyError, AttributeError, TypeError) as e:
+        return Lookup(MALFORMED, None, {"repo": None, "status": None, "line": str(e)[:300]})
+    return Lookup(OK, {"prs": prs, "tags": tags, "tested_trees": tested}, None)

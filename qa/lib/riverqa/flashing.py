@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -19,7 +21,7 @@ STATE_FILE = "slot-state.json"
 FIRST_BOOT_TIMEOUT = 900
 BOOT_TIMEOUT = 600
 
-EXIT_OK, EXIT_ERROR, EXIT_HALT, EXIT_RESCUED = 0, 1, 3, 4
+EXIT_OK, EXIT_ERROR, EXIT_HALT, EXIT_RESCUED, EXIT_RESUMABLE = 0, 1, 3, 4, 75
 
 
 class Halt(RuntimeError):
@@ -723,7 +725,12 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
         attempt["result"] = f"bootloader fell back to slot {slot_now}; batch failed"
         save_attempt()
         try:
-            attempt["rescue"] = rollback(dev, st, f"bootloader fell back to slot {slot_now}", attempt["attempt_id"])
+            # I3: the same rescue path as a failed boot, so both exit-4 paths
+            # leave the same evidence (a "rescue:" rolled-back event whose wipe
+            # carries this attempt ID).
+            attempt["rescue"] = rescue(dev, st, f"batch {batch_id}: bootloader fell back to slot {slot_now}",
+                                       attempt["attempt_id"])
+            attempt["result"] = "rescued; batch failed"
             save_attempt()
             return EXIT_RESCUED
         except (Halt, Unreachable, GuardError) as h:
@@ -767,6 +774,36 @@ def finish_checkpoint(st: dict) -> bool:
     return True
 
 
+def github_lag(look: dict, batch: dict, runner=None) -> list[str] | None:
+    """Expected PRs that GitHub still reports OPEN at the tested head on
+    river-22.2 although their merge has landed (I4): the repo's tag is
+    present (the runner tags only after it saw the PR MERGED) and the tagged
+    commit is a merge whose parents include the tested head. Returns the
+    lagging PRs, or None if a parent read failed (also a transport case)."""
+    frozen = slots.frozen_pr_set(batch) or {}
+    cs = batch.get("commit_set") or {}
+    want = {(e["repo"], e["number"]): cs.get(path) for path, e in frozen.items() if e.get("number") is not None}
+    tags = {t.get("repo"): t for t in look.get("tags") or []}
+    runner = runner or recovery.default_runner
+    out = []
+    for p in look.get("prs") or []:
+        sha = want.get((p.get("repo"), p.get("number")))
+        t = tags.get(p.get("repo")) or {}
+        if not (sha and p.get("state") == "OPEN" and p.get("head") == sha and p.get("base") == slots.BRANCH
+                and t.get("present") and t.get("commit")):
+            continue
+        try:
+            r = runner(["gh", "api", f"repos/{p['repo']}/git/commits/{t['commit']}", "--jq", "[.parents[].sha]"])
+            parents = json.loads(r.stdout) if r.returncode == 0 else None
+        except (OSError, TimeoutError, ValueError):
+            parents = None
+        if not isinstance(parents, list):
+            return None
+        if len(parents) == 2 and parents[1] == sha:
+            out.append(f"{p['repo']}#{p['number']}")
+    return out
+
+
 def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
     """flash --promote: make a merged and tagged batch's slot known-good.
 
@@ -791,8 +828,29 @@ def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
         return EXIT_ERROR
     slugs = stage.repo_slugs()
     look = recovery.lookup(batch, runner, slugs)
-    decision, why = slots.decide_recovery(pair, look, batch, slugs)
+    # H11: a lookup that could not finish never touches the phone.
+    if look.outcome == recovery.TRANSPORT:
+        log(f"error: lookup failed in transport ({look.evidence}); nothing touched the phone. Run flash --promote "
+            f"{batch_id} again.")
+        return EXIT_RESUMABLE
+    if look.outcome != recovery.OK:
+        log(f"error: lookup {look.outcome} ({look.evidence}); nothing touched the phone.")
+        print(json.dumps({"lookup": look.outcome, "repo": (look.evidence or {}).get("repo"),
+                          "evidence": look.evidence}), flush=True)
+        return EXIT_ERROR
+    decision, why = slots.decide_recovery(pair, look.data, batch, slugs)
     if decision != slots.PROMOTE:
+        lag = github_lag(look.data, batch, runner)
+        if lag is None:
+            log(f"error: {batch_id}: a PR is still reported open and the tag's parents could not be read; "
+                "nothing touched the phone. Run flash --promote again later.")
+            return EXIT_RESUMABLE
+        if lag:
+            # I4: GitHub still reports a PR open whose merge the runner saw
+            # land: a lagging read, retried later, never a halt.
+            log(f"error: {batch_id}: GitHub still reports {', '.join(lag)} open at the tested head; not proven "
+                "yet. Nothing touched the phone; run flash --promote again later.")
+            return EXIT_RESUMABLE
         log(f"error: {batch_id} is not proven merged and tagged ({why}). The fallback slot stays reserved.")
         return EXIT_HALT if decision == slots.HALT else EXIT_ERROR
     dev = dev or Device(SERIAL)
@@ -940,7 +998,11 @@ def recover(runner=None, dev: Device | None = None) -> int:
     pair = st["pair"]
     batch = read_json(batch_dir(pair["batch"]) / "batch.json", {}) or {}
     slugs = stage.repo_slugs() if pair["kind"] == "batch" else {}
-    look = None if pair["kind"] != "batch" else recovery.lookup(batch, runner, slugs)
+    look = None
+    if pair["kind"] == "batch":
+        typed = recovery.lookup(batch, runner, slugs)
+        # Any outcome but ok is today's failed lookup (H11): it halts.
+        look = typed.data if typed.outcome == recovery.OK else None
     decision, why = slots.decide_recovery(pair, look, batch, slugs)
     log(f"Recovery for {pair['batch']} ({pair['kind']}): {decision}: {why}")
     st.setdefault("history", []).append({"event": "recovery-decision", "at": now_iso(),
@@ -962,6 +1024,32 @@ def recover(runner=None, dev: Device | None = None) -> int:
         return EXIT_OK
     except (RuntimeError, TimeoutError) as e:    # R6-1: every failure halts, obligation intact
         return recovery_halt(e)
+
+
+def runner_owned_pair(lock: DeviceLock, zak: bool) -> str | None:
+    """H12: why flash --rollback or --recover must refuse, or None. While
+    slot-state.json holds a pair whose batch is the batch runner's
+    running.id, only the runner may resolve it: RIVER_BATCH_ID names that
+    batch and the device lock was reused through a matching token (the
+    runner's holder holds it, so ``not lock.owned``). ``--zak`` overrides.
+    An unreadable runner state file refuses (fail closed)."""
+    if zak:
+        return None
+    st = load_state()
+    pair = (st or {}).get("pair")
+    if not pair:
+        return None
+    from . import runnerstate
+    try:
+        rid = runnerstate.running_id(bench_path())
+    except runnerstate.Unreadable as e:
+        return f"{e}; the slot pair of {pair['batch']} may belong to a running batch (pass --zak to override)"
+    if rid != pair["batch"]:
+        return None
+    if os.environ.get("RIVER_BATCH_ID") == rid and not lock.owned:
+        return None
+    return (f"the slot pair of {rid} belongs to the running batch {rid}; the batch runner resolves it "
+            "(batch tick), or Zak with --zak")
 
 
 def show_status() -> int:
@@ -1002,6 +1090,10 @@ Usage:
                           The runner runs this before any merge or tag action.
   flash --status          Show slot-state.json.
 
+  --rollback and --recover refuse while the slot pair belongs to the batch the
+  runner is running ($BENCH_HOME/runner/state.json running.id), unless the
+  runner itself calls them (RIVER_BATCH_ID and its lock token), or --zak.
+
   baseline|stripped  Use $BENCH_HOME/out-<env>/target/product/river.
   PRODUCT_DIR        Any directory with boot.img, dtbo.img, system.img and vendor.img.
   --wipe       Factory reset (fastboot erase userdata; river's bootloader rejects -w).
@@ -1041,6 +1133,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--promote")
     ap.add_argument("--merge-started")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--zak", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args(argv)
     if a.help:
@@ -1051,7 +1144,7 @@ def main(argv: list[str]) -> int:
     try:
         # --merge-started and --promote time nothing, so they may run while a
         # build holds the build lock (R6-5).
-        with DeviceLock(check_build=not (a.merge_started or a.promote)):
+        with DeviceLock(check_build=not (a.merge_started or a.promote)) as lock:
             # Slot recovery dispatches first (R5-1): --rollback and --recover
             # handle fb_mode themselves, in fastboot, on the way to the slot
             # they pick, and never boot the active slot (it may be the failed
@@ -1065,6 +1158,11 @@ def main(argv: list[str]) -> int:
                 if st and st.get("pair"):
                     log(f"error: batch {st['pair']['batch']} holds an unresolved slot pair; resolve it first "
                         "(flash --recover)")
+                    return EXIT_ERROR
+            if a.rollback or a.recover:
+                why = runner_owned_pair(lock, a.zak)
+                if why:
+                    log(f"error: {why}")
                     return EXIT_ERROR
             if a.rollback:
                 st = load_state()

@@ -27,8 +27,10 @@
 #              is what phone-qa stage requires of a batch. Refuses a dirty tree.
 #
 # Output goes to $BENCH_HOME/out-<tree>/, which is what scripts/flash installs.
-# A successful build also writes out-<tree>/river-build.json: the build ID and
-# the commit set (each fork's HEAD and the manifest's) it was built from.
+# A successful build also writes out-<tree>/river-build.json: the build ID,
+# the commit set (each fork's HEAD and the manifest's) it was built from, and
+# the build image ID (H1). river-build.json and .bench-result are deleted right
+# after the build lock is taken, so a killed build leaves neither behind.
 # For timing measurements, use scripts/bench/bench instead: it builds cold in a
 # separate directory and never touches this output.
 set -euo pipefail
@@ -81,12 +83,15 @@ fi
 export RIVER_BUILD_ID=$build_id
 
 acquire_build_lock
+out=$BENCH_HOME/out-$env_name
+# H1: a killed build must leave nothing a reader could trust: the previous
+# build's record and result go before anything else.
+rm -f "$out/river-build.json" "$out/.bench-result"
 # Lowest CPU priority: the build and every compiler it starts yield to
 # anything interactive, but still use idle cores. (bench does not do this, so
 # its timings are not affected by the desktop.)
 renice -n 19 $$ >/dev/null
 ensure_image
-out=$BENCH_HOME/out-$env_name
 mkdir -p "$out" "$BENCH_HOME/logs"
 if [[ "$clean" == 1 ]]; then
   echo "Deleting $out"
@@ -102,11 +107,12 @@ echo
 if [[ "$rc" == 0 ]]; then
   python3 -I -c '
 import json, sys
-build_id, commit_hash, commits, out = sys.argv[1:5]
+build_id, commit_hash, commits, image_id, out = sys.argv[1:6]
 rows = [l.split(" ", 1) for l in commits.splitlines() if l.strip()]
-json.dump({"build_id": build_id, "commit_set_hash": commit_hash,
-           "commit_set": {p: s for p, s in rows}}, open(out, "w"), indent=2)
-' "$build_id" "$commit_hash" "$commits" "$out/river-build.json"
+with open(out, "w") as f:
+    json.dump({"build_id": build_id, "commit_set_hash": commit_hash,
+               "commit_set": {p: s for p, s in rows}, "image_id": image_id}, f, indent=2)
+' "$build_id" "$commit_hash" "$commits" "$IMAGE" "$out/river-build.json"
   echo "Built $build_id in ${wall}s. Install with: scripts/flash $env_name"
 else
   echo "Build failed (exit $rc). Log: $log"

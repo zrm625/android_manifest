@@ -155,7 +155,7 @@ NONE = {"a": False, "b": False, "c": False}
 class Recovery(unittest.TestCase):
     def decide(self, merged, tags, kind="batch", fail=None, batch=None, **kw):
         batch = batch or BATCH
-        look = recovery.lookup(batch, stub_runner(merged, tags, fail, **kw), SLUGS)
+        look = recovery.lookup(batch, stub_runner(merged, tags, fail, **kw), SLUGS).data
         return slots.decide_recovery({"kind": kind, "batch": "b"}, look, batch, SLUGS)[0]
 
     def test_all_merged_and_tagged_promotes(self):
@@ -209,7 +209,7 @@ class Recovery(unittest.TestCase):
         # changed record halts.
         dropped = dict(BATCH, prs=[{"repo": "zrm625/a", "number": 0}], no_pr=["b", "c"])
         self.assertEqual(self.decide([True, True], ALL, batch=dropped), slots.HALT)
-        look = recovery.lookup(dropped, stub_runner([True, True], ALL), SLUGS)
+        look = recovery.lookup(dropped, stub_runner([True, True], ALL), SLUGS).data
         self.assertEqual(sorted(p["repo"] for p in look["prs"]), ["zrm625/a", "zrm625/b"])
         errs = slots.commit_set_proof(dropped, look, SLUGS)
         self.assertTrue(any("changed after merge_started" in e for e in errs), errs)
@@ -222,17 +222,19 @@ class Recovery(unittest.TestCase):
         hash is a failed lookup, never a tree."""
         for out in ("T\n", "", "<html>rate limited</html>\n", "1" * 39 + "\n", "1" * 40 + "x\n"):
             r = lambda cmd, out=out: subprocess.CompletedProcess(cmd, 0, out, "")
-            self.assertIsNone(recovery.tree_of(r, "zrm625/a", "a" * 40), out)
+            with self.assertRaises(recovery._Failed) as cm:
+                recovery.tree_of(r, "zrm625/a", "a" * 40)
+            self.assertEqual(cm.exception.outcome, recovery.MALFORMED, out)
         ok = lambda cmd: subprocess.CompletedProcess(cmd, 0, "1" * 40 + "\n", "")
         self.assertEqual(recovery.tree_of(ok, "zrm625/a", "a" * 40), "1" * 40)
         look = recovery.lookup(BATCH, stub_runner([True, True], ALL, trees={"m1": "T"}), SLUGS)
-        self.assertIsNone(look)
+        self.assertEqual((look.outcome, look.data), (recovery.MALFORMED, None))
 
     def test_tagged_tree_must_be_the_tested_tree(self):
         # b's PR was merged into a river-22.2 that had moved on: the merge
         # commit's tree holds content that was never tested.
         self.assertEqual(self.decide([True, True], ALL, trees={"m1": TREE2}), slots.HALT)
-        look = recovery.lookup(BATCH, stub_runner([True, True], ALL, trees={"m1": TREE2}), SLUGS)
+        look = recovery.lookup(BATCH, stub_runner([True, True], ALL, trees={"m1": TREE2}), SLUGS).data
         errs = slots.commit_set_proof(BATCH, look, SLUGS)
         self.assertTrue(any("tested tree" in e for e in errs), errs)
 
@@ -241,7 +243,7 @@ class Recovery(unittest.TestCase):
             if cmd[:2] == ["gh", "api"]:
                 return subprocess.CompletedProcess(cmd, 1, "", "rate limited")
             return inner(cmd)
-        self.assertIsNone(recovery.lookup(BATCH, run, SLUGS))
+        self.assertEqual(recovery.lookup(BATCH, run, SLUGS).outcome, recovery.TRANSPORT)
 
     def test_expected_pr_set(self):
         exp, errs = slots.expected_pr_set(UNSTARTED, SLUGS)
@@ -274,16 +276,16 @@ class MergeStarted(unittest.TestCase):
         self.assertEqual(self.decide(self.EMPTY, merge_started={"at": "t"}), slots.HALT)
 
     def test_nothing_merged_with_marker_halts(self):
-        look = recovery.lookup(UNSTARTED, stub_runner([False, False], NONE), SLUGS)
+        look = recovery.lookup(UNSTARTED, stub_runner([False, False], NONE), SLUGS).data
         self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, UNSTARTED, SLUGS)[0], slots.ROLLBACK)
         self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, BATCH, SLUGS)[0], slots.HALT)
 
     def test_partial_with_marker_halts(self):
-        look = recovery.lookup(BATCH, stub_runner([True, False], NONE), SLUGS)
+        look = recovery.lookup(BATCH, stub_runner([True, False], NONE), SLUGS).data
         self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, BATCH, SLUGS)[0], slots.HALT)
 
     def test_complete_with_marker_promotes(self):
-        look = recovery.lookup(BATCH, stub_runner([True, True], ALL), SLUGS)
+        look = recovery.lookup(BATCH, stub_runner([True, True], ALL), SLUGS).data
         self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, BATCH, SLUGS)[0], slots.PROMOTE)
 
 
