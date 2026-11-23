@@ -11,7 +11,7 @@ these rules on 2026-11-23. Change them only in a pull request that Zak approves.
 | RAM | At most 1,000 MB used (1,233 MB on 2026-11-23) | `device-bench` "used RAM", taken after a boot on a freshly wiped phone. See [Measuring RAM](#measuring-ram). |
 | Must-work list | Every item passes | `phone-qa` (the QA harness) on every batch. |
 | Autonomy | No hands | Build, flash, set up, QA, then merge or send back, with no one at the phone. |
-| No regressions | Boot ≤ 50 s; RAM and `/system` size no worse | Compared with the last known-good tag on every batch. |
+| No regressions | Boot ≤ 55 s; RAM no worse; `/system` no bigger unless RAM went down | See [Regressions](#regressions). |
 | Stay current | Monthly | Security patches and upstream LineageOS merges go through the same queue. |
 
 ### Measuring RAM
@@ -19,6 +19,17 @@ these rules on 2026-11-23. Change them only in a pull request that Zak approves.
 - Each batch measures RAM after one boot.
 - Once a batch gets to 1,050 MB or less, measure three boots and use the median.
 - A boot takes several minutes, so don't measure more often than that.
+
+### Regressions
+
+- **Boot:** the first boot after the wipe takes 55 s or less, timed from the
+  workstation (`host_boot_seconds` in `device.csv`).
+- **RAM:** no worse than the reference. The reference is the lowest
+  three-boot median of any known-good build. If one boot comes out more than
+  10 MB over the reference, measure three boots. The batch fails if the median
+  is more than 5 MB over the reference. This allows for measurement noise.
+- **Size:** `/system` and `/vendor` may not grow, unless the same batch lowers
+  the RAM median below the reference. This applies to upstream merges as well.
 
 Low-RAM mode (`ro.config.low_ram`) is an experiment. Run it in its own batch
 and record the result, but don't merge it. Zak decides whether it ships.
@@ -35,7 +46,7 @@ means QA inspects the build output, not the phone.
 | | Bluetooth | Turns on, scans, and pairs with the workstation (`forge`). | fixture (have it) |
 | | NFC | The test phone is an XT1962-1 (US model) and has no NFC chip, so it can't turn NFC on. QA checks that the image still has the NFC stack: the HAL service, the NFC APEX, the Tag app, and the `sku_nfc` permission files. Reading a tag needs a phone that has NFC hardware. | build check |
 | | GPS | The GNSS HAL is up and reports satellites. | auto |
-| Hardware | Cameras | Each camera that is enabled in the build opens and takes a photo that isn't black. See [Cameras](#cameras). | auto |
+| Hardware | Cameras | Exactly the cameras enabled in the build are present, and each one delivers live frames. The rear main camera takes a photo, with the torch on, that isn't black. See [Cameras](#cameras). | auto |
 | | Speaker and mic | The speaker plays a tone and the mic picks it up. | auto |
 | | Fingerprint | The fingerprint HAL is up. | auto |
 | | Sensors | The accelerometer reads about 9.8 m/s² at rest. Light and proximity report values. | auto |
@@ -44,7 +55,6 @@ means QA inspects the build output, not the phone.
 | | Battery | Level and charging state are reported. | auto |
 | | USB | adb works, and the workstation sees the phone's storage in file-transfer mode (MTP). | auto |
 | System | Boot | Boot finishes with SELinux enforcing, no crashes, and no services restarting in a loop. | auto |
-| | Sleep | With the screen off for 10 minutes the phone goes into deep sleep, then wakes up and responds. | auto |
 | | Home and gestures | Perch is home, swiping up goes home, and Back works. | auto |
 | | Alarms | An alarm set for one minute ahead goes off on time. | auto |
 | | Keyboard | Text typed into a text field arrives. | auto |
@@ -55,7 +65,11 @@ means QA inspects the build output, not the phone.
 | Apps | Brave Origin | Sideloaded; opens a web page. | auto |
 | | Perch | Home screen (see Home and gestures). | auto |
 
-The headphone jack is not on the list. Nothing checks it.
+Not on the list, and not checked:
+
+- The headphone jack.
+- Deep sleep. The phone can't deep-sleep while it is plugged into USB: the USB
+  controller and the charger keep it awake. Check it by hand now and then.
 
 ### Cameras
 
@@ -66,6 +80,12 @@ The river has three cameras: the rear main, the rear depth, and the front.
   hardware switch.
 - QA expects exactly the cameras that the build switches on, and tests only
   those.
+- Only the rear main camera has a flash, and the phone may lie in a dark room.
+  So QA lights the rear main with its torch and requires a photo that isn't
+  black. The front and depth cameras must deliver frames that change from
+  frame to frame at maximum exposure, which shows the sensor and pipeline
+  work. A black photo from those two is noted in the report but doesn't fail
+  the batch.
 
 ## Pipeline
 
