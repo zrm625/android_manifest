@@ -186,10 +186,9 @@ def _sysrq_read_only(cmd: str, depth: int = 0) -> bool:
     - ``ls``, ``stat``, ``cat`` or ``grep`` with any options and operands
       (none of them can write a file without a redirection);
     - ``test -e PATH`` or ``[ -e PATH ]``;
-    - ``cp [options] SRC... DEST`` (or ``cp -t DIR SRC...``) where every
-      mention of sysrq-trigger is a source equal to /proc/sysrq-trigger,
-      and the destination neither mentions it nor may be /proc (``proc``,
-      ``.``, ``..``);
+    - exactly ``cp /proc/sysrq-trigger DEST`` with no options (R8-5),
+      where DEST neither mentions sysrq-trigger nor may be /proc
+      (``proc``, ``.``, ``..``, ``/``);
     - ``su [user] -c CMD`` with CMD one of the above.
 
     Everything else that mentions sysrq-trigger is refused, including
@@ -220,34 +219,14 @@ def _sysrq_read_only(cmd: str, depth: int = 0) -> bool:
         return True
     if name != "cp":
         return False
-    operands, target_dir, it = [], None, iter(argv[1:])
-    for tok in it:
-        if tok == "--":
-            operands.extend(it)
-            break
-        if tok in ("-t", "--target-directory"):
-            target_dir = next(it, None)
-            if target_dir is None:
-                return False
-        elif tok.startswith("--target-directory="):
-            target_dir = tok.split("=", 1)[1]
-        elif tok.startswith("-t") and len(tok) > 2:
-            target_dir = tok[2:]
-        elif tok.startswith("-") and tok != "-":
-            if "sysrq-trigger" in tok:
-                return False
-        else:
-            operands.append(tok)
-    if target_dir is None:
-        if len(operands) < 2:
-            return False
-        dest, sources = operands[-1], operands[:-1]
-    else:
-        dest, sources = target_dir, operands
-    tail = Path(dest.rstrip("/") or "/").name
-    if "sysrq-trigger" in dest or tail in ("proc", ".", "..", ""):
+    # R8-5: exactly `cp /proc/sysrq-trigger DEST`, no options at all (no
+    # -t cluster, no Toybox -s symlink), DEST free of the trigger and not
+    # /proc, ., .. or /.
+    if len(argv) != 3 or argv[1] != TRIGGER:
         return False
-    return all(src == TRIGGER for src in sources if "sysrq-trigger" in src)
+    dest = argv[2]
+    tail = Path(dest.rstrip("/") or "/").name
+    return not (dest.startswith("-") or "sysrq-trigger" in dest or tail in ("proc", ".", "..", ""))
 
 
 def _is_sysrq(args: tuple) -> bool:

@@ -115,9 +115,8 @@ class RebootGuard(unittest.TestCase):
         allowed (the control); one onto the trigger, into /proc, or with a
         trigger-named source other than /proc/sysrq-trigger is refused."""
         fake = FakeRun()
-        allowed = ("cp /proc/sysrq-trigger /data/local/tmp/x", "cp -p /proc/sysrq-trigger /sdcard/",
-                   "su -c 'cp /proc/sysrq-trigger /tmp/x'", "su root -c 'cp /proc/sysrq-trigger /tmp/x'",
-                   "cp -t /tmp /proc/sysrq-trigger")
+        allowed = ("cp /proc/sysrq-trigger /data/local/tmp/x", "cp /proc/sysrq-trigger /sdcard/",
+                   "su -c 'cp /proc/sysrq-trigger /tmp/x'", "su root -c 'cp /proc/sysrq-trigger /tmp/x'")
         refused = ("cp /data/local/tmp/b /proc/sysrq-trigger", "install -m 200 b /proc/sysrq-trigger",
                    "su -c 'cp /tmp/b /proc/sysrq-trigger'", "cp /tmp/sysrq-trigger /proc",
                    "cp /tmp/sysrq-trigger /proc/", "cp -t /proc /tmp/sysrq-trigger",
@@ -131,6 +130,22 @@ class RebootGuard(unittest.TestCase):
                 with self.assertRaises(GuardError, msg=cmd):
                     Device().sh(cmd)
         self.assertEqual(len(fake.cmds), len(allowed), fake.cmds)
+
+    def test_copy_takes_no_options(self):
+        """R8-5: only the option-free `cp /proc/sysrq-trigger DEST`. A -t
+        inside a short-option cluster (-pt, -rt) and Toybox's -s (a symlink
+        to the trigger) were judged as plain options before."""
+        fake = FakeRun()
+        refused = ("cp -pt /proc /tmp/sysrq-trigger", "cp -rt/proc /tmp/sysrq-trigger",
+                   "cp -s /proc/sysrq-trigger /data/local/tmp/t", "cp -p /proc/sysrq-trigger /sdcard/",
+                   "cp -t /tmp /proc/sysrq-trigger", "cp -- /proc/sysrq-trigger /tmp/x",
+                   "cp /proc/sysrq-trigger /proc/sysrq-trigger /tmp", "cp /proc/sysrq-trigger -t",
+                   "su -c 'cp -pt /proc /tmp/sysrq-trigger'")
+        with mock.patch.object(device, "run", fake):
+            for cmd in refused:
+                with self.assertRaises(GuardError, msg=cmd):
+                    Device().sh(cmd)
+        self.assertEqual(fake.cmds, [])
 
     def test_sysrq_guard_fails_closed(self):
         """R7-4, R7-9: trailing shell syntax after a copy onto the trigger,
