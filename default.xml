@@ -271,7 +271,10 @@
   <project name="LineageOS/android_packages_apps_Twelve" path="packages/apps/Twelve" revision="d9643f4bf17bbb8661a7dd4c747bcd192a8b3c6c" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2"/>
   <project name="LineageOS/android_packages_apps_Updater" path="packages/apps/Updater" revision="150bb6724143833f2c6351f075e54b995429a7f7" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2"/>
   <project name="LineageOS/android_packages_apps_WallpaperPicker2" path="packages/apps/WallpaperPicker2" revision="578cddd56b419e12a6cb300bb23e834d4f7f4e4f" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk-fs,sysui-studio"/>
-  <project name="LineageOS/android_packages_inputmethods_LatinIME" path="packages/inputmethods/LatinIME" revision="ee832c1131fadaca239fb6d01f3391f894a8db6c" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk-fs"/>
+  <project name="android_packages_inputmethods_LatinIME" path="packages/inputmethods/LatinIME" remote="zrm625" revision="refs/heads/river-22.2" dest-branch="refs/heads/river-22.2" groups="pdk-fs,zrm625-fork">
+    <annotation name="UPSTREAM_REPO" value="LineageOS/android_packages_inputmethods_LatinIME"/>
+    <annotation name="UPSTREAM_BRANCH" value="lineage-22.2"/>
+  </project>
   <project name="LineageOS/android_packages_inputmethods_LeanbackIME" path="packages/inputmethods/LeanbackIME" revision="6a6b251251fae081488121016de2f3d01116f2b4" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk-fs"/>
   <project name="LineageOS/android_packages_modules_Bluetooth" path="packages/modules/Bluetooth" revision="1051eabce0d2fbf9fc8055fc9e4a91c22cc2d372" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk"/>
   <project name="LineageOS/android_packages_modules_CellBroadcastService" path="packages/modules/CellBroadcastService" revision="ea7970becc8bc3431505852923942a802378a338" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk"/>
