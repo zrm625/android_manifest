@@ -1800,3 +1800,82 @@ wipe).**
   before.
 - `phone-qa --quick --wait` passed (7 passed) on slot a,
   `known_good_slot` a, no pair, journal empty.
+
+## Code review round 7: changes to R6
+
+Status: specified 2026-11-23 from the round-7 code review of `62f73de`.
+Everything in round 6 stands except as changed here. Where this section and
+an earlier one disagree, this one wins.
+
+**The rule for every recovery path.** No journal obligation is resolved,
+and no pair is released or settled, until the booted phone has passed the
+guard, the slot check and the build check. A mismatch or a failed read
+halts (exit 3) with the obligation and the pair intact and the phone not
+wiped. Inputs are checked, and a reserved pair refused, before anything
+changes on the phone.
+
+**R7-1. Verify before settling.** After a boot, `fbmode.recover` checks
+that the phone passes the adb guard and runs the slot it meant to boot (the
+named `slot`, or the slot fastboot reported active), then runs the caller's
+`verify` (its build check). Only then is the obligation resolved. fastboot
+can report a slot active that the bootloader then falls back from; that now
+raises.
+- `--promote` (and `--recover`'s promote path) pass the candidate check:
+  the guard, the candidate slot, and both build IDs equal to `batch.json`.
+- The `flash --batch` preflight passes `verify_slot_build` against the
+  known-good record (build ID, or boot hash for a provisional one).
+- With no pair, a dev slot active and a clear that succeeded, `flash
+  --recover` boots nothing and now leaves the obligation pending.
+  `flash --rollback` resolves it after verifying `known_good_slot`.
+- `recover(boot=False)` still resolves the obligation right after a
+  successful clear. Only a dev flash uses it; that flash writes and boots
+  its slot at once, so nothing is left for a later recovery to boot. This
+  is the one deliberate exception.
+
+**R7-2. Advice that fits the path.** `fbmode.WrongSlot` carries no advice;
+each caller gives its own. A promotion halt (`promote_halt`) says the pair
+stays reserved, never to run `flash --rollback` (it wipes and releases the
+pair of a merged batch), and that Zak brings the phone back to the
+candidate. The batch preflight, which has no pair, points at `flash
+--rollback`. The no-pair dev-slot halt no longer suggests `flash --recover`
+(Opus minor 2). `Halt` can carry its own advice, which replaces
+`recovery_halt`'s generic note.
+
+**R7-3. Check, then touch.** `flash_dev` and `flash_batch` run fb_mode
+recovery only after their image checks and the pair check, and `flash`'s
+`main` no longer runs it before dispatching. `device-bench --flash` leaves
+it to `flash_dev`. A refused flash, including `device-bench --flash` with a
+reserved pair, leaves the phone where it was and the obligation pending.
+
+**R7-4. The sysrq guard is an allowlist.** The round-5 and round-6 parsers
+are gone. An adb call that mentions `sysrq-trigger` is refused unless it is
+`adb shell` (or `exec-out`) and its command
+- contains no shell syntax at all: none of `< > | & ; # $ ( ) { } * ? ~ !`,
+  backtick, backslash or newline;
+- splits with `shlex`; and
+- is `ls`, `stat`, `cat` or `grep` with any operands, `test -e PATH`,
+  `[ -e PATH ]`, or `cp` whose every mention of the trigger is the source
+  `/proc/sysrq-trigger` and whose destination neither mentions it nor may
+  be `/proc` (`proc`, `.`, `..`), optionally under `su [user] -c`.
+
+`ln`, `mv`, `install`, `dd`, `tee`, `sh -c`, `busybox`/`toybox` and every
+other command that mentions the trigger are refused. `stat
+/mnt/cp/sysrq-trigger` is allowed (Opus minor 4). Indirect targets stay out
+of scope (round 6).
+
+**Smaller changes.**
+- **R7-5.** A failed rescue in `flash --batch` (and its fallback-slot
+  rollback, and `device-bench`'s rescue) goes through `recovery_halt`, so it
+  prints the `error:` line and the obligation note.
+- **R7-6.** `allowance_for` gives no A for a record whose `rules_version`
+  is not `CALIBRATION_RULES`, or that has any A-setting sample without the
+  current stamp; the uptime gate is then UNVERIFIED. `prove` judges its
+  fresh reboots as current-rules data.
+- **R7-7.** README says what to do when `flash --batch` halts on a dev slot,
+  and that a promotion halt must never be answered with `flash --rollback`.
+- **R7-8.** `--promote` with the phone already in Android on the wrong slot
+  or build halts (exit 3) with the pair open; it used to exit 1.
+- **R7-9.** Covered by the R7-4 allowlist: `(cp /tmp/sysrq-trigger /proc)`,
+  a trailing `2>/dev/null` or `# comment` are refused.
+- **R7-10.** `reuse_problems` refuses an empty `build_date_utc` on either
+  side, even when both are empty.

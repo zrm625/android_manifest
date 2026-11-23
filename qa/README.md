@@ -102,9 +102,12 @@ The steps run in this order (DESIGN.md, "Calibration and bootstrap"):
    injected extra pass sets `fastboot oem fb_mode_set` for one boot and
    clears it again. Changing `boot-timing.json` changes the harness
    version. `--reuse-normals` reuses the stored normal reboots only if
-   they come from this build and every one carries the current
-   calibration-rules stamp (`rules_version` 3, full-precision brackets);
-   otherwise it says why and measures fresh ones.
+   they come from this build (a build date on both sides; an empty one
+   never matches) and every one carries the current calibration-rules
+   stamp (`rules_version` 3, full-precision brackets); otherwise it says
+   why and measures fresh ones. A `boot-timing.json` written under other
+   rules, or with any unstamped sample that sets A, gives no A at all: the
+   uptime gate is UNVERIFIED until `phone-qa boot-timing` runs again.
 2. The baseline: build `river-22.2` HEAD with `scripts/build`, then:
 
    ```sh
@@ -260,12 +263,20 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   active slot; `phone-qa recover` does only that. A full `phone-qa` run that
   had to do this stops with `preflight.journal` FAIL, because the phone
   rebooted outside the plan. The obligation is resolved only once Android
-  booted, so a run killed in between leaves it for the next one.
+  booted and passed the guard and a check that it runs the slot fastboot
+  booted (a bootloader that fell back to the other slot keeps it pending);
+  `flash --batch` and `flash --promote` also check the build ID first. A
+  run killed in between, or a failed check, leaves it for the next one.
   `flash --rollback`, `flash --recover` and rescue never boot the active
   slot (it may be the failed candidate): in fastboot they clear fb_mode, set
   the fallback active, then reboot, and resolve the obligation once the
   fallback is verified. A dev flash (also `device-bench --flash`) clears it
-  and stays in fastboot. If the clear fails with an obligation pending,
+  and stays in fastboot, but only after it has checked its images and that
+  no slot pair is reserved: a refused flash never touches the phone. With
+  no pair and a dev slot active, `flash --recover` clears fb_mode, leaves
+  the phone in fastboot and the obligation pending, and says to run
+  `flash --rollback`, which resolves it once `known_good_slot` is verified.
+  If the clear fails with an obligation pending,
   rollback still sets the fallback active, then halts (exit 3). Any other
   failure of `flash --recover`, `--rollback` or rescue on the phone (a
   fastboot error, a timeout, a guard failure) also halts with exit 3 and an
@@ -273,6 +284,27 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
 - **The phone found in fastboot.** `flash --batch` boots `known_good_slot`
   from fastboot, and `flash --promote` the candidate slot; if fastboot
   reports another slot active they halt (exit 3) instead of booting it.
+  - `flash --batch` halts like this when a dev flash left its slot active.
+    No pair is reserved then, so run `flash --rollback` (it sets
+    `known_good_slot` active, wipes userdata and verifies the slot and
+    build), then `phone-setup`, then `flash --batch` again. It also halts
+    if `known_good_slot` boots but the bootloader fell back to the other
+    slot, or its build ID or boot hash differs from the known-good record:
+    that needs Zak.
+  - `flash --promote` (and `flash --recover` when it decides to promote)
+    halts on any mismatch: the fallback active in fastboot, a bootloader
+    fallback, the phone in Android on the wrong slot, or a build ID other
+    than the batch's. The batch is already merged and tagged, so the pair
+    stays reserved. **Never run `flash --rollback` here**: it wipes
+    userdata and releases the pair. Zak brings the phone back to the
+    candidate slot, then runs `flash --promote <id>` again.
+- **The sysrq guard is an allowlist.** An adb command that mentions
+  `sysrq-trigger` is refused unless it is `adb shell` with no shell syntax
+  at all (no redirection, `;`, `&`, `|`, `#`, backtick, `$`, subshell,
+  glob or `~`) and is `ls`, `stat`, `cat` or `grep`, `test -e PATH`,
+  `[ -e PATH ]`, or a `cp` whose only mention of the trigger is
+  `/proc/sysrq-trigger` as a source (optionally under `su -c`). Only
+  `reboot_sysrq` writes the trigger.
 - **No device job during a build.** `flash`, `device-bench`, `phone-qa` and
   calibration refuse to start while a build holds `$BENCH_HOME/.lock`: a
   build eats the timing brackets' headroom. `flash --merge-started` and
