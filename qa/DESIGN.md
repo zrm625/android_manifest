@@ -1022,3 +1022,14 @@ tail, otherwise UNVERIFIED; the silent tail) and these:
   empty pstore, because the directory was proven readable first). The glob
   is expanded once, and a listed file that vanishes before it is read fails
   the read; it is never skipped.
+- **A8 gestures, exact package.** The overview proxy's recents component
+  and quickstep intent are parsed, and the package must be exactly
+  `app.zak.perch`; `app.zak.perch.fake` is rejected.
+- **A9 alarm, firing time.** The firing time lies after the last absent
+  sample started and no later than the end of the first firing sample.
+  With the notification's recorded post time (`postTime`, or
+  `mCreationTimeMs`, which the system sets from it; never the app-chosen
+  `when`), that time must fall in target ± 10 s and inside its own
+  observation bounds. Without one, PASS needs the whole interval inside
+  target ± 10 s; an interval that spans either boundary is UNVERIFIED.
+  Absent at −15 s and then a firing poll from −11 s to −9 s is not a PASS.

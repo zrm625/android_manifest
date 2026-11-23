@@ -9,7 +9,7 @@ from pathlib import Path
 
 import _path  # noqa: F401
 from riverqa import features as F
-from riverqa.results import FAIL, PASS
+from riverqa.results import FAIL, PASS, UNVERIFIED
 
 BATCH = {"prs": [{"repo": "zrm625/android_device_motorola_river", "number": 12}]}
 URL = "https://github.com/zrm625/android_device_motorola_river/pull/12#issuecomment-555"
@@ -81,6 +81,14 @@ class Gestures(unittest.TestCase):
         self.assertFalse(F.overview_proxy_bound("app.zak.perch isConnected=true mBound=true"))
         self.assertFalse(F.overview_proxy_bound(proxy_dump(connected="trueish")))
 
+    def test_exact_package_only(self):
+        # Review round 3: a package that merely starts with app.zak.perch is
+        # not Perch.
+        self.assertFalse(F.overview_proxy_bound(proxy_dump(comp="app.zak.perch.fake/.QuickstepService")))
+        self.assertFalse(F.overview_proxy_bound(proxy_dump(comp="app.zak.perchx/.QuickstepService")))
+        self.assertTrue(F.overview_proxy_bound(proxy_dump(comp="app.zak.perch/app.zak.perch.QuickstepService")))
+        self.assertEqual(F.component_package("ComponentInfo{app.zak.perch.fake/.X}"), "app.zak.perch.fake")
+
 
 NOTIF = "Current Notification Manager state:\n"
 
@@ -89,16 +97,49 @@ class Alarm(unittest.TestCase):
     T = 1000.0
 
     def polls(self, *rel):
-        return [(self.T + a, self.T + b, f) for a, b, f in rel]
+        return [(self.T + r[0], self.T + r[1], r[2], None if len(r) < 4 else self.T + r[3]) for r in rel]
 
     def test_absent_then_firing(self):
         st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, False), (-1, 0.5, False), (1.0, 2.5, True)), self.T)
         self.assertEqual(st, PASS)
 
     def test_observation_must_finish_inside_the_deadline(self):
-        # The dumpsys that showed firing finished at +10.6 s: too late.
+        # The dumpsys that showed firing finished at +10.6 s: never PASS.
         st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, False), (9.0, 10.6, True)), self.T)
+        self.assertNotEqual(st, PASS)
+        st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, False), (8.0, 9.0, False), (9.5, 10.6, True)), self.T)
+        self.assertNotEqual(st, PASS)
+        # Still absent after +10 s: it fired late.
+        st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, False), (10.2, 11.0, False), (11.2, 12.0, True)), self.T)
         self.assertEqual(st, FAIL)
+
+    def test_sol_firing_poll_spanning_minus_10(self):
+        # Review round 3: absent at -15 s, then the first firing poll spans
+        # -11 s .. -9 s. It may have fired at -10.5 s: never PASS.
+        st, why = F.alarm_verdict(self.polls((-15.5, -15.0, False), (-11.0, -9.0, True)), self.T)
+        self.assertEqual(st, UNVERIFIED, why)
+        # With the notification's event time the answer is known.
+        st, _ = F.alarm_verdict(self.polls((-15.5, -15.0, False), (-11.0, -9.0, True, -10.5)), self.T)
+        self.assertEqual(st, FAIL)
+        st, _ = F.alarm_verdict(self.polls((-15.5, -15.0, False), (-11.0, -9.0, True, -9.5)), self.T)
+        self.assertEqual(st, PASS)
+
+    def test_event_time_must_fall_inside_its_observation(self):
+        st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, False), (-1.0, 0.0, False), (1.0, 2.0, True, 30.0)),
+                                self.T)
+        self.assertEqual(st, UNVERIFIED)
+        st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, False), (-1.0, 0.0, False), (1.0, 2.0, True, 0.4)),
+                                self.T)
+        self.assertEqual(st, PASS)
+
+    def test_event_time_is_parsed_from_the_record(self):
+        dump = (NOTIF + "  NotificationRecord(0x1: pkg=com.android.deskclock user=UserHandle{0} id=1 "
+                "tag=null importance=4 key=0|x: Notification(channel=alarmFiringNotificationChannel ...))\n"
+                "    fullscreenIntent=PendingIntent{1: x}\n    river-qa-ab\n    when=0\n"
+                "    mCreationTimeMs=1000000123456\n")
+        self.assertEqual(F.alarm_firing_event(dump, "river-qa-ab"), (True, 1000000123.456))
+        self.assertEqual(F.alarm_firing_event(dump.replace("mCreationTimeMs=1000000123456", "when=99"),
+                                              "river-qa-ab"), (True, None))
 
     def test_absence_must_be_at_or_before_minus_10(self):
         st, _ = F.alarm_verdict(self.polls((-10.2, -9.0, False), (1.0, 2.0, True)), self.T)
@@ -115,18 +156,23 @@ class Alarm(unittest.TestCase):
         # Nor for firing.
         st, _ = F.alarm_verdict(self.polls((-11.2, -10.0, False), (1.0, 2.0, None)), self.T)
         self.assertEqual(st, FAIL)
-        # A failed sample between two good ones changes nothing.
-        st, _ = F.alarm_verdict(self.polls((-13.0, -12.0, False), (-11.2, -10.0, None), (1.0, 2.0, True)), self.T)
+        # A failed sample between two good ones changes nothing...
+        st, _ = F.alarm_verdict(self.polls((-13.0, -12.0, False), (-11.2, -10.0, None), (-1.0, 0.0, False),
+                                           (1.0, 2.0, True)), self.T)
         self.assertEqual(st, PASS)
+        # ...but it can't narrow the firing interval: absent at -13 s and
+        # firing by +2 s spans target - 10 s (review round 3).
+        st, _ = F.alarm_verdict(self.polls((-13.0, -12.0, False), (-11.2, -10.0, None), (1.0, 2.0, True)), self.T)
+        self.assertEqual(st, UNVERIFIED)
 
     def test_each_sample_carries_the_dump_status(self):
         ok = F.parse_alarm_sample(0, f"1.0\n{NOTIF}nothing\n__DUMP_RC__0\n2.0\n", "lbl")
-        self.assertEqual(ok, (1.0, 2.0, False))
+        self.assertEqual(ok, (1.0, 2.0, False, None))
         # dumpsys failed but the trailing date succeeded: no evidence.
         self.assertEqual(F.parse_alarm_sample(0, "1.0\nCan't find service\n__DUMP_RC__1\n2.0\n", "lbl"),
-                         (1.0, 2.0, None))
+                         (1.0, 2.0, None, None))
         # Exit 0 but not a notification dump (cut off, or another service).
-        self.assertEqual(F.parse_alarm_sample(0, "1.0\n\n__DUMP_RC__0\n2.0\n", "lbl"), (1.0, 2.0, None))
+        self.assertEqual(F.parse_alarm_sample(0, "1.0\n\n__DUMP_RC__0\n2.0\n", "lbl"), (1.0, 2.0, None, None))
         self.assertIsNone(F.parse_alarm_sample(1, "", "lbl"))
         self.assertIsNone(F.parse_alarm_sample(0, "x\n__DUMP_RC__0\n2.0\n", "lbl"))
 

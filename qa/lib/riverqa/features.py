@@ -1154,8 +1154,25 @@ def overview_proxy_bound(proxy_txt: str) -> bool:
     alone doesn't count: SystemUI derives it from resolving the service,
     not from a connection (OverviewProxyService.updateEnabledState)."""
     fields = dict(re.findall(r"^\s*(\w+)=(.*?)\s*$", proxy_txt, re.M))
-    named = PERCH in fields.get("mRecentsComponentName", "") or PERCH in fields.get("mQuickStepIntent", "")
+    # The exact package, parsed from the component (review round 3):
+    # app.zak.perch.fake is not Perch.
+    recents = component_package(fields.get("mRecentsComponentName", ""))
+    intent = fields.get("mQuickStepIntent", "")
+    qs = re.search(r"\bpkg=([\w.]+)", intent)
+    qs_cmp = re.search(r"\bcmp=(\S+)", intent)
+    named = PERCH in (recents, qs.group(1) if qs else None, component_package(qs_cmp.group(1)) if qs_cmp else None)
     return named and fields.get("isConnected") == "true" and fields.get("mBound") == "true"
+
+
+COMPONENT_RE = re.compile(r"([A-Za-z][\w.]*)/([\w.$]+)")
+
+
+def component_package(text: str) -> str | None:
+    """The package of the first "package/class" component in ``text``
+    (ComponentInfo{...}, an activity record, a resolve-activity line), or
+    None. Callers compare it exactly, never by prefix."""
+    m = COMPONENT_RE.search(text or "")
+    return m.group(1) if m else None
 
 
 def screen_size(dev) -> tuple[int, int]:
@@ -1163,8 +1180,16 @@ def screen_size(dev) -> tuple[int, int]:
     return (int(m.group(1)), int(m.group(2))) if m else (1080, 2270)
 
 
-def alarm_firing(dump: str, label: str) -> bool:
-    """DeskClock's firing notification with fullScreenIntent and this label."""
+EVENT_TIME_RE = re.compile(r"\b(?:postTime|mCreationTimeMs)=(\d{12,})")
+
+
+def alarm_firing_event(dump: str, label: str) -> tuple[bool, float | None]:
+    """(firing?, event time in phone seconds or None) for DeskClock's firing
+    notification with fullScreenIntent and this label. The event time is
+    the time the system recorded the post (postTime, or mCreationTimeMs,
+    which NotificationRecord sets from it); the app-chosen ``when`` is not
+    used, because DeskClock may set it to the alarm time whenever the
+    notification really fired (review round 3)."""
     for block in re.split(r"\n\s*NotificationRecord\(", dump):
         if "pkg=com.android.deskclock" not in block:
             continue
@@ -1172,21 +1197,30 @@ def alarm_firing(dump: str, label: str) -> bool:
         chan_id = (chan.group(1) or chan.group(2)) if chan else ""
         fsi = re.search(r"fullscreenintent=PendingIntent", block, re.I)
         if fsi and label in block and ("firing" in chan_id.lower() or "Firing" in block):
-            return True
-    return False
+            ev = EVENT_TIME_RE.search(block)
+            return True, (int(ev.group(1)) / 1000.0 if ev and int(ev.group(1)) > 0 else None)
+    return False, None
+
+
+def alarm_firing(dump: str, label: str) -> bool:
+    """DeskClock's firing notification with fullScreenIntent and this label."""
+    return alarm_firing_event(dump, label)[0]
 
 
 NOTIF_HEADER = "Current Notification Manager state"
 ALARM_ABSENT_FROM_S = -16.0   # an absence sample may start no earlier than this...
 ALARM_ABSENT_BY_S = -10.0     # ...and must have finished by this (review round 2)
-ALARM_FIRED_BY_S = 10.0
+ALARM_EARLIEST_S = -10.0      # the alarm must fire at or after target - 10 s...
+ALARM_FIRED_BY_S = 10.0       # ...and by target + 10 s
+ALARM_EVENT_SLACK_S = 0.5     # an event time must fall inside its own observation bounds, within this
 
 
-def parse_alarm_sample(rc: int, out: str, label: str) -> tuple[float, float, bool | None] | None:
-    """One sample: (phone time before dumpsys, phone time after it, firing?).
-    firing is None when the dump itself failed or doesn't look like a
-    notification dump: that sample is no evidence either way. None if the
-    phone times are unreadable. Pure."""
+def parse_alarm_sample(rc: int, out: str, label: str) -> tuple[float, float, bool | None, float | None] | None:
+    """One sample: (phone time before dumpsys, phone time after it, firing?,
+    the firing notification's event time or None). firing is None when the
+    dump itself failed or doesn't look like a notification dump: that
+    sample is no evidence either way. None if the phone times are
+    unreadable. Pure."""
     lines = out.replace("\r", "").rstrip("\n").split("\n")
     if rc != 0 or len(lines) < 3:
         return None
@@ -1196,38 +1230,63 @@ def parse_alarm_sample(rc: int, out: str, label: str) -> tuple[float, float, boo
         return None
     status, dump = lines[-2], "\n".join(lines[1:-2])
     if status != "__DUMP_RC__0" or NOTIF_HEADER not in dump:
-        return t0, t1, None
-    return t0, t1, alarm_firing(dump, label)
+        return t0, t1, None, None
+    firing, ev = alarm_firing_event(dump, label)
+    return t0, t1, firing, ev
 
 
-def alarm_observe(dev, label: str) -> tuple[float, float, bool | None] | None:
+def alarm_observe(dev, label: str) -> tuple[float, float, bool | None, float | None] | None:
     """One observation, timed on the phone, with dumpsys's own exit status
     (a trailing date can't hide a failed dump)."""
     r = dev.read("date +%s.%N; dumpsys notification --noredact; echo __DUMP_RC__$?; date +%s.%N", timeout=30)
     return parse_alarm_sample(r.rc, r.out, label)
 
 
-def alarm_verdict(polls: list[tuple[float, float, bool | None]], target_s: float) -> tuple[str, str]:
-    """Judge firing evidence by phone time (A9, review round 2). Samples
-    whose dump failed (firing None) are no evidence either way. Absence
-    needs a successful sample that started at target - 16 s or later and
-    finished by target - 10 s, and the last such sample must show no firing.
-    Firing counts only from a successful sample that finished by
-    target + 10 s. Firing seen in anything that finished before target - 10 s
-    means it fired early."""
-    rel = [(a - target_s, b - target_s, f) for a, b, f in polls if f is not None]
-    early = [r for r in rel if r[2] and r[1] < ALARM_ABSENT_BY_S]
+def alarm_verdict(polls: list[tuple], target_s: float) -> tuple[str, str]:
+    """Judge firing evidence by phone time (A9, review rounds 2 and 3).
+
+    Samples whose dump failed (firing None) are no evidence either way.
+    Absence needs a successful sample that started at target - 16 s or
+    later and finished by target - 10 s, and the last such sample must show
+    no firing. The firing time F lies after the last absent sample started
+    (L) and no later than the end of the first firing sample (U):
+    - with the notification's recorded event time E (inside L .. U), PASS
+      if target - 10 s <= E <= target + 10 s, otherwise FAIL;
+    - without one, PASS only if L >= target - 10 s and U <= target + 10 s;
+      FAIL if U < target - 10 s (early) or L > target + 10 s (late); any
+      interval that spans a boundary is UNVERIFIED (review round 3)."""
+    rel = sorted(((p[0] - target_s, p[1] - target_s, p[2],
+                   None if len(p) < 4 or p[3] is None else p[3] - target_s) for p in polls if p[2] is not None))
+    early = [r for r in rel if r[2] and (r[1] < ALARM_EARLIEST_S or (r[3] is not None and r[3] < ALARM_EARLIEST_S))]
     if early:
-        return FAIL, f"firing evidence already at {early[0][1]:+.1f} s"
+        r = early[0]
+        return FAIL, (f"firing evidence already at {r[1]:+.1f} s"
+                      + (f" (posted at {r[3]:+.1f} s)" if r[3] is not None else ""))
     window = [r for r in rel if r[0] >= ALARM_ABSENT_FROM_S and r[1] <= ALARM_ABSENT_BY_S]
     if not window:
         return FAIL, "no successful observation inside target - 16 s .. target - 10 s"
     if window[-1][2]:
         return FAIL, "firing evidence present at target - 10 s"
-    fired = [r for r in rel if r[2] and r[1] <= ALARM_FIRED_BY_S]
-    if not fired:
+    first = next((i for i, r in enumerate(rel) if r[2]), None)
+    if first is None:
         return FAIL, "no firing notification observed by target + 10 s"
-    return PASS, f"absent at {window[-1][1]:+.1f} s, firing by {fired[0][1]:+.1f} s (phone time)"
+    absent = [r for r in rel[:first] if not r[2]]
+    lo, hi, ev = absent[-1][0], rel[first][1], rel[first][3]
+    if ev is not None:
+        if not (lo - ALARM_EVENT_SLACK_S <= ev <= hi + ALARM_EVENT_SLACK_S):
+            return UNVERIFIED, (f"the notification's event time {ev:+.1f} s is outside its observation "
+                                f"bounds {lo:+.1f} .. {hi:+.1f} s")
+        if ALARM_EARLIEST_S <= ev <= ALARM_FIRED_BY_S:
+            return PASS, f"absent at {lo:+.1f} s, posted at {ev:+.1f} s, seen by {hi:+.1f} s (phone time)"
+        return FAIL, f"the firing notification was posted at {ev:+.1f} s, outside target +/- 10 s"
+    if hi < ALARM_EARLIEST_S:
+        return FAIL, f"fired before {hi:+.1f} s"
+    if lo > ALARM_FIRED_BY_S:
+        return FAIL, f"still absent at {lo:+.1f} s: no firing notification by target + 10 s"
+    if lo >= ALARM_EARLIEST_S and hi <= ALARM_FIRED_BY_S:
+        return PASS, f"absent at {lo:+.1f} s, firing by {hi:+.1f} s (phone time)"
+    return UNVERIFIED, (f"fired between {lo:+.1f} s and {hi:+.1f} s, which spans a boundary of target +/- 10 s, "
+                        "and the notification has no event time")
 
 
 def check_alarms(run) -> Result:
@@ -1268,7 +1327,8 @@ def check_alarms(run) -> Result:
     state, msg = alarm_verdict(polls, eff)
     activity = top_activity(dev)
     d = {"label": label, "target_ms": res.get("target_ms"), "shift_s": shift, "tz": res.get("tz"),
-         "polls": [(round(a - eff, 2), round(b - eff, 2), f) for a, b, f in polls], "top_after": activity}
+         "polls": [(round(a - eff, 2), round(b - eff, 2), f, None if e is None else round(e - eff, 2))
+                   for a, b, f, e in polls], "top_after": activity}
     helper.wake(dev)
     dis = helper.instrument(run, "alarm_dismiss", {"label": label}, timeout=30, need_foreground=False)
     time.sleep(2)
