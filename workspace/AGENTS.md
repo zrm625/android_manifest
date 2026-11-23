@@ -44,18 +44,11 @@ end up in the image (seen with removed IMS app libraries). `--installclean`
 deletes the staged partitions and images but keeps compiled objects, so it
 only adds a few minutes. Adding or changing things needs no install-clean.
 
-**For measurements, use `scripts/bench/bench`.** It builds cold, with ccache
-off, into a separate `bench/out-bench-<tree>/`, so it never wipes your working
-output.
-
-```sh
-scripts/bench/bench stripped     # cold build time of tree/
-scripts/bench/bench baseline     # cold build time of baseline/, for comparison
-```
-
-Each benchmark adds a row to `bench/results/results.csv` (build time, peak
-memory, output size, commits) and keeps the log and Soong metrics in
-`bench/results/<run id>/`.
+**Do not run cold builds unless Zak asks for one.** Measure each change on the
+phone with `scripts/bench/device-bench` instead (see "Build and run a change").
+For the record, `scripts/bench/bench <stripped|baseline>` builds cold, with
+ccache off, into a separate `bench/out-bench-<tree>/` and adds a row to
+`bench/results/results.csv`. It takes a couple of hours of every CPU core.
 
 The build produces, in `bench/out-stripped/target/product/river/`:
 
@@ -194,9 +187,9 @@ The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
    scripts/change merge
    ```
 
-8. **Now and then**, measure the cold build time with
-   `scripts/bench/bench stripped`, and mark a milestone with
-   `scripts/change tag baseline-<n>`.
+8. **Now and then**, mark a milestone with `scripts/change tag baseline-<n>`.
+   The `device-bench` run of the merged change is its measurement; no cold
+   build is needed.
 
 ## Rules
 
