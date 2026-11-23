@@ -1894,3 +1894,167 @@ wipe).**
   rejected as before: the marked extra pass by uptime, the unmarked one by
   the enumeration rule, and the adb early reboot by the chain.
 - Final state: slot a, `known_good_slot` a, no pair, journal empty.
+
+## Code review round 8: changes to R7
+
+Status: specified 2026-11-23 from the round-8 code review of `1897d45`.
+Everything in round 7 stands except as changed here. Where this section and
+an earlier one disagree, this one wins. Round 7's "one deliberate
+exception" (`recover(boot=False)` settling after the clear) is gone.
+
+**The single rule (R8-1).** An fb_mode obligation is resolved in one place,
+`fbmode.settle(proof)`, and only with a `fbmode.VerifiedBoot`.
+- `fbmode.verify_boot(dev, want)` is the only function that makes a
+  `VerifiedBoot` (the dataclass is sealed: any other construction raises).
+  On the booted phone, in this order, it runs the adb guard (serial
+  ZY225DPT7F, product river), reads the boot status (boot completed,
+  `boot_id`, uptime), reads `ro.boot.slot_suffix`, reads both build IDs
+  (`ro.river.build_id` from `/system/build.prop` and
+  `ro.vendor.river.build_id` from `/vendor/build.prop`, as root), and
+  hashes `boot_<slot>` when `want` asks for it. Any failed read or mismatch
+  raises. `boot_id` is read before the slot and builds, so `settle`'s
+  `boot_id` check covers every read.
+- `want` (`fbmode.Want`) says what the phone must be: the slot, both build
+  IDs (or, for a provisional known-good record or an unstamped dev build,
+  a boot hash instead), an optional boot hash to compare, and whether to
+  record the hash for the caller.
+- `settle` refuses unless the proof is a `VerifiedBoot` of this phone, the
+  entry was stamped cleared (`cleared_at`, written after a successful
+  `fb_mode_clear`), the verified boot began after that clear (host time of
+  the read minus the phone's uptime), and the phone's `boot_id`, read once
+  more, is still the proof's.
+- `Journal.resolve` refuses an fb_mode entry. Only `settle` calls the
+  journal's private resolver, which a unit test checks by parsing
+  `qa/lib`. The same test pins the set of `settle` callers (below) and
+  that only `verify_boot` builds a `VerifiedBoot`.
+- The journal reads and writes `journal.json` on every call. Before, a
+  `Journal` object kept its entries in memory, so phone-qa's run journal
+  could write back a list from before the `sysrq` control armed fb_mode
+  through another object, and drop the obligation.
+
+**What the entry records.** `fbmode.arm(dev, slot, build_ids)` refuses with
+an obligation already pending and records `serial`, `armed_at`, the slot,
+both build IDs and `cleared_at: null`. The `sysrq` extra-pass control
+reads the slot and IDs in Android before it goes to the bootloader to arm;
+an unstamped build can't be armed. Generic recovery (`phone-qa recover`,
+the phone-qa preflight and `--quick`, calibration, journal restore,
+`device-bench`, and `flash --recover` before the first baseline) verifies
+against this identity, not against whatever fastboot reports now: another
+active slot is a `WrongSlot` before anything is cleared, a fallback or
+another build fails `verify_boot`, and both halt (exit 3) with the entry
+pending. An entry without an identity (armed before round 8) can't be
+settled by generic recovery; a dev or batch flash, or `flash --rollback`,
+settles it with its own proof.
+
+**Who settles, with what proof.**
+
+| Caller | Proof it passes to `settle` |
+| --- | --- |
+| `fbmode.recover` (generic recovery; `flash --batch` preflight; `--promote` and `--recover`'s promote path) | `verify_boot` after its own boot, against the caller's `want` or the armed identity |
+| `flashing.rollback` (`flash --rollback`, rescue, `--recover`'s rollback path) | `verify_boot` of `known_good_slot`: both build IDs, or the boot hash for a provisional record |
+| `flashing.recover_fb_mode_to_known_good` (no-pair `--recover`) | `verify_boot` of `known_good_slot`, as for rollback |
+| `flashing.flash_dev` (dev flash, `device-bench --flash`) | `verify_boot` of the slot it wrote: both build IDs from the images' `build.prop`, or, unstamped, the hash of `boot.img` against the start of `boot_<slot>` |
+| `reboots.planned_reboot` (the `sysrq` extra-pass control) | `verify_boot` against the armed identity, after every timing value and USB event was taken |
+
+Promotion passes the candidate slot, both build IDs from `batch.json` and
+`hash_boot`, and promotes with the proof's build ID and hash. The batch
+preflight passes `known_good_slot`, its build IDs, the recorded boot hash
+and `hash_boot`, and reserves the pair with the proof's hash. Neither reads
+the phone again after `settle`: a timeout on any of those reads halts with
+the pair and the obligation intact.
+
+**No clear-only settlement.** `fbmode.clear` (was `clear_in_fastboot`) and
+`fbmode.recover(boot=False)` clear and stamp, and never settle.
+`write_images` clears and never settles. A dev flash settles only after its
+boot is verified; `flash --no-reboot` leaves the entry pending and says so;
+a kill before the first image write leaves it pending (the active slot is
+still the armed one, so generic recovery settles it). `disarm` is gone.
+
+**R8-2. An unreadable active slot.** `getvar current-slot` that gives no
+slot raises `fbmode.SlotUnreadable` ("cannot read the active slot; recheck
+with `fastboot -s ZY225DPT7F getvar current-slot`") before fb_mode is
+cleared. It is never a `WrongSlot` and never gets rollback advice. Rollback
+advice is only for a confirmed other slot: `WrongSlot` in fastboot, or
+`SlotMismatch` from `verify_boot` in Android. With no pair, `flash
+--recover` on a confirmed dev slot clears fb_mode and halts (exit 3, was
+exit 1), the phone in fastboot and the entry pending.
+
+**R8-3. Disk first.** `slots.preflight(state, batch_id, kind)` is
+host-only (it no longer takes the running slot; `verify_boot` checks that
+on the phone). `flash_batch` runs it after the batch, image and control
+checks and before any phone call, so a missing slot-state for a non-
+baseline batch, a missing closed baseline, an unfinished baseline
+checkpoint or a reserved pair refuse with the phone untouched.
+
+**R8-4. Messages.** The no-pair dev-slot halt says to run `flash --rollback`
+(it wipes) or to flash a dev build again (`flash stripped`), which settles
+the obligation without a wipe once it has verified the slot it boots. A
+`ClearFailed` during `flash --rollback` ends with "flash --rollback
+finishes it" (`Halt.advice` is set from the command the message names).
+`recovery_halt` takes an empty advice to mean "the message said it all".
+
+**R8-5. The sysrq copy.** The only `cp` the guard allows is exactly `cp
+/proc/sysrq-trigger DEST`, no options, `DEST` free of `sysrq-trigger` and
+not `/proc`, `.`, `..` or `/` (optionally under `su [user] -c`). That
+closes `-pt`/`-rt` clusters and Toybox `cp -s`.
+
+**Exit codes.** `phone-qa recover`, `phone-qa --quick`, `phone-qa
+boot-timing` and `phone-qa controls --boot-timing` exit 3 (HALT) when fb_mode
+recovery fails with the obligation still pending, and 1 otherwise.
+
+**State-change ordering.** Each step, then the state left if it fails or
+the host dies right after it.
+
+1. `fbmode.recover`, boot case.
+   1. Read the entry and `fastboot devices`. Fail: nothing changed.
+   2. `adb reboot bootloader` (guarded) if in Android. Die: entry pending,
+      fb_mode set, phone in fastboot.
+   3. `getvar current-slot`: unreadable → `SlotUnreadable`; another slot
+      than `want` or the armed one → `WrongSlot`. Fail: entry pending, fb_mode
+      not cleared, phone in fastboot.
+   4. `fb_mode_clear`, then stamp `cleared_at`. Fail: entry pending, fb_mode
+      set. Die between: entry pending, unstamped (a later `settle` refuses
+      until a clear is stamped again).
+   5. `fastboot reboot`, wait for adb and boot completed. Fail: entry
+      pending, stamped, phone booting or hung.
+   6. `verify_boot`. Fail: entry pending, phone in Android.
+   7. `settle` (`boot_id` again, then resolve). Die before the resolve: the
+      entry stays; the next recovery redoes 2-7.
+2. `fbmode.recover(boot=False)` (dev flash): 1-4 only; the entry stays.
+3. `flash_dev`: input and pair checks (phone untouched), then row 2, then
+   `write_images` (clear and stamp, flash,
+   `--set-active`, optional wipe), then boot, `verify_boot` of the target,
+   `settle`. Die before the first write: entry pending, active slot still
+   the armed one. Die after `--set-active`: entry pending; generic recovery
+   halts on `WrongSlot`; the next `flash stripped` or `flash --rollback`
+   settles it. `--no-reboot`: entry pending, said.
+4. `flash_batch`: batch, image, control checks; `slots.preflight` (disk);
+   all before the phone. Then row 1 with `want` = `known_good_slot`, build
+   IDs, boot hash, `hash_boot` (or, before the first baseline, generic
+   recovery, then `first_run`). `WrongSlot` or `SlotMismatch`: HALT with
+   rollback advice; anything else: HALT. Both: no pair, entry pending.
+   Then `reserve` with the proof's hash, `save_state`, the writes.
+5. `promote_batch`: host proof (phone untouched), then row 1 with `want` =
+   candidate, both IDs, `hash_boot`. Any failure: `promote_halt`, pair
+   reserved, entry pending. Then `slots.promote` with the proof's values and
+   `save_state`. Die between `settle` and `save_state`: entry resolved,
+   pair reserved; rerunning `--promote` verifies the phone in Android and
+   promotes.
+6. `rollback`: `to_fastboot`, `fastboot_guard`, clear and stamp,
+   `--set-active` fallback, erase userdata, record the wipe, reboot. Any
+   failure: HALT, pair and entry as they were (`ClearFailed` still sets the
+   fallback active). Then wait, `verify_boot` of `known_good_slot`,
+   `settle`: failure → HALT, pair reserved, entry pending. Then the pair is
+   released (`rolled_back`) and saved.
+7. `recover_fb_mode_to_known_good` (no pair): `to_fastboot`, guard, read the
+   slot. Unreadable: HALT before the clear. Confirmed dev slot: clear and
+   stamp, HALT, entry pending, phone in fastboot. `known_good_slot`: clear
+   and stamp, `--set-active`, reboot, `verify_boot`, `settle`, history.
+8. `planned_reboot`, `sysrq` extra pass: in Android read slot and IDs; `adb
+   reboot bootloader`; `arm` (journal, then `fb_mode_set`); `fastboot
+   continue`; marker; sysrq; the stop; clear and stamp; `fastboot reboot`;
+   boot status; timing and USB data; `verify_boot` against the armed
+   identity; `settle`. A failure before the clear: `clear_fb_mode` runs row
+   1. A failure after it: the entry stays for the next recovery.
+9. Journal restore (`_fb_mode`): row 1, then re-read the journal;
+   `restore_entry` never resolves an fb_mode entry itself.
