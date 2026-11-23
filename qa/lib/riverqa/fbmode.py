@@ -371,7 +371,7 @@ class Recovery:
 
 
 def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, want: Want | None = None,
-            j: jmod.Journal | None = None) -> Recovery:
+            j: jmod.Journal | None = None, boot_only_ok: bool = False) -> Recovery:
     """Clear a leftover fb_mode. Call it under the device lock, before the
     adb guard (the phone may be sitting in fastboot). It boots the
     **active** slot, so slot recovery must not use it (R5-1).
@@ -404,8 +404,18 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, want: W
     # never boots (a dev flash) only clears and stamps, so an entry armed
     # before round 8, with no identity, never stops it.
     expect = want
+    # R13-2: with ``boot_only_ok`` (phone-qa recover only), an entry whose
+    # build IDs can't be verified but whose slot is recorded (the unstamped
+    # sentinel) is cleared and its slot booted to completion, and the
+    # obligation stays pending: only a dev flash's proof settles it.
+    boot_only = None
     if expect is None and will_boot and e is not None:
-        expect = armed_want(e)
+        try:
+            expect = armed_want(e)
+        except RuntimeError:
+            if not (boot_only_ok and armed_slot(e)):
+                raise
+            boot_only = armed_slot(e)
     if not in_fb:
         st = dev.state()
         if st not in ("device", "recovery"):
@@ -420,8 +430,9 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, want: W
         active = got.lstrip("_")
         if active not in SLOTS:
             raise SlotUnreadable(dev.serial, got)
-        if expect is not None and active != expect.slot:
-            raise WrongSlot(dev.serial, active, expect.slot)
+        need = expect.slot if expect is not None else boot_only
+        if need is not None and active != need:
+            raise WrongSlot(dev.serial, active, need)
     dev.fb_mode_clear()
     _mark_cleared(j)
     what = ("cleared a pending fb_mode obligation" if e is not None else
@@ -435,6 +446,15 @@ def recover(dev, boot_timeout: float = 600, *, boot: bool | None = None, want: W
     dev.wait_for_device(boot_timeout)
     dev.wait_boot_completed(boot_timeout)
     proof = None
+    if boot_only is not None:
+        dev.guard()
+        running = (dev.getprop("ro.boot.slot_suffix") or "").lstrip("_")
+        if running != boot_only:
+            raise RuntimeError(f"fastboot booted slot {boot_only}, but the phone runs slot {running or '?'}")
+        what += (f" and booted Android on slot {boot_only}; the obligation, armed with no usable build IDs, stays "
+                 "pending until a dev flash verifies the slot it writes")
+        log(f"fb_mode recovery: {what}")
+        return Recovery(what, None)
     if expect is not None:
         proof = verify_boot(dev, expect)
         settle(proof, j)

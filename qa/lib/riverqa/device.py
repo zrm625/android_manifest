@@ -324,6 +324,17 @@ class Device:
     def getprop(self, name: str) -> str:
         return self.sh(f"getprop {shlex.quote(name)}").strip()
 
+    def slot_boot_state(self) -> tuple[str, bool]:
+        """The running slot suffix and whether its boot completed, read in
+        one checked adb shell call, so both come from the same boot (R13-1).
+        Raises on a failed read."""
+        rc, out, err = self.sh_rc("echo \"S=$(getprop ro.boot.slot_suffix)\"; "
+                                  "echo \"C=$(getprop sys.boot_completed)\"")
+        vals = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+        if rc != 0 or "S" not in vals or "C" not in vals:
+            raise RuntimeError(f"cannot read the running slot and boot state (rc {rc}): {(err or out).strip()[-200:]}")
+        return vals["S"].strip(), vals["C"].strip() == "1"
+
     def guard(self) -> None:
         """Refuse unless the serial answers in adb device mode and is river."""
         st = self.state()

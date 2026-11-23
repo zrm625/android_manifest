@@ -60,7 +60,11 @@ The build produces, in `bench/out-stripped/target/product/river/`:
 Requirements:
 
 - The Moto G7 is plugged in over USB and appears in `adb devices` as
-  `ZY225DPT7F`, or is in fastboot mode.
+  `ZY225DPT7F`, or is in fastboot mode. Before the QA harness has a
+  known-good slot (no `$BENCH_HOME/slot-state.json`), it must be booted to
+  Android with adb authorized: `flash` writes only after it has read that
+  the active slot finished booting. From fastboot, `fastboot -s ZY225DPT7F
+  reboot` and wait for Android first.
 - The bootloader is unlocked. It is.
 - Run all `adb` and `fastboot` commands with `-s ZY225DPT7F`. A Pixel is
   sometimes connected over wireless adb. Never touch it.

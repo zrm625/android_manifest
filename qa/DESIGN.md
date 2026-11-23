@@ -2587,3 +2587,42 @@ booted-phone rule.
 - Opus m2: the R12-1 refusal for a phone in Android that hasn't finished
   booting first says to wait and run the flash again.
 - Opus m3: README wording matches the `--no-reboot` refusal message.
+
+## Code review round 13: changes to R12
+
+Round 13 (head `a1abb2a`): Opus and Gemini approve; Sol 7 objects with two
+majors. The five `fbmode.settle` callers are unchanged.
+
+**R13-1. One boot for the slot and the boot state.** The slot suffix and
+`sys.boot_completed` came from two adb calls; a phone falling back from b
+to a between them paired b's suffix with a's completed boot, and the flash
+targeted a. `Device.slot_boot_state()` reads both in one checked adb shell
+call (`echo "S=$(getprop ro.boot.slot_suffix)"; echo "C=$(getprop
+sys.boot_completed)"`), so both values come from the same boot; a failed
+read raises. The dev flash uses it for its pre-write slot read in Android.
+
+**R13-2. A guarded way out for a recorded slot with unusable build IDs.**
+An obligation armed with the `unstamped` sentinel records its slot but no
+build IDs generic recovery can verify. Before the first baseline, R12-1
+refuses the dev flash in fastboot, and `phone-qa recover` refused the
+entry before clearing fb_mode, so nothing could boot the phone. Now
+`fbmode.recover(boot_only_ok=True)`, used only by `phone-qa recover`,
+clears fb_mode for such an entry, boots the recorded slot (after checking
+it is the active one; another slot raises `WrongSlot` before the clear),
+waits for boot completion, checks the phone runs that slot, and returns
+**without settling**: the obligation stays pending until a dev flash's
+verified boot settles it. Every other caller of `fbmode.recover` still
+refuses such an entry. `armed_way_back` for this case says to run
+`phone-qa recover`, then the same flash with the caller's `--wipe` kept.
+
+**Minors.** README step 0 and the install guide state the booted-phone
+prerequisite and how to get there from fastboot. The R12-1 message says
+where the phone was found (recovery, unauthorized adb, fastboot). The
+"no clear" test asserts the fake's actual `("fb_mode_clear",)` call. Opus's
+round-13 minors (sentinel advice dead end, "wait for boot" advice, README
+wording) are in the "Round 13 follow-ups" note above.
+
+Regressions (`test_round12.R13FollowUps`): at `a1abb2a` the fallback race
+wrote slot a; the sentinel advice named the refused flash; the not-booted
+advice had no "wait".
+

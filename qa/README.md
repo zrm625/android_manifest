@@ -105,6 +105,12 @@ The steps run in this order (DESIGN.md, "Calibration and bootstrap" and
      branches: `qa-harness` in `device/motorola/river` and in
      `.repo/manifests`. A build without the stamp, or with device.mk's
      default `unstamped` on either partition, counts as unstamped.
+   - **Prerequisite: the phone booted to Android, adb authorized.** With no
+     `slot-state.json` yet, the dev flash writes only after it reads, in one
+     adb call, that the active slot has completed boot (R12-1, R13-1).
+     From fastboot: `fastboot -s ZY225DPT7F reboot`, wait for Android to
+     finish booting and accept the USB-debugging prompt, then flash. If an
+     fb_mode obligation is pending, run `phone-qa recover` first.
    - **Why `--wipe`.** Builds from this tree are signed with its test keys.
      Over a build signed with other keys (an official LineageOS nightly,
      or any build not from this tree) the phone boot-loops unless userdata

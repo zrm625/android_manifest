@@ -58,6 +58,11 @@ class SlotPhone(Boots):
             return "1" if self.where == "android" else ""
         return f"_{self.running}" if name == "ro.boot.slot_suffix" else ""
 
+    def slot_boot_state(self):
+        """One shell call: both values from the same boot (R13-1)."""
+        return (self.getprop("ro.boot.slot_suffix") or ""), \
+            (self.getprop("sys.boot_completed") or "").strip() == "1"
+
     def sh(self, cmd, timeout=30):
         if "build_id" in cmd:
             key = "ro.vendor.river.build_id" if "vendor" in cmd else "ro.river.build_id"

@@ -1257,7 +1257,7 @@ def cmd_recover(argv: list[str]) -> int:
         return 1
     try:
         with DeviceLock():
-            what = fbmode.recover(Device(SERIAL), 900, boot=True).what
+            what = fbmode.recover(Device(SERIAL), 900, boot=True, boot_only_ok=True).what
     except LockError as e:
         log(f"error: {e}")
         return 1
@@ -1269,6 +1269,10 @@ def cmd_recover(argv: list[str]) -> int:
         return 3
     if what is None:     # fbmode.recover logs what it did
         log("Nothing to recover: no fb_mode obligation and the phone is not in fastboot.")
+    elif fbmode.pending() is not None:
+        # R13-2: booted, but the obligation has no build IDs to verify.
+        log("Next: a dev flash (flash stripped, with --wipe if the phone ran a build signed with other keys) "
+            "writes the other slot and settles the obligation once that boot is verified.")
     return 0
 
 

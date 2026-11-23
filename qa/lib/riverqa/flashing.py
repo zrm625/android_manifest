@@ -305,6 +305,8 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         raise SystemExit(f"error: batch {st['pair']['batch']} holds an unresolved slot pair; "
                          "resolve it first (flash --recover)")
     owed = fbmode.pending()
+    # The flash to name in advice, keeping the caller's --wipe (Sol, round 13).
+    again = "flash stripped --wipe" if wipe else "flash stripped"
     if st is None and owed is not None and not reboot:
         # R10-3: before the first baseline, a flash that leaves the obligation
         # pending also leaves the slot it was armed on (the only slot known to
@@ -313,7 +315,7 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         log("error: an fb_mode obligation is pending and there is no known-good slot yet (no slot-state.json), "
             "so flash --no-reboot is refused: it would leave the obligation pending with another slot active, "
             "and the next flash could write the only slot known to boot.")
-        log(armed_way_back(owed, None))
+        log(armed_way_back(owed, None, again))
         return EXIT_ERROR
     # Only now, with the inputs and the pair checked (R7-3), is the phone
     # touched. R9-4: the active slot is read first, before anything is
@@ -322,19 +324,19 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     # clean stop: HALT 3 with an obligation pending or before the first
     # baseline (a guard failure only with an obligation pending), else exit
     # 1; Unreachable goes to main, which halts.
-    source = "getprop" if dev.state() == "device" else "fastboot"
+    found = dev.state()
+    source = "getprop" if found == "device" else "fastboot"
     # R12-1: before the first baseline, what may be overwritten is decided
     # by the active slot alone, so it must be shown to boot: the phone found
     # in Android with sys.boot_completed=1.
     booted = False
     # Before the first baseline with an obligation pending, every halt gives
     # the R10-3/R11-1 way back, never flash --recover (Sol, round 12).
-    pre_advice = armed_way_back(owed, None) if st is None and owed is not None else None
+    pre_advice = armed_way_back(owed, None, again) if st is None and owed is not None else None
     try:
         if source == "getprop":
             dev.guard()
-            got = dev.getprop("ro.boot.slot_suffix") or ""
-            booted = (dev.getprop("sys.boot_completed") or "").strip() == "1"
+            got, booted = dev.slot_boot_state()     # R13-1: one call, one boot
         else:
             to_fastboot(dev, 30)
             dev.fastboot_guard()
@@ -360,11 +362,14 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         # other slot is written. adb answering is not enough: the phone must
         # have completed boot. This also stops a second --no-reboot flash
         # from writing the original slot before the first one has booted.
-        where = "in fastboot" if source == "fastboot" else "in Android but has not completed boot"
+        where = {"device": "in Android but has not completed boot",
+                 "recovery": "was found in recovery (moved to fastboot to read the slot)",
+                 "unauthorized": "was found with adb unauthorized (moved to fastboot to read the slot)"}.get(
+            found, "in fastboot")
         msg = (f"slot {current} is active and the phone is {where}; with no known-good slot yet, nothing "
                f"shows that slot {current} boots, so this flash would not write slot {target}")
         if owed is not None:
-            return recovery_halt(RuntimeError(msg), advice=armed_way_back(owed, current))
+            return recovery_halt(RuntimeError(msg), advice=armed_way_back(owed, current, again))
         log(f"error: {msg}.")
         log(("If the phone is still booting, wait until it finishes and run the flash again. Otherwise b"
              if source == "getprop" else "B")
@@ -377,7 +382,7 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         return recovery_halt(RuntimeError(
             f"slot {current} is active, so this flash would write slot {target}, where the pending fb_mode "
             f"obligation was armed. With no known-good slot yet, slot {target} is the only slot known to boot; "
-            "not writing it"), advice=armed_way_back(owed, current))
+            "not writing it"), advice=armed_way_back(owed, current, again))
     # A leftover fb_mode would stop every boot in fastboot. A dev flash
     # only needs fastboot, so this never boots (R5-16, R6-4): the active
     # slot may be one that doesn't boot. It clears and never settles: the
@@ -399,7 +404,7 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         """Where to go with the obligation pending (R10-3): before the first
         baseline never a flash or flash --rollback."""
         if st is None:
-            return armed_way_back(fbmode.pending(), active)
+            return armed_way_back(fbmode.pending(), active, again)
         return ("The fb_mode obligation stays pending. Flash again, or return with flash --rollback (it wipes "
                 "userdata).")
 
@@ -490,7 +495,7 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     return EXIT_OK
 
 
-def armed_way_back(e: dict | None, active: str | None) -> str:
+def armed_way_back(e: dict | None, active: str | None, again: str = "flash stripped") -> str:
     """Before the first baseline, with an obligation pending: the way back
     (R10-3). The slot it was armed on is the only slot known to boot, so the
     advice never names a flash that could write it, nor flash --rollback
@@ -504,7 +509,7 @@ def armed_way_back(e: dict | None, active: str | None) -> str:
                 "can't tell which slot still boots, and it advises no flash until you have found one. In fastboot: "
                 f"fastboot -s {SERIAL} oem fb_mode_clear, then for a slot X, fastboot -s {SERIAL} --set-active=X "
                 f"and fastboot -s {SERIAL} reboot, and check that X reaches Android. If one does, leave it active "
-                "and run flash stripped (without --no-reboot): it writes the other slot and settles the "
+                f"and run {again} (without --no-reboot): it writes the other slot and settles the "
                 "obligation once that boot is verified. If no slot boots, stop and tell Zak: don't flash.")
     if active == slot:
         first = ""
@@ -523,12 +528,13 @@ def armed_way_back(e: dict | None, active: str | None) -> str:
         # R10-1: an identity generic recovery can't verify (the unstamped
         # sentinel): the verified boot of a dev flash of the other slot
         # settles it.
-        # R13 (Opus m1): before the first baseline a dev flash needs the
-        # phone booted (R12-1), so first clear fb_mode and boot the slot.
-        then = (f"clear fb_mode by hand (fastboot -s {SERIAL} oem fb_mode_clear), boot slot {slot} (fastboot -s "
-                f"{SERIAL} reboot) and wait until it has reached Android and finished booting; then run flash "
-                f"stripped: it writes slot {slots.other(slot)} and settles the obligation once that boot is verified. "
-                f"If slot {slot} doesn't reach Android, stop and tell Zak: don't flash.")
+        # R13 (Opus m1, Sol 2): before the first baseline a dev flash needs
+        # the phone booted (R12-1). phone-qa recover clears fb_mode and boots
+        # the recorded slot to completion, leaving the obligation pending.
+        then = (f"run phone-qa recover: it clears fb_mode, boots slot {slot} to completion and leaves the "
+                f"obligation pending. Then run {again}: it writes slot {slots.other(slot)} and settles the "
+                f"obligation once that boot is verified. If slot {slot} doesn't reach Android, stop and tell Zak: "
+                "don't flash.")
     how = first + then
     return (f"The fb_mode obligation stays pending. With no known-good slot yet, slot {slot} (where it was armed) "
             f"is the only slot known to boot. {how[:1].upper()}{how[1:]}")

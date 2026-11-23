@@ -46,7 +46,7 @@ class R12_1PreBaselineBootedSlot(unittest.TestCase):
                 self.assertEqual(rc, flashing.EXIT_HALT if owed else flashing.EXIT_ERROR, err)
                 self.assertIn("has not completed boot", err)
                 self.assertEqual(flashes(p.calls), [])
-                self.assertNotIn("clear", [c for c in p.calls if c[:1] == ("fastboot",) and "fb_mode" in str(c)])
+                self.assertNotIn(("fb_mode_clear",), p.calls)
                 if owed:
                     self.assertIsNotNone(fbmode.pending())
                     self.assertNotIn("flash --recover", err)
@@ -124,6 +124,29 @@ if __name__ == "__main__":
 
 
 class R13FollowUps(unittest.TestCase):
+    def test_slot_and_boot_state_come_from_one_boot(self):
+        """Sol round 13 (major 1): slot b answers adb before completing boot
+        and the phone falls back to a between two separate getprop calls.
+        At a1abb2a the flash paired b's suffix with a's completed boot,
+        targeted a and wrote it. With one shell call both values are from
+        the same boot (here: a, completed), so it writes b."""
+        with bench_home():
+            p = R9Phone(where="android", active="b", bootable=("a", "b"), fb=False,
+                        builds={"a": BID, "b": DEV_BID})
+            real = p.getprop
+
+            def getprop(name, real=real, p=p):
+                if name == "ro.boot.slot_suffix" and p.running == "b":
+                    v = real(name)
+                    p.running = p.active = "a"      # fell back to a before the next read
+                    return v
+                return real(name)
+            p.getprop = getprop
+            # One shell call sees one boot: the one the phone fell back to.
+            p.slot_boot_state = lambda: ("_a", True)
+            rc, err = dev_flash(p, reboot=booting_reboot)
+            self.assertNotIn("a", {c[2][-1] for c in flashes(p.calls)}, err)
+
     def test_sentinel_entry_in_fastboot_advice_leads_out(self):
         """Opus round 13 (m1): no slot-state.json, an obligation armed on a
         with the unstamped sentinel, the phone in fastboot on a. R12-1
@@ -136,12 +159,14 @@ class R13FollowUps(unittest.TestCase):
             arm_entry("a", ids=("unstamped", "unstamped"))
             rc, err = dev_flash(p, reboot=booting_reboot)
             self.assertEqual(rc, flashing.EXIT_HALT, err)
-            self.assertIn("oem fb_mode_clear", err)
-            self.assertIn("wait until it has reached Android", err)
+            self.assertIn("phone-qa recover: it clears fb_mode, boots slot a to completion", err)
             self.assertEqual(flashes(p.calls), [])
-            # Follow the advice: clear fb_mode, boot slot a, then flash.
-            p.fb_mode_clear()
-            p.reboot_fastboot()
+            # Follow the advice (Sol round 13): phone-qa recover boots slot a
+            # and leaves the obligation pending; then the flash settles it.
+            from test_round10 import recover_cmd
+            rc, out = recover_cmd(p)
+            self.assertEqual(rc, 0, out)
+            self.assertIsNotNone(fbmode.pending())
             rc, err = dev_flash(p, reboot=booting_reboot)
             self.assertEqual(rc, flashing.EXIT_OK, err)
             self.assertIsNone(fbmode.pending())

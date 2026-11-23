@@ -155,9 +155,12 @@ class R10_1Sentinel(unittest.TestCase):
                 p = R10Phone(where="fastboot", active="a", bootable=("a",), sentinel="both")
                 arm_entry("a", armed)
                 rc, out = recover_cmd(p)
-                self.assertEqual((p.calls, p.boots), ([], []), out)
-                self.assertEqual(rc, 3, out)
-                self.assertIn("no recorded slot and build IDs", out)
+                # R13-2: phone-qa recover clears fb_mode and boots the
+                # recorded slot to completion, but can't verify the
+                # sentinel, so it never settles.
+                self.assertEqual(rc, 0, out)
+                self.assertEqual(p.boots, ["a"], out)
+                self.assertIn("stays pending until a dev flash", out)
                 self.assertIsNotNone(fbmode.pending())
             with self.subTest(path="first baseline", armed=armed), bench_home():
                 p = R10Phone(where="fastboot", active="a", bootable=("a",), sentinel="both")
