@@ -71,7 +71,10 @@ class Verdict:
 
 
 def evaluate(boot_rows: list[dict], known_good: dict | None) -> Verdict:
-    """Apply the charter to the batch's bench rows (boot 1 first, in order)."""
+    """Apply the charter to the batch's bench rows (boot 1 first, in order).
+    The 3-boot median is used only when needs_three_boots says the charter
+    calls for it; otherwise RAM is judged on bench boot 1 alone, whatever
+    other rows exist (review round 4)."""
     details: dict = {}
     parts: list[tuple[str, str]] = []
     if not boot_rows:
@@ -80,9 +83,6 @@ def evaluate(boot_rows: list[dict], known_good: dict | None) -> Verdict:
     boot1_mb = mb(b1["used_ram_kb"])
     details["boot1_host_boot_seconds"] = float(b1["host_boot_seconds"])
     details["boot1_mb"] = round(boot1_mb, 1)
-    rams = [mb(r["used_ram_kb"]) for r in boot_rows[:3]]
-    med = median3(rams)
-    details["median_mb"] = None if med is None else round(med, 1)
 
     # Boot time: bench boot 1 only.
     secs = float(b1["host_boot_seconds"])
@@ -95,6 +95,15 @@ def evaluate(boot_rows: list[dict], known_good: dict | None) -> Verdict:
     required, why = needs_three_boots(boot1_mb, known_good, grew)
     details["three_boots_required"] = required
     details["three_boots_why"] = why
+    # The charter's schedule (review round 4): one boot, three when a
+    # trigger fires. Every batch has a mandatory sysrq bench boot (A2), but
+    # its RAM row counts only when the three-boot rule applies; otherwise
+    # the RAM verdict is bench boot 1 (adb) alone. The median then mixes
+    # the adb boot with sysrq boots (DESIGN.md, R4-4).
+    med = median3([mb(r["used_ram_kb"]) for r in boot_rows[:3]]) if required else None
+    details["median_mb"] = None if med is None else round(med, 1)
+    details["ram_rows"] = ([f"{r.get('run_id')}#{r.get('boot')}" for r in boot_rows[:3]] if med is not None
+                           else [f"{b1.get('run_id')}#{b1.get('boot')}"])
 
     if not ref or ref.get("median_mb") is None:
         parts.append((UNVERIFIED, "no RAM reference"))

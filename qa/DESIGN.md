@@ -1200,8 +1200,9 @@ amendments A1 and A1′. A1′ rules 1-2 stay, for the chain only.
    charter needs only 1 bench boot: the first `device-bench --batch` run of a
    flash attempt measures at least 2 boots, and `health.boot_signals` is
    UNVERIFIED without a `sysrq` bench row, or if bench boot 1 is not `adb`.
-   That boot's RAM row counts like any other bench row; `device.csv` records
-   each row's `reboot_path`. Its gate is the uptime check from the USB
+   That boot's RAM row counts toward the RAM verdict only when the
+   charter's three-boot rule applies (R4-4); `device.csv` records each
+   row's `reboot_path`. Its gate is the uptime check from the USB
    disconnect with the `sysrq` path's own A, plus the chain and the boot
    count.
 4. **The first boot after a flash stays on the fastboot path**, with the
@@ -1404,3 +1405,20 @@ have no bracket and are all excluded.
   harmless when nothing is set.
 - Unit tests now run with `$BENCH_HOME` pointed at a throwaway directory
   (`qa/tests/_path.py`), so no test can write the real journal.
+
+**R4-4. The RAM schedule follows the charter.** The charter measures RAM
+after one boot, and after three when a trigger fires (`regression.
+needs_three_boots`: no reference yet, the reference is still the seed, boot
+1 more than 10 MB over the reference, boot 1 at or under 1,050 MB, or
+`/system` or `/vendor` grew). A2 made every batch take a `sysrq` bench boot
+for its boot evidence, so every batch now has at least two RAM rows.
+- The mandatory `sysrq` boot and its boot evidence stay.
+- `regression.evaluate` uses the 3-boot median only when
+  `needs_three_boots` is true. Otherwise the RAM verdict is bench boot 1
+  (the `adb` reboot) alone, whatever other rows exist.
+  `health.regression` records the rows it used (`ram_rows`).
+- Once three boots are required, the median is over bench boots 1-3: boot 1
+  is an `adb` reboot and boots 2-3 are `sysrq` reboots, so the median mixes
+  the two paths. Both end in the same Android boot and the RAM reading is
+  taken after the same settle time, so no difference is expected. There is
+  no paired adb/sysrq RAM data yet (see "Phone notes" below).

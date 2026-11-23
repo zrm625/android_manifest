@@ -32,6 +32,31 @@ class Rules(unittest.TestCase):
         self.assertEqual(v.state, UNVERIFIED)
         self.assertTrue(v.details["three_boots_required"])
 
+    def test_sysrq_row_does_not_count_when_one_boot_is_enough(self):
+        """Every batch has a mandatory sysrq bench boot (A2), but the charter
+        judges RAM on one boot unless a trigger fires (review round 4)."""
+        # Boot 1 within 10 MB: no trigger. A bad sysrq row (or a good third
+        # row) changes nothing; the verdict is boot 1 alone.
+        for rows in ([row(1209), row(1300)], [row(1209), row(1300), row(1300)],
+                     [row(1209), row(1100), row(1100)]):
+            v = rg.evaluate(rows, kg())
+            self.assertEqual(v.state, PASS, rows)
+            self.assertFalse(v.details["three_boots_required"])
+            self.assertIsNone(v.details["median_mb"])
+            self.assertIn("RAM boot 1", v.summary)
+        # Boot 1 over reference + 10 fires the trigger: now the median counts.
+        v = rg.evaluate([row(1211), row(1100), row(1100)], kg())
+        self.assertTrue(v.details["three_boots_required"])
+        self.assertEqual(v.details["median_mb"], 1100.0)
+
+    def test_three_boot_rule_uses_the_median_of_mixed_paths(self):
+        rows = [dict(row(1211), reboot_path="adb", run_id="r", boot="1"),
+                dict(row(1204), reboot_path="sysrq", run_id="r", boot="2"),
+                dict(row(1203), reboot_path="sysrq", run_id="r2", boot="1")]
+        v = rg.evaluate(rows, kg())
+        self.assertEqual(v.state, PASS)
+        self.assertEqual(v.details["ram_rows"], ["r#1", "r#2", "r2#1"])
+
     def test_median_rule(self):
         self.assertEqual(rg.evaluate([row(1211), row(1204), row(1203)], kg()).state, PASS)
         self.assertEqual(rg.evaluate([row(1211), row(1206), row(1207)], kg()).state, FAIL)
