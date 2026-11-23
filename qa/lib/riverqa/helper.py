@@ -68,6 +68,34 @@ def top_activities(dump: str) -> list[tuple[str, bool]]:
     return out
 
 
+COMPONENT_RE = re.compile(r"([A-Za-z][\w.]*)/([\w.$]+)")
+
+
+def component_package(text: str) -> str | None:
+    """The package of the first "package/class" component in ``text``
+    (ComponentInfo{...}, an activity record, a resolve-activity line), or
+    None. Callers compare it exactly, never by prefix (review round 3)."""
+    m = COMPONENT_RE.search(text or "")
+    return m.group(1) if m else None
+
+
+def activity_is(top: tuple[str, bool], package: str, name: str | None = None) -> bool:
+    """Is ``top`` (resumed_top's (component, resumed)) the resumed activity
+    of exactly ``package``, and, with ``name``, the activity class whose
+    simple name is ``name``? A prefix match (app.zak.perch.fake) or an
+    activity that is on top but not resumed never counts (review round 3)."""
+    comp, resumed = top
+    m = COMPONENT_RE.fullmatch(comp or "")
+    if not (resumed and m and m.group(1) == package):
+        return False
+    return name is None or m.group(2).rsplit(".", 1)[-1] == name
+
+
+def fmt_top(top: tuple[str, bool]) -> str:
+    comp, resumed = top
+    return (comp or "?") + ("" if resumed else " (not resumed)")
+
+
 def resumed_top(dump: str) -> tuple[str, bool]:
     acts = top_activities(dump)
     resumed = [a for a, r in acts if r]
@@ -76,10 +104,10 @@ def resumed_top(dump: str) -> tuple[str, bool]:
     return (acts[-1][0], False) if acts else ("", False)
 
 
-def foreground(dev, activity_prefix: str = PKG) -> tuple[bool, str]:
+def foreground(dev, package: str = PKG) -> tuple[bool, str]:
     act, resumed = resumed_top(dev.sh("dumpsys activity top", timeout=60))
     awake = "mWakefulness=Awake" in dev.sh("dumpsys power", timeout=30)
-    ok = act.startswith(activity_prefix) and resumed and awake
+    ok = activity_is((act, resumed), package) and awake
     return ok, f"top {act or '?'}{'' if resumed else ' (not resumed)'}, {'awake' if awake else 'screen not awake'}"
 
 

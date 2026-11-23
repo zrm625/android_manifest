@@ -117,7 +117,25 @@ class GateInputs:
     kind: str | None = None        # batch.json kind; only "batch" can merge
     thresholds_calibrated: bool = False
     calibration_runs: int = 0      # clean --calibrate runs for this harness version
-    camera_set_change: bool = False  # batch.json has camera_set_change (A7: Zak merges by hand)
+    camera_set_change: object = None  # batch.json's camera_set_change as recorded (A7: Zak merges by hand)
+
+
+def camera_change_shape_errors(change) -> list[str]:
+    """Why ``camera_set_change`` is not {"url": str, "set": [int, ...]}
+    (a non-empty list of distinct non-negative camera IDs). Pure."""
+    if not isinstance(change, dict):
+        return [f"not an object ({type(change).__name__})"]
+    errs = []
+    if not isinstance(change.get("url"), str) or not change.get("url"):
+        errs.append("url missing")
+    st = change.get("set")
+    if not isinstance(st, list) or not st or not all(isinstance(x, int) and not isinstance(x, bool) and x >= 0
+                                                     for x in st) or len(set(st)) != len(st):
+        errs.append(f"set {st!r} is not a non-empty list of distinct camera IDs")
+    extra = sorted(set(change) - {"url", "set"})
+    if extra:
+        errs.append(f"unexpected keys {extra}")
+    return errs
 
 
 def eligibility(results: dict[str, Result], g: GateInputs) -> tuple[bool, list[str]]:
@@ -133,10 +151,14 @@ def eligibility(results: dict[str, Result], g: GateInputs) -> tuple[bool, list[s
         reasons.append("experiment batch")
     if g.kind != "batch":
         reasons.append(f"batch kind is {g.kind!r}, not 'batch'")
-    if g.camera_set_change:
+    if g.camera_set_change is not None:
         # A7: the camera set is a must-work item, and removing one needs
         # Zak. The approval check stays in the report as evidence only.
+        # Any non-null value counts, even {} or false (review round 3).
         reasons.append("camera set change: Zak merges by hand")
+        bad = camera_change_shape_errors(g.camera_set_change)
+        if bad:
+            reasons.append("camera_set_change is malformed: " + "; ".join(bad))
     low = parse_bool(g.low_ram)
     if g.low_ram is None:
         reasons.append("ro.config.low_ram could not be read")

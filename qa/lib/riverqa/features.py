@@ -88,9 +88,11 @@ def helper_result(cid: str, res: helper.HelperResult) -> Result | None:
     return None
 
 
-def top_activity(dev) -> str:
-    """The resumed top activity (`dumpsys activity top` lists tasks bottom to top)."""
-    return helper.resumed_top(dev.sh("dumpsys activity top", timeout=60))[0]
+def top_activity(dev) -> tuple[str, bool]:
+    """(component, resumed) of the top activity (`dumpsys activity top`
+    lists tasks bottom to top). Decide with helper.activity_is, which needs
+    the resumed flag and the exact package (review round 3)."""
+    return helper.resumed_top(dev.sh("dumpsys activity top", timeout=60))
 
 
 def screen_off(dev, wait_s: float = 20) -> tuple[bool, str]:
@@ -437,7 +439,11 @@ def expected_cameras(run) -> tuple[list[int] | None, str]:
     prop = run.dev.getprop("ro.vendor.river.cameras")
     pset = sorted(int(x) for x in re.findall(r"\d+", prop)) if prop else None
     change = run.batch.get("camera_set_change")
-    if change:
+    if change is not None:
+        from .results import camera_change_shape_errors
+        bad = camera_change_shape_errors(change)
+        if bad:
+            return None, "camera_set_change is malformed: " + "; ".join(bad)
         ok, why = verify_camera_change(change, run.batch)
         if not ok:
             return None, f"camera_set_change not confirmed: {why}"
@@ -1091,29 +1097,29 @@ def check_gestures(run) -> Result:
         problems.append(f"navigation_mode {nav}, not gesture (2)")
     if not bound:
         problems.append("overview proxy not connected to app.zak.perch (isConnected/mBound)")
-    if not home or not home[0].startswith("app.zak.perch/"):
+    if not home or component_package(home[0]) != PERCH:
         problems.append(f"HOME resolves to {home}")
     w, h = screen_size(dev)
     helper.wake(dev)
     dev.sh("input keyevent KEYCODE_HOME")
     time.sleep(1.5)
     t1 = top_activity(dev)
-    d["after_home"] = t1
-    if not t1.startswith("app.zak.perch/") or "MainActivity" not in t1:
-        problems.append(f"after HOME the top is {t1}")
+    d["after_home"] = helper.fmt_top(t1)
+    if not helper.activity_is(t1, PERCH, "MainActivity"):
+        problems.append(f"after HOME the top is {helper.fmt_top(t1)}")
     dev.sh("am start -W -n com.android.deskclock/.DeskClock")
     time.sleep(1.5)
     t2 = top_activity(dev)
-    d["deskclock"] = t2
+    d["deskclock"] = helper.fmt_top(t2)
     sx, sy0, sy1 = param(run, "swipe_up", [w // 2, h - 3, int(h * 0.45)])
     dev.sh(f"input swipe {sx} {sy0} {sx} {sy1} 250")
     time.sleep(2)
     t3 = top_activity(dev)
-    d["after_swipe_up"] = t3
-    if not t2.startswith("com.android.deskclock"):
-        problems.append(f"DeskClock did not come to the front ({t2})")
-    if not t3.startswith("app.zak.perch/"):
-        problems.append(f"after the swipe up the top is {t3}")
+    d["after_swipe_up"] = helper.fmt_top(t3)
+    if not helper.activity_is(t2, DESKCLOCK):
+        problems.append(f"DeskClock did not come to the front ({helper.fmt_top(t2)})")
+    if not helper.activity_is(t3, PERCH):
+        problems.append(f"after the swipe up the top is {helper.fmt_top(t3)}")
     dev.sh("am force-stop com.android.deskclock")
     seen = {}
 
@@ -1132,12 +1138,12 @@ def check_gestures(run) -> Result:
     if early:
         dev.sh("input keyevent KEYCODE_HOME")
         return early
-    tb, ta = seen.get("before", ""), seen.get("after", "")
-    d["back"] = {"before": tb, "after": ta, "helper": res.values}
-    if not tb.endswith(".ChildActivity"):
-        problems.append(f"child B not on top before Back ({tb})")
-    if ta != f"{helper.PKG}/.MainActivity":
-        problems.append(f"after Back the top is {ta}, not A")
+    tb, ta = seen.get("before", ("", False)), seen.get("after", ("", False))
+    d["back"] = {"before": helper.fmt_top(tb), "after": helper.fmt_top(ta), "helper": res.values}
+    if not helper.activity_is(tb, helper.PKG, "ChildActivity"):
+        problems.append(f"child B not on top before Back ({helper.fmt_top(tb)})")
+    if not helper.activity_is(ta, helper.PKG, "MainActivity"):
+        problems.append(f"after Back the top is {helper.fmt_top(ta)}, not A")
     dev.sh("input keyevent KEYCODE_HOME")
     return Result(cid, FAIL if problems else PASS, "; ".join(problems) or
                   "Perch is home and bound; HOME and swipe up go to Perch; Back returns to A", d,
@@ -1145,6 +1151,7 @@ def check_gestures(run) -> Result:
 
 
 PERCH = "app.zak.perch"
+DESKCLOCK = "com.android.deskclock"
 
 
 def overview_proxy_bound(proxy_txt: str) -> bool:
@@ -1164,15 +1171,7 @@ def overview_proxy_bound(proxy_txt: str) -> bool:
     return named and fields.get("isConnected") == "true" and fields.get("mBound") == "true"
 
 
-COMPONENT_RE = re.compile(r"([A-Za-z][\w.]*)/([\w.$]+)")
-
-
-def component_package(text: str) -> str | None:
-    """The package of the first "package/class" component in ``text``
-    (ComponentInfo{...}, an activity record, a resolve-activity line), or
-    None. Callers compare it exactly, never by prefix."""
-    m = COMPONENT_RE.search(text or "")
-    return m.group(1) if m else None
+component_package = helper.component_package
 
 
 def screen_size(dev) -> tuple[int, int]:
@@ -1325,7 +1324,7 @@ def check_alarms(run) -> Result:
         else:
             time.sleep(max(0.2, min(3.0, eff + ALARM_ABSENT_FROM_S - phone_now())))
     state, msg = alarm_verdict(polls, eff)
-    activity = top_activity(dev)
+    activity = helper.fmt_top(top_activity(dev))
     d = {"label": label, "target_ms": res.get("target_ms"), "shift_s": shift, "tz": res.get("tz"),
          "polls": [(round(a - eff, 2), round(b - eff, 2), f, None if e is None else round(e - eff, 2))
                    for a, b, f, e in polls], "top_after": activity}
@@ -1527,10 +1526,12 @@ def app_crashed(run, pkg, since_tags) -> list[str]:
     return hits
 
 
-def vpn_launch_ok(top_after: str, package: str) -> bool:
-    """Launched only if the app's own activity is on top (after any VPN
-    dialog was dismissed). A VPN dialog on top doesn't count."""
-    return top_after.startswith(package + "/")
+def vpn_launch_ok(top_after: tuple[str, bool], package: str) -> bool:
+    """Launched only if the app's own activity is the resumed top, with
+    exactly this package (after any VPN dialog was dismissed). A VPN dialog
+    on top doesn't count, nor does an activity that isn't resumed (review
+    round 3)."""
+    return helper.activity_is(top_after, package)
 
 
 def launch_and_watch(run, cid, key, start_cmd, accept_vpn_dialog=False) -> Result:
@@ -1545,8 +1546,8 @@ def launch_and_watch(run, cid, key, start_cmd, accept_vpn_dialog=False) -> Resul
     dev.sh(start_cmd)
     time.sleep(4)
     top = top_activity(dev)
-    d = {"top": top}
-    if accept_vpn_dialog and top.startswith("com.android.vpndialogs"):
+    d = {"top": helper.fmt_top(top)}
+    if accept_vpn_dialog and component_package(top[0]) == "com.android.vpndialogs":
         # The VPN consent dialog is the system's, not the app's: the app
         # counts as launched only if its own activity is resumed once the
         # dialog is dismissed (never accepted). Review round 2.
@@ -1554,7 +1555,7 @@ def launch_and_watch(run, cid, key, start_cmd, accept_vpn_dialog=False) -> Resul
         dev.sh("input keyevent KEYCODE_BACK")
         time.sleep(2)
         top = top_activity(dev)
-        d["top_after_dialog"] = top
+        d["top_after_dialog"] = helper.fmt_top(top)
     opened = vpn_launch_ok(top, f["package"])
     resumed = opened
     run.sideload[key]["launch"] = opened
@@ -1563,7 +1564,7 @@ def launch_and_watch(run, cid, key, start_cmd, accept_vpn_dialog=False) -> Resul
     d["crashes"] = crashed
     dev.sh(f"am force-stop {f['package']}; input keyevent KEYCODE_HOME")
     if not resumed:
-        return Result(cid, FAIL, f"not in front after launch (top {top})", d)
+        return Result(cid, FAIL, f"not in front after launch (top {helper.fmt_top(top)})", d)
     if crashed:
         return Result(cid, FAIL, f"crash or ANR within 10 s: {crashed}", d)
     return Result(cid, PASS, f"{f['package']} {f['version']} opened ({top}), no crash or ANR for 10 s", d)
@@ -1631,7 +1632,7 @@ def check_brave(run) -> Result:
         nodes = list(root.iter("node"))
         if any(n.get("package") == f["package"] for n in nodes):
             seen_app = True
-        if brave_rendered(nodes, token) and top_activity(dev).startswith(f["package"]):
+        if brave_rendered(nodes, token) and helper.activity_is(top_activity(dev), f["package"]):
             seen_token = True
             break
         tapped = False
@@ -1652,7 +1653,7 @@ def check_brave(run) -> Result:
     run.sideload["brave"]["launch"] = seen_app   # only if Brave's window was actually seen (A11)
     gets = run.server.find("page", token)
     beacons = run.server.find("beacon", token)
-    top = top_activity(dev)
+    top = helper.fmt_top(top_activity(dev))
     dev.sh(f"am force-stop {f['package']}; input keyevent KEYCODE_HOME")
     d = {"first_run_taps": steps, "gets": len(gets), "beacons": len(beacons), "script_text_on_screen": seen_token,
          "top": top, "ua": gets[0]["ua"] if gets else None}

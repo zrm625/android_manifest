@@ -204,9 +204,35 @@ class SmallItems(unittest.TestCase):
         self.assertFalse(F.usb_reconnect_failed(False, "device"))
 
     def test_vpn_dialog_alone_is_not_a_launch(self):
-        self.assertFalse(F.vpn_launch_ok("com.android.vpndialogs/.ConfirmDialog", "com.tailscale.ipn"))
-        self.assertTrue(F.vpn_launch_ok("com.tailscale.ipn/.MainActivity", "com.tailscale.ipn"))
-        self.assertFalse(F.vpn_launch_ok("com.tailscale.ipnx/.Main", "com.tailscale.ipn"))
+        self.assertFalse(F.vpn_launch_ok(("com.android.vpndialogs/.ConfirmDialog", True), "com.tailscale.ipn"))
+        self.assertTrue(F.vpn_launch_ok(("com.tailscale.ipn/.MainActivity", True), "com.tailscale.ipn"))
+        self.assertFalse(F.vpn_launch_ok(("com.tailscale.ipnx/.Main", True), "com.tailscale.ipn"))
+        # Review round 3: on top but not resumed is not launched.
+        self.assertFalse(F.vpn_launch_ok(("com.tailscale.ipn/.MainActivity", False), "com.tailscale.ipn"))
+
+    def test_resumed_exact_package_rule(self):
+        from riverqa import helper
+        dump = ("TASK 10 id=1\n  ACTIVITY app.zak.perch/.MainActivity 1a pid=100\n    mResumed=false\n"
+                "TASK 10 id=2\n  ACTIVITY app.zak.perch.fake/.MainActivity 2b pid=200\n    mResumed=true\n")
+        top = helper.resumed_top(dump)
+        self.assertEqual(top, ("app.zak.perch.fake/.MainActivity", True))
+        for pkg in ("app.zak.perch", "com.brave.browser", "com.t3tools.t3code", "com.android.deskclock"):
+            self.assertFalse(helper.activity_is(top, pkg), pkg)
+        self.assertFalse(helper.activity_is(("app.zak.perch/.MainActivity", False), "app.zak.perch"))
+        self.assertTrue(helper.activity_is(("app.zak.perch/.MainActivity", True), "app.zak.perch", "MainActivity"))
+        self.assertTrue(helper.activity_is(("app.zak.perch/app.zak.perch.MainActivity", True), "app.zak.perch",
+                                           "MainActivity"))
+        self.assertFalse(helper.activity_is(("app.zak.perch/.MainActivityX", True), "app.zak.perch", "MainActivity"))
+        self.assertFalse(helper.activity_is(("com.android.deskclockx/.DeskClock", True), "com.android.deskclock"))
+
+    def test_helper_foreground_needs_the_exact_package(self):
+        from fakes import FakeShell
+        from riverqa import helper
+        for comp, want in (("river.qa/.MainActivity", True), ("river.qa.evil/.MainActivity", False)):
+            dev = FakeShell({r"dumpsys activity top": (0, f"TASK 1 id=1\n  ACTIVITY {comp} 1 pid=1\n"
+                                                          "    mResumed=true\n"),
+                             r"dumpsys power": (0, "mWakefulness=Awake\n")})
+            self.assertEqual(helper.foreground(dev)[0], want, comp)
 
     def test_build_counts_untracked_files_as_dirty(self):
         build = Path(__file__).resolve().parents[2] / "scripts" / "build"

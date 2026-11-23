@@ -1041,7 +1041,7 @@ def full_run(run: Run, lock_result: Result) -> int:
                       kind=(run.batch or {}).get("kind"),
                       thresholds_calibrated=run.thresholds.get("calibrated") is True,
                       calibration_runs=calibration_runs(run.version),
-                      camera_set_change=bool((run.batch or {}).get("camera_set_change")))
+                      camera_set_change=(run.batch or {}).get("camera_set_change"))
     code = finish(run, REQUIRED, gate)
     record_calibration(run, code)
     if run.mode == "control":

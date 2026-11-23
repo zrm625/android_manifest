@@ -119,9 +119,21 @@ class Gate(unittest.TestCase):
 
     def test_camera_set_change_is_never_eligible(self):
         # A7: even with every check passing and Zak's approval verified.
-        ok, why = eligibility(all_pass(), gate(camera_set_change=True))
+        good = {"url": "https://github.com/zrm625/android_manifest/pull/1#issuecomment-2", "set": [0, 2]}
+        ok, why = eligibility(all_pass(), gate(camera_set_change=good))
         self.assertFalse(ok)
         self.assertEqual(why, ["camera set change: Zak merges by hand"])
+
+    def test_any_non_null_camera_set_change_is_never_eligible(self):
+        # Review round 3: falsy values ({}, false, "", []) are changes too,
+        # and a malformed one says so.
+        for change in ({}, False, "", [], 0, {"url": "u", "set": []}, {"url": "u", "set": [0, 0]},
+                       {"set": [0, 1]}, {"url": "u", "set": [0, True]}, {"url": "u", "set": [0], "x": 1}):
+            ok, why = eligibility(all_pass(), gate(camera_set_change=change))
+            self.assertFalse(ok, change)
+            self.assertIn("camera set change: Zak merges by hand", why)
+            self.assertTrue(any("malformed" in w for w in why), (change, why))
+        self.assertTrue(eligibility(all_pass(), gate(camera_set_change=None))[0])
 
 
 if __name__ == "__main__":

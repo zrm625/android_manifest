@@ -1046,3 +1046,11 @@ tail, otherwise UNVERIFIED; the silent tail) and these:
   extra-pass rejection included. The README's order of qualification spells
   out the final step: resolve the previous pair, flash with a wipe, bench,
   set up the phone, then the five clean calibrations.
+- **Smaller items.** Any non-null `camera_set_change` makes a batch
+  ineligible, and a malformed one (not `{"url": str, "set": [distinct camera
+  IDs]}`) is reported as such and makes `hardware.cameras` UNVERIFIED.
+  `scripts/build` counts untracked files as dirty even when git is set to
+  hide them (`--untracked-files=normal`). Every pass decided from the top
+  activity (Tailscale, T3 Code, Brave, Perch, DeskClock, the helper) needs
+  the **resumed** activity of the **exact** package; a prefix match or an
+  activity on top that isn't resumed never counts.

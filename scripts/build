@@ -61,7 +61,7 @@ tree=$(tree_for "$env_name") || usage 1
 # untracked build input changes the build without changing HEAD. phone-qa
 # recomputes the hash (qa/lib/riverqa/stage.py, commit_set_hash), so keep the
 # format in step.
-dirty() { [[ -n "$(git -C "$1" status --porcelain)" ]] && echo +dirty || true; }
+dirty() { [[ -n "$(git -C "$1" status --porcelain --untracked-files=normal)" ]] && echo +dirty || true; }
 commit_set() {
   local path
   { (cd "$tree" && "$REPO" forall -g "$FORK_GROUP" -c 'echo "$REPO_PATH"' 2>/dev/null) || true; } |
