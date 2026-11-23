@@ -1,6 +1,6 @@
 # Design: `phone-qa`, the QA harness for river batches (revision 11)
 
-Status: **approved by the council in round 11** (Opus 9, Sol 9, Gemini 9). This is revision 11, plus [amendment A1](#amendment-a1-the-adb-path-uptime-clock), which the council approved with conditions in code review round 1 and made strict in code review round 3, and [amendment A1′](#amendment-a1-reconcile-the-strict-anchor-with-the-phone-data), which replaces the round-3 anchor rule where the two conflict. The implementation notes from each round are at the end and must be applied during the build.
+Status: **approved by the council in round 11** (Opus 9, Sol 9, Gemini 9). This is revision 11, plus [amendment A2](#amendment-a2-drop-the-pstore-reset-anchor-and-add-an-immediate-reboot-bench-path), which replaces amendments [A1](#amendment-a1-the-adb-path-uptime-clock) and [A1′](#amendment-a1-reconcile-the-strict-anchor-with-the-phone-data). A1 and A1′ are kept below as history only. The implementation notes from each round are at the end and must be applied during the build.
 
 ## Council review
 
@@ -262,11 +262,12 @@ owns the whole sequence and holds one lock across all of it.
      rely on the other two signals.
    - **Uptime.** The clock starts at the first USB disconnect after the
      harness's reboot command, which leaves Android's variable shutdown time
-     out of it. On the `adb reboot` path, [amendment
-     A1](#amendment-a1-the-adb-path-uptime-clock) replaces this with the old
-     kernel's reset, because river's USB gadget drops seconds before the
-     reset. Any fastboot enumeration the harness didn't plan counts as an
-     extra boot. At boot completion, `/proc/uptime` must be at least the time
+     out of it. On the `adb reboot` path river's USB gadget drops seconds
+     before the reset, so [amendment
+     A2](#amendment-a2-drop-the-pstore-reset-anchor-and-add-an-immediate-reboot-bench-path)
+     records uptime there as INFO only and adds the immediate `sysrq`
+     reboot path, which has the gate. Any fastboot enumeration the harness
+     didn't plan counts as an extra boot. At boot completion, `/proc/uptime` must be at least the time
      since that disconnect, minus a bootloader allowance A set by calibration:
      - A must be at least the longest normal bootloader pass calibration
        measured;
@@ -287,8 +288,9 @@ owns the whole sequence and holds one lock across all of it.
    settles that, and it is better than a false pass. The `sys.boot.reason`
    string is recorded but not trusted. It differs from boot to boot on this
    phone and isn't needed by any rule.
-3. **Bench boot 1.** `device-bench current --boots 1 --batch <id>`. The setup
-   wizard is still untouched. Before any later reboot, `device-bench` records
+3. **Bench boot 1.** `device-bench current --boots 1 --batch <id>`. Under
+   amendment A2 this run also measures bench boot 2, the `sysrq` boot that
+   every batch needs. The setup wizard is still untouched. Before any later reboot, `device-bench` records
    health evidence for the boot it just measured. Each boot row gets a unique
    key (`run_id` plus `boot`). The evidence is:
    - `boot_id` and `sys.boot.reason`;
@@ -307,8 +309,8 @@ owns the whole sequence and holds one lock across all of it.
    If a boot's evidence is missing, the check is UNVERIFIED.
 4. **Bench boots 2–3, when the charter calls for them.** The runner decides
    before `phone-setup`, so every boot is measured in the same untouched state.
-   It runs `device-bench current --boots 2 --batch <id>` if any of these is
-   true:
+   Boot 2 already exists (amendment A2), so it runs `device-bench current
+   --boots 1 --batch <id>` for boot 3 if any of these is true:
    - boot 1 is more than the reference + 10 MB;
    - boot 1 is at or under 1,050 MB;
    - `/system` or `/vendor` grew compared with the latest known-good build (so
@@ -564,8 +566,10 @@ check requires Perch. The steps run in this order, and each one finishes
 before the next starts:
 
 1. **Boot-timing calibration, with no flash.** On the build running now, do
-   planned reboots on each path that matters: a plain `adb reboot`, and a
-   reboot through fastboot with no writes. The clock for each starts at the
+   planned reboots on each path that matters: the immediate `sysrq` reboot
+   and a reboot through fastboot with no writes ([amendment
+   A2](#amendment-a2-drop-the-pstore-reset-anchor-and-add-an-immediate-reboot-bench-path);
+   the `adb reboot` path has no uptime gate, only a chain control). The clock for each starts at the
    first USB disconnect after the harness's command. For flashing, the clock
    starts at the disconnect after the final `fastboot reboot`, so the time
    spent writing images is never counted. From these reboots, set the
@@ -657,7 +661,8 @@ before the next starts:
    | Alarm checked 1 minute early | FAIL |
    | `navigation_mode` 0, or HOME pointed elsewhere | FAIL (gestures) |
    | Camera set changed in `batch.json` | UNVERIFIED (and a batch with an approved `camera_set_change` is never eligible) |
-   | An extra reboot planted before boot completes (first boot and a bench boot) | FAIL |
+   | An extra reboot planted before boot completes (first boot, and the `sysrq` bench boot, where its uptime gate must reject it) | FAIL |
+   | An extra full reboot after ramoops init on an `adb reboot` like bench boot 1 (amendment A2) | FAIL, through the kernel-log chain |
    | An extra bootloader pass with no kernel session (`fastboot reboot bootloader`, then `fastboot reboot` straight away), inside a planned reboot. The clock starts at the disconnect that begins the injected pass, and those enumerations are marked planned. | FAIL, through the uptime check itself |
    | Tag pushed, then the host killed before `slot-state.json` was updated | Recovery promotes the batch and does not roll back |
 
@@ -846,6 +851,10 @@ Round-10 notes from Opus, to apply during implementation:
   `git ls-remote`, never real tags.
 
 ## Amendment A1: the adb-path uptime clock
+
+**Superseded by [amendment
+A2](#amendment-a2-drop-the-pstore-reset-anchor-and-add-an-immediate-reboot-bench-path).**
+Kept as history; none of the anchor below is in the code any more.
 
 Status: approved with conditions in council code review round 1 (Opus and
 Gemini approved; Sol objected to the first wording, and the conditions below
@@ -1066,6 +1075,11 @@ tail, otherwise UNVERIFIED; the silent tail) and these:
 
 ## Amendment A1′: reconcile the strict anchor with the phone data
 
+**Superseded by [amendment
+A2](#amendment-a2-drop-the-pstore-reset-anchor-and-add-an-immediate-reboot-bench-path),**
+except rules 1-2 (find the marker tolerantly, prove it by its stamp), which
+A2 keeps for the chain.
+
 Status: specified 2026-11-23 from the on-phone validation run. It replaces
 rule 2 of amendment A1 (the code review round 3 wording) wherever the two
 conflict, and the calibration of the shutdown-tail bound. Rule 1 (the
@@ -1142,3 +1156,104 @@ straight after, repeated until there are 3 tail samples; then the anchor
 rate on the adb path and both proofs per path. If the anchor rate is below
 about 90%, the rule is not loosened; the failing pstore dumps go to the
 council.
+
+## Amendment A2: drop the pstore reset anchor and add an immediate-reboot bench path
+
+Status: specified 2026-11-23 from the on-phone data below. It replaces
+amendments A1 and A1′. A1′ rules 1-2 stay, for the chain only.
+
+**Data.**
+- **A1′ failed on the phone.** After wipe #15 only 1 of 5 adb reboots got an
+  anchor. The lines after the marker had a damaged stamp 41-60% of the time:
+  rules 1-2 worked, rule 3 (the final lines) did not. Anchoring the `adb
+  reboot` path on pstore can't work on river. The dumps are in
+  `$BENCH_HOME/qa/pstore-noanchor/`.
+- **The immediate kernel reboot is as stable as fastboot.** `sync; echo b >
+  /proc/sysrq-trigger` as root (it works with `kernel.sysrq=0`), measured
+  three times: command to USB gone 1.17-1.28 s; USB gone to kernel start
+  10.06-10.08 s. The fastboot path's normal pass is 10.06-10.08 s, and an
+  injected extra pass adds about 4.4 s. USB drops at the reset itself, so
+  there is no variable shutdown tail.
+
+**The rule.**
+1. **Bench boot 1 stays a normal `adb reboot`.** The charter's boot metric
+   (`host_boot_seconds`, ≤ 55 s) is defined exactly as before, and the boot
+   also exercises a clean Android shutdown. Its reset detection is the
+   kernel-log chain plus the dropbox boot count. Uptime is recorded as INFO
+   only, with no anchor and no gate. An unplanned fastboot enumeration is
+   still a FAIL.
+2. **The chain** (`bootsig.chain_verdict`). PASS needs a copy of this
+   attempt's marker proven by its stamp (A1′ rules 1-2: a copy within 3 bit
+   flips whose strictly parsed stamp equals a live stamp of this attempt's
+   write, to the microsecond), with no new kernel session after it. An extra
+   kernel that ran after ramoops init replaces the pstore log, and its log
+   can't contain this attempt's marker, so a readable log with no copy of
+   the marker is a FAIL. A missing, empty or unreadable log is UNVERIFIED.
+   So are copies whose stamps are all damaged, and a marker whose stamps
+   were not read back: the log is the marker kernel's, but nothing proves
+   it. An exact copy without a proven stamp is not enough for PASS.
+3. **Every other bench boot uses the immediate reboot** (`sysrq`): `sync`,
+   then `echo b > /proc/sysrq-trigger`, as root, after the leaving marker
+   (`Device.reboot_sysrq`; a raw sysrq write through `Device.adb` is refused
+   like a raw reboot). **Every batch performs at least one**, even when the
+   charter needs only 1 bench boot: the first `device-bench --batch` run of a
+   flash attempt measures at least 2 boots, and `health.boot_signals` is
+   UNVERIFIED without a `sysrq` bench row, or if bench boot 1 is not `adb`.
+   That boot's RAM row counts like any other bench row; `device.csv` records
+   each row's `reboot_path`. Its gate is the uptime check from the USB
+   disconnect with the `sysrq` path's own A, plus the chain and the boot
+   count.
+4. **The first boot after a flash stays on the fastboot path**, with the
+   disconnect clock and its uptime gate unchanged.
+5. **Step 1** measures and qualifies the `fastboot` and `sysrq` paths. On
+   each: a normal boot passes; an injected extra bootloader pass is rejected
+   by the uptime check itself; an unmarked extra enumeration is rejected by
+   the enumeration rule. `sysrq-b` can't ask for the bootloader, so the
+   `sysrq` path's injected pass uses Motorola's `fastboot oem fb_mode_set`:
+   set it in fastboot, boot Android with `fastboot continue` (no reset),
+   write the marker, `sysrq` reboot (the clock starts at this disconnect),
+   the bootloader stops in fastboot (the injected pass), `fastboot oem
+   fb_mode_clear`, `fastboot reboot`. If anything fails in between, the
+   harness clears fb_mode before it gives up. The `adb` path has no uptime
+   proofs.
+6. **Controls.** `extra-reboot-bench` injects on the first `sysrq` bench
+   boot, and qualifies only if that boot's uptime gate is FAIL. The new
+   step-1 control `boot-timing-adb-extra-reboot` does an `adb reboot` like
+   bench boot 1 and, as soon as adb answers and before boot completes (far
+   past ramoops init, about 1 s into the kernel), reboots again with no
+   marker. It qualifies only if the fault went in and the chain itself is
+   FAIL. The step-1 controls are now `boot-timing-{fastboot,sysrq}-extra-pass`,
+   their `-unmarked` twins and `boot-timing-adb-extra-reboot`.
+7. **Deleted:** the corroborated stamps, the clean-tail rule and the
+   final-lines reset estimate, the host-time pairing of the marker write,
+   `max_shutdown_tail` and `shutdown-tails.jsonl`, the first-after-wipe tail
+   samples (and the first-boot record in `wipes.jsonl` that only they used),
+   `clock: reset-anchor`, and `pstore-noanchor/`. Step 1 now keeps the raw
+   pstore of every reboot whose chain did not pass in
+   `$BENCH_HOME/qa/pstore-unproven/`.
+
+**Residual risk.** A reset during bench boot 1 that happens before the
+interrupted kernel initialises ramoops (its first ~1 s) leaves the marker
+kernel's log in place, so the chain passes and that boot doesn't detect it.
+Only a kernel or bootloader change can cause such a reset, and in the same
+batch the fastboot first boot and the `sysrq` bench boot(s) are still
+uptime-gated, so the same change is very likely to show up there. A second
+residual: if every marker copy's stamp is damaged, the chain is UNVERIFIED
+and the boot is rerun; on the A1′ step-1 data, 2 of 13 boots had exact
+copies but no proven one.
+
+**Tests.** The chain: a proven copy passes; an exact copy without a live
+match, a damaged stamp, a stamp 1 µs off, a nonce one character off and copy
+mixing are UNVERIFIED; another kernel's log and a new session after the
+marker are FAIL; no single bit flip turns a good log into a FAIL. The judge:
+the gated paths use the disconnect clock, adb uptime is INFO (even with an
+old adb A on disk), an adb extra kernel fails through the chain. The `sysrq`
+reboot: guarded and root-only, a raw sysrq write is refused, the injected
+pass's call order and clock, and fb_mode is cleared after a failure. The
+bench plan, the sysrq-row and bench-boot-1 requirements, and the uptime-gate
+requirement of `extra-reboot-bench`.
+
+**Phone runs.** `phone-qa boot-timing` (after `flash --rollback` if a wipe is
+needed); A for each path, the normal passes, the injected increments and the
+controls; several `sysrq` reboots, whose uptime check must PASS every time;
+and the adb chain control once.
