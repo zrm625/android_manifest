@@ -239,7 +239,9 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     try:
         rec = reboots.planned_reboot(dev, "fastboot", boot_timeout=FIRST_BOOT_TIMEOUT, in_fastboot=in_fb)
     except TimeoutError as e:
-        log(f"error: {e}. Roll back: fastboot -s {SERIAL} --set-active={current}")
+        back = st["known_good_slot"] if st else current
+        log(f"error: {e}. Roll back to the {'known-good' if st else 'previous'} slot: "
+            f"flash --rollback, or fastboot -s {SERIAL} --set-active={back}")
         return EXIT_ERROR
     if st:
         st.setdefault("history", []).append({"event": "dev-flash", "at": now_iso(), "slot": target})
@@ -512,9 +514,10 @@ Usage:
                health evidence, and runs slot rescue if the boot fails.
 
 The images go to the slot that is not the known-good one (or, before the first
-baseline, the inactive slot), so the running build stays as a fallback. Every
-adb and fastboot wait has a deadline. Only the phone with serial ZY225DPT7F is touched (fixed in the code;
-BENCH_DEVICE may only repeat it), and only if it reports itself as river.
+baseline, the inactive slot), so the known-good slot stays as the fallback.
+Every adb and fastboot wait has a deadline. Only the phone with serial
+ZY225DPT7F is touched (fixed in the code; BENCH_DEVICE may only repeat it),
+and only if it reports itself as river.
 Every reboot command is guarded first.
 
 Exit codes: 0 done, 1 error, 3 halted (needs Zak), 4 boot failed and the phone

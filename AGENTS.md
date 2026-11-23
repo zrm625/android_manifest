@@ -131,7 +131,8 @@ The goal is to cut build time and image size against a frozen baseline.
   use, and idle CPU to `device.csv`.
 - **Install a build:** `.repo/manifests/scripts/flash <baseline|stripped> [--wipe]`.
   It uses fastboot to flash the slot that is not the known-good one, so the
-  running build stays as a fallback.
+  known-good slot (`known_good_slot` in `slot-state.json`) stays as the
+  fallback. That is not necessarily the build running now.
 - **Check a build on the phone:** `.repo/manifests/scripts/phone-qa --quick`
   after every flash (add `--wait` straight after one). It must pass before you
   open pull requests. The full edit-build-flash-check loop is in
