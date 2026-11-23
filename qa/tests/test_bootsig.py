@@ -411,6 +411,10 @@ def raw(path, bootloader_pass, tail=None, first_after_wipe=False, anchored=True)
     return r
 
 
+DROPBOX0 = "Drop box contents: 0 entries\n"
+DROPBOX1 = "Drop box contents: 1 entries\n\n2026-11-22 18:44:04 SYSTEM_BOOT (text, 443 bytes)\n"
+
+
 class Calibration(unittest.TestCase):
     """compute_paths and the report (R2-7)."""
 
@@ -465,6 +469,53 @@ class Calibration(unittest.TestCase):
         calibrate.compute_paths(empty)
         calibrate.summary(empty)
         self.assertFalse(calibrate.qualified(empty))
+
+    def test_first_after_wipe_is_tied_to_the_flash_record(self):
+        from riverqa import calibrate
+        wipe = {"seq": 9, "how": "flash", "first_boot_id": "boot-after-wipe"}
+        self.assertTrue(calibrate.first_after_wipe("adb", 0, "boot-after-wipe", 1, wipe)[0])
+        for args in (("fastboot", 0, "boot-after-wipe", 1, wipe),     # not adb
+                     ("adb", 1, "boot-after-wipe", 1, wipe),          # not step 1's first reboot
+                     ("adb", 0, "another-boot", 1, wipe),             # a boot came in between
+                     ("adb", 0, "boot-after-wipe", 2, wipe),          # dropbox disagrees
+                     ("adb", 0, "boot-after-wipe", 0, wipe),          # dropbox not written yet
+                     ("adb", 0, "boot-after-wipe", 1, dict(wipe, first_boot_id=None)),
+                     ("adb", 0, "boot-after-wipe", 1, None)):
+            self.assertFalse(calibrate.first_after_wipe(*args)[0], args)
+
+    def test_last_wipe_reads_the_first_boot(self):
+        import tempfile
+        from pathlib import Path
+        from riverqa import journal
+        with tempfile.TemporaryDirectory() as t:
+            home = Path(t)
+            self.assertIsNone(journal.last_wipe(home))
+            s1 = journal.record_wipe(home, "a1", "flash")
+            journal.record_wipe_boot(home, s1, "B1")
+            s2 = journal.record_wipe(home, "a2", "rollback")
+            self.assertEqual(journal.last_wipe(home)["seq"], s2)
+            self.assertIsNone(journal.last_wipe(home)["first_boot_id"])      # not booted yet
+            journal.record_wipe_boot(home, s2, "B2")
+            self.assertEqual(journal.last_wipe(home)["first_boot_id"], "B2")
+            self.assertEqual(journal.current_wipe_seq(home), s2)
+
+    def test_boot_count_now_waits_for_a_boot_entry(self):
+        from riverqa import calibrate
+        dumps = iter([DROPBOX0, DROPBOX0, DROPBOX1, DROPBOX1])
+
+        class Dev:
+            def sh(self, cmd, timeout=30):
+                return next(dumps)
+        with mock.patch.object(calibrate.time, "sleep", lambda s: None):
+            self.assertEqual(calibrate.boot_count_now(Dev()), 1)
+
+    def test_qualified_needs_all_three_proofs(self):
+        from riverqa import calibrate
+        proofs = {"proof_normal_pass": True, "proof_control_rejected": True, "proof_unmarked_rejected": True}
+        d = {"paths": {"adb": dict(proofs), "fastboot": dict(proofs)}}
+        self.assertTrue(calibrate.qualified(d))
+        d["paths"]["fastboot"]["proof_unmarked_rejected"] = False
+        self.assertFalse(calibrate.qualified(d))
 
     def test_controls_boot_timing_command(self):
         from riverqa import calibrate, qa

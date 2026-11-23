@@ -1037,3 +1037,12 @@ tail, otherwise UNVERIFIED; the silent tail) and these:
   path as other packages: a failed package listing is not proof it is gone.
   Leftover alarms are looked for in the past-due non-wakeup list too, not
   only the pending alarms. Setting restores verify with a checked read.
+- **Calibration.** "The first adb reboot after a wipe" comes from the flash
+  record: `flash` (dev flash, batch flash and rollback) writes the boot_id
+  of the first boot after each wipe to `wipes.jsonl`, and step 1's first adb
+  reboot counts only if it rebooted from that boot and dropbox holds exactly
+  one `SYSTEM_BOOT` (the count is read only once it has settled at 1 or
+  more). `qualified()` needs all three proofs per path, the unmarked
+  extra-pass rejection included. The README's order of qualification spells
+  out the final step: resolve the previous pair, flash with a wipe, bench,
+  set up the phone, then the five clean calibrations.

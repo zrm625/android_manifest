@@ -91,15 +91,36 @@ def usable(path: str, r: dict) -> bool:
 
 def boot_count_now(dev: Device, settle_s: float = 60) -> int:
     """SYSTEM_BOOT entries in dropbox once the count has settled (it is
-    written after BOOT_COMPLETED)."""
+    written after BOOT_COMPLETED, so a settled count is at least 1; review
+    round 3). At the deadline, whatever was last read (possibly 0)."""
     end = time.monotonic() + settle_s
     last = None
     while True:
         n = bootsig.dropbox_tags(dev.sh("dumpsys dropbox", timeout=60)).count("SYSTEM_BOOT")
-        if n == last or time.monotonic() > end:
+        if (n >= 1 and n == last) or time.monotonic() > end:
             return n
         last = n
         time.sleep(3)
+
+
+def first_after_wipe(path: str, index: int, boot_id_before: str | None, boots_before: int,
+                     wipe: dict | None) -> tuple[bool, str]:
+    """Is this step-1 reboot the first adb reboot after a recorded wipe
+    (review round 3)? Only if it is step 1's first reboot, on the adb path,
+    from the boot the flash record names as the wipe's first boot (so no
+    other boot came between), and dropbox holds exactly that one boot."""
+    if path != "adb" or index != 0:
+        return False, "not step 1's first adb reboot"
+    if not wipe:
+        return False, "no wipe recorded"
+    if not wipe.get("first_boot_id"):
+        return False, f"wipe #{wipe.get('seq')} has no recorded first boot"
+    if boot_id_before != wipe["first_boot_id"]:
+        return False, (f"rebooted from boot {str(boot_id_before)[:8]}, not wipe #{wipe['seq']}'s first boot "
+                       f"{wipe['first_boot_id'][:8]}")
+    if boots_before != 1:
+        return False, f"dropbox holds {boots_before} SYSTEM_BOOT entries, not 1"
+    return True, f"the first adb reboot after wipe #{wipe['seq']} ({wipe.get('how')})"
 
 
 def compute_paths(data: dict) -> None:
@@ -219,8 +240,12 @@ def summary(data: dict) -> list[str]:
 
 
 def qualified(data: dict) -> bool:
-    return all((data.get("paths", {}).get(p) or {}).get("proof_normal_pass")
-               and (data.get("paths", {}).get(p) or {}).get("proof_control_rejected") for p in reboots.PATHS)
+    """Every path has all three proofs: a normal boot passed, the marked
+    extra pass was rejected by the uptime check and the unmarked one by the
+    enumeration rule (review round 3)."""
+    return all(all((data.get("paths", {}).get(p) or {}).get(k)
+                   for k in ("proof_normal_pass", "proof_control_rejected", "proof_unmarked_rejected"))
+               for p in reboots.PATHS)
 
 
 def boot_timing_main(argv: list[str]) -> int:
@@ -288,7 +313,16 @@ def run(n_normal: int, reuse: bool = False) -> int:
                                                                              for p in reboots.PATHS):
         data["raw"] = old["raw"]
         data["reused_normals_from"] = old.get("measured_at")
+        # A flag set before review round 3 (dropbox count only) is not
+        # trusted: it carries no tie to the flash record.
+        for r in data["raw"].get("adb") or []:
+            if not r.get("first_after_wipe_why"):
+                r["first_after_wipe"] = False
         log(f"Reusing {sum(len(v) for v in old['raw'].values())} normal reboots from {old.get('measured_at')}")
+    from .flashing import qa_home
+    from .journal import last_wipe
+    wipe = last_wipe(qa_home())
+    data["wipe"] = wipe
     w = UsbWatcher(dev.serial).start()
     try:
         if not data.get("reused_normals_from"):
@@ -296,10 +330,11 @@ def run(n_normal: int, reuse: bool = False) -> int:
                 for path in reboots.PATHS:
                     before = boot_count_now(dev)
                     r = one(dev, w, path, timing_none, count_before=before, measuring=True)
-                    # The first adb reboot after a wipe: only the first boot
-                    # since the wipe is in dropbox (F1).
+                    # The first adb reboot after a wipe, tied to the flash
+                    # record's first boot after it (F1, review round 3).
                     r["boots_before"] = before
-                    r["first_after_wipe"] = path == "adb" and before == 1
+                    r["first_after_wipe"], r["first_after_wipe_why"] = first_after_wipe(
+                        path, i, r.get("boot_id_before"), before, wipe)
                     data["raw"][path].append(r)
                     write_json(bench_path("qa", "boot-timing.partial.json"), data)
         # One injected extra pass per path, to measure how long an extra

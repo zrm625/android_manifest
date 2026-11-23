@@ -139,7 +139,8 @@ def rollback(dev: Device, st: dict, reason: str, attempt_id: str | None = None) 
     dev.reboot_fastboot()
     try:
         dev.wait_for_device(FIRST_BOOT_TIMEOUT)
-        dev.wait_boot_completed(FIRST_BOOT_TIMEOUT)
+        booted = dev.wait_boot_completed(FIRST_BOOT_TIMEOUT)
+        journal.record_wipe_boot(qa_home(), seq, booted.boot_id)
         kgrec = st.get("known_good") or {}
         how = verify_slot_build(dev, fallback, kgrec.get("build_id"),
                                 (pair or {}).get("fallback_boot_sha256") or kgrec.get("boot_sha256"))
@@ -243,6 +244,8 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         log(f"error: {e}. Roll back to the {'known-good' if st else 'previous'} slot: "
             f"flash --rollback, or fastboot -s {SERIAL} --set-active={back}")
         return EXIT_ERROR
+    if attempt.get("wipe"):
+        journal.record_wipe_boot(qa_home(), attempt["wipe"]["seq"], rec.boot_id)
     if st:
         st.setdefault("history", []).append({"event": "dev-flash", "at": now_iso(), "slot": target})
         save_state(st)
@@ -340,6 +343,8 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
     attempt["first_boot"] = {"boot_id": rec.boot_id, "completed_at": now_iso(),
                              "host_boot_seconds": rec.host_boot_seconds}
     save_attempt()
+    if attempt.get("wipe") and rec.control is None:
+        journal.record_wipe_boot(qa_home(), attempt["wipe"]["seq"], rec.boot_id)
     batch["first_boot_seconds"] = rec.host_boot_seconds
     if rec.control in ("early-reboot", "early-reboot-missed"):
         batch.setdefault("control_injections", []).append(

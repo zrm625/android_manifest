@@ -178,10 +178,39 @@ changes:
 6. Note `phone-qa version`. This is the final version.
 7. Every other control (step 5 above) until `phone-qa controls` shows all of
    them qualified.
-8. Flash the Perch calibration batch again and run `phone-qa --calibrate`
-   five times, each with exit 0 and the full check set.
+8. The five clean calibrations. A flash archives the old attempt's bench
+   rows (`identity.bench_rows` then has nothing for the new attempt), so this
+   step does the whole flash sequence again, in this order:
+
+   ```sh
+   S=.repo/manifests/scripts
+   $S/flash --recover        # 1. resolve the previous pair (a calibration pair
+                             #    always rolls back: verified wipe, back to known-good)
+   $S/device-lock sh -c "$S/flash --batch CAL --wipe &&                  # 2. flash with a wipe
+     $S/bench/device-bench current --boots 3 --batch CAL"                # 3. bench (the 3-boot median)
+   $S/phone-setup --wifi SSID_FILE PSK_FILE                              # 4. set up the phone
+   for i in 1 2 3 4 5; do $S/phone-qa --calibrate --batch CAL || break; done   # 5. five clean runs
+   ```
+
+   `CAL` is the Perch calibration batch (kind `calibration`). `flash
+   --batch` refuses while any pair is open, including this batch's own
+   (`slots.preflight`), and needs the phone on `known_good_slot`, which the
+   rollback in 1 guarantees. `phone-setup` runs after `device-bench`, never
+   before, because the benchmark measures the phone with the wizard
+   untouched. Each of the five must exit 0 with the full check set (no
+   `--only` or `--skip`); they are recorded for the current version in
+   `$BENCH_HOME/qa/calibration.json`.
 9. Check that `phone-qa version` still prints the version from step 6 and
    that `phone-qa controls` exits 0.
+
+Step 2 is needed again after any change to the A1 anchor code (code review
+round 3 made it strict and added the calibrated `max_stamp_gap`): a
+`boot-timing.json` from older code has no `max_stamp_gap`, so the adb path
+stays UNVERIFIED until step 1 runs again straight after `flash --wipe`.
+Step 1 now takes "the first adb reboot after a wipe" from the flash record:
+`flash` records the boot_id of the first boot after every wipe in
+`wipes.jsonl`, and step 1's first adb reboot counts only if it rebooted from
+that boot and dropbox holds exactly one `SYSTEM_BOOT`.
 
 ## The uptime clock on the adb reboot path (amendment A1)
 
