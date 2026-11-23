@@ -70,10 +70,12 @@ def allowance_for(path: str, timing: dict | None = None) -> float | None:
 
 
 def chain_survives(path: str, timing: dict | None = None) -> bool | None:
-    """Step 1's record of whether the chain survives this path. Only the
-    gated paths have one (review round 4): on the adb path the chain is
-    bench boot 1's main signal and always counts, whatever an old file
-    says. None for any other path."""
+    """Step 1's record of whether the chain survived every normal reboot on
+    this path. Only the gated paths have one (review round 4). It is a
+    record only (R5-12): the chain counts on every path. A path whose chain
+    doesn't survive can't qualify anyway (a clean calibration sample needs
+    a chain PASS, so it gets no A), and a path with 3 clean samples and one
+    that wasn't must not lose its chain. None for any other path."""
     if path not in GATED_PATHS:
         return None
     timing = load_timing() if timing is None else timing
@@ -350,10 +352,8 @@ def judge_signals(dev: Device, rec: BootRecord, timing: dict | None = None) -> N
     timing = load_timing() if timing is None else timing
     try:
         dev.root()
-        # A path where step 1 showed the chain does not survive may have no
-        # console-ramoops at all: that is not a read error (review round 4).
-        ok, data, why = read_pstore(dev, "console-ramoops*",
-                                    missing_ok=chain_survives(rec.path, timing) is False)
+        # A missing console-ramoops is a read error on every path (R5-12).
+        ok, data, why = read_pstore(dev, "console-ramoops*")
     except (TimeoutError, RuntimeError) as e:
         ok, data, why = False, b"", str(e)
     rec.pstore_read_error = "" if ok else (why or "pstore read failed")
@@ -383,26 +383,18 @@ def judge_record(rec: BootRecord, pstore_log: bytes | None, timing: dict) -> Non
 
 
 def combined_verdict(signals: dict, path: str, timing: dict | None = None) -> tuple[str, str]:
-    """One verdict from the chain, uptime and boot-count signals of a boot.
-
-    A reboot path whose chain calibration showed does not survive relies on
-    the other two signals: its chain UNVERIFIED does not count, a chain FAIL
-    still does.
-    """
-    timing = load_timing() if timing is None else timing
+    """One verdict from the chain, uptime and boot-count signals of a boot:
+    the worst of the three. The chain counts on every path, so ``path``
+    and ``timing`` (step 1's chain record) no longer change it (R5-12)."""
     states, notes = [], []
     read_err = (signals.get("reboot") or {}).get("pstore_read_error")
     if read_err:
-        # A failed pstore read is never the same as a chain that doesn't
-        # survive this path: the whole verdict is UNVERIFIED.
+        # A failed pstore read: the whole verdict is UNVERIFIED.
         states.append(UNVERIFIED)
         notes.append(f"pstore read failed: {read_err}")
     chain = signals.get("chain") or ["UNVERIFIED", "missing"]
-    if chain[0] == UNVERIFIED and chain_survives(path, timing) is False:
-        notes.append(f"chain: not used on the {path} path ({chain[1]})")
-    else:
-        states.append(chain[0])
-        notes.append(f"chain: {chain[1]}")
+    states.append(chain[0])       # on every path (R5-12)
+    notes.append(f"chain: {chain[1]}")
     up = signals.get("uptime") or ["UNVERIFIED", "missing"]
     states.append(up[0])
     notes.append(f"uptime: {up[1]}")

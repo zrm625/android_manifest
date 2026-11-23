@@ -316,15 +316,30 @@ class Judge(unittest.TestCase):
         sig = {"chain": list(rec.chain), "uptime": list(rec.uptime_check), "boot_count": [PASS, "ok"]}
         self.assertEqual(reboots.combined_verdict(sig, "adb", {})[0], PASS)
 
-    def test_chain_not_used_on_path_where_it_does_not_survive(self):
-        timing = {"chain": {"fastboot": {"survives": False}}}
+    def test_chain_counts_on_every_path(self):
+        """R5-12: chain_survives is a record only. A chain UNVERIFIED counts
+        even where step 1 recorded survives False."""
         sig = {"chain": [UNVERIFIED, "x"], "uptime": [PASS, "ok"], "boot_count": [PASS, "ok"]}
-        self.assertEqual(reboots.combined_verdict(sig, "fastboot", timing)[0], PASS)
-        timing = {"chain": {"fastboot": {"survives": True}}}
-        self.assertEqual(reboots.combined_verdict(sig, "fastboot", timing)[0], UNVERIFIED)
+        for survives in (False, True, None):
+            timing = {"chain": {"fastboot": {"survives": survives}}}
+            self.assertEqual(reboots.combined_verdict(sig, "fastboot", timing)[0], UNVERIFIED, survives)
         sig["chain"] = [FAIL, "x"]
         self.assertEqual(reboots.combined_verdict(sig, "fastboot", {"chain": {"fastboot": {"survives": False}}})[0],
                          FAIL)
+
+    def test_mixed_chain_path_qualifies_but_keeps_its_chain(self):
+        """The case that made the old branch reachable: 3 clean normals
+        (chain PASS) and a fourth with chain UNVERIFIED give the path an A
+        and survives False. Its chain must still count."""
+        from riverqa import calibrate
+        d = {"raw": {"fastboot": [raw(10.07), raw(10.06), raw(10.08)],
+                     "sysrq": [raw(10.06), raw(10.07), raw(10.08), raw(10.07, chain=UNVERIFIED)]},
+             "inject_measure": {"fastboot": raw(14.47), "sysrq": raw(14.46)}, "paths": {}, "chain": {}}
+        calibrate.compute_paths(d)
+        self.assertIsNotNone(d["paths"]["sysrq"]["A"])
+        self.assertFalse(d["chain"]["sysrq"]["survives"])
+        sig = {"chain": [UNVERIFIED, "x"], "uptime": [PASS, "ok"], "boot_count": [PASS, "ok"]}
+        self.assertEqual(reboots.combined_verdict(sig, "sysrq", d)[0], UNVERIFIED)
 
     def test_allowance_needs_proofs(self):
         t = {"paths": {"sysrq": {"A": 12.3, "proof_normal_pass": True, "proof_control_rejected": False}}}
@@ -336,15 +351,14 @@ class Judge(unittest.TestCase):
         self.assertEqual(reboots.allowance_for("sysrq", t), 12.3)
 
     def test_chain_survives_only_on_gated_paths(self):
-        """Review round 4 (Gemini 4): an adb chain record never turns off
-        the chain on bench boot 1."""
+        """Review round 4 (Gemini 4): only the gated paths have a record;
+        since R5-12 it never turns the chain off anywhere."""
         timing = {"chain": {"adb": {"survives": False}, "sysrq": {"survives": False}}}
         self.assertIsNone(reboots.chain_survives("adb", timing))
         self.assertFalse(reboots.chain_survives("sysrq", timing))
         sig = {"chain": [UNVERIFIED, "x"], "uptime": [INFO, "x"], "boot_count": [PASS, "ok"]}
         self.assertEqual(reboots.combined_verdict(sig, "adb", timing)[0], UNVERIFIED)
-        self.assertEqual(reboots.combined_verdict(dict(sig, uptime=[PASS, "x"]), "sysrq", timing)[0], PASS)
-
+        self.assertEqual(reboots.combined_verdict(dict(sig, uptime=[PASS, "x"]), "sysrq", timing)[0], UNVERIFIED)
 
 def raw(bootloader_pass, chain=PASS, **kw):
     r = {"bootloader_pass": bootloader_pass, "chain": [chain, ""], "marker_copies_exact": 4,
@@ -587,23 +601,14 @@ class CheckedPstoreRead(unittest.TestCase):
         reboots.judge_signals(dev, rec, timing)
         return rec
 
-    def test_missing_console_ramoops_where_the_chain_does_not_survive(self):
-        """Review round 4 (Gemini 2): on a gated path whose chain step 1
-        showed does not survive, no console-ramoops at all is not a read
-        error; elsewhere it still is."""
+    def test_missing_console_ramoops_is_always_a_read_error(self):
+        """R5-12 replaces review round 4's Gemini 2 exception: no
+        console-ramoops is a read error on every path, whatever step 1
+        recorded."""
         dead = dict(TIMING, chain={"sysrq": {"survives": False}, "fastboot": {"survives": True}})
-        rec = self.judge((0, []), dead)                     # glob matched nothing
-        self.assertEqual(rec.pstore_read_error, "")
-        self.assertEqual(rec.chain[0], UNVERIFIED)
-        sig = {"chain": list(rec.chain), "uptime": list(rec.uptime_check), "boot_count": [PASS, "ok"],
-               "reboot": rec.to_json()}
-        self.assertEqual(reboots.combined_verdict(sig, "sysrq", dead)[0], PASS)
-        # A real read failure is still an error there.
+        for path in ("sysrq", "fastboot", "adb"):
+            self.assertTrue(self.judge((0, []), dead, path=path).pstore_read_error, path)
         self.assertTrue(self.judge((5, []), dead).pstore_read_error)
-        # Where the chain survives, and on adb, missing is an error.
-        self.assertTrue(self.judge((0, []), dead, path="fastboot").pstore_read_error)
-        self.assertTrue(self.judge((0, []), dict(dead, chain={"adb": {"survives": False}}), path="adb")
-                        .pstore_read_error)
 
     def test_good_read_passes(self):
         rec = self.judge((0, shutdown_log()))
