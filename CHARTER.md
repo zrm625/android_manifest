@@ -22,14 +22,17 @@ these rules on 2026-11-23. Change them only in a pull request that Zak approves.
 
 ### Regressions
 
-- **Boot:** the first boot after the wipe takes 55 s or less, timed from the
-  workstation (`host_boot_seconds` in `device.csv`).
+- **Boot:** 55 s or less, timed from the workstation (`host_boot_seconds` in
+  `device.csv`) for the first `device-bench` boot. That is the reboot after the
+  first boot following the wipe. The first boot itself runs setup work, takes
+  minutes, and is only recorded.
 - **RAM:** no worse than the reference. The reference is the lowest
   three-boot median of any known-good build. If one boot comes out more than
   10 MB over the reference, measure three boots. The batch fails if the median
   is more than 5 MB over the reference. This allows for measurement noise.
-- **Size:** `/system` and `/vendor` may not grow, unless the same batch lowers
-  the RAM median below the reference. This applies to upstream merges as well.
+- **Size:** `/system` and `/vendor` may not grow compared with the latest
+  known-good build, unless the same batch lowers the RAM median below the
+  reference. This applies to upstream merges as well.
 
 Low-RAM mode (`ro.config.low_ram`) is an experiment. Run it in its own batch
 and record the result, but don't merge it. Zak decides whether it ships.
@@ -62,8 +65,17 @@ means QA inspects the build output, not the phone.
 | | WebView | An app that shows a web page loads it. | auto |
 | | Video | A sample video plays with the hardware decoder. | auto |
 | | Time | The clock syncs over Wi-Fi. | auto |
-| Apps | Brave Origin | Sideloaded; opens a web page. | auto |
+| Apps | Brave | Installs, opens, and shows a web page. | auto |
+| | Tailscale | Installs and opens. Signing in needs Zak, so QA doesn't. | auto |
+| | T3 Code | Installs and opens. | auto |
 | | Perch | Home screen (see Home and gestures). | auto |
+
+QA installs the sideloaded apps from pinned APKs in
+`$BENCH_HOME/qa/fixtures/`: Brave from its GitHub releases (arm64), Tailscale
+from pkgs.tailscale.com, and T3 Code from its nightly Android builds. Update
+an app by replacing its APK and its pinned hash in one change. If an app's APK
+can no longer be found, drop the app from this list instead of failing
+batches.
 
 Not on the list, and not checked:
 
