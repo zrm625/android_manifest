@@ -80,7 +80,21 @@ fi
 # Screens stacked on top of the wizard (for example Settings screens opened by
 # a crash sweep) would make Back walk through all of them. Clear them first.
 a shell am force-stop com.android.settings >/dev/null 2>&1 || true
-a shell input keyevent WAKEUP >/dev/null 2>&1 || true
+
+# A bench or boot-timing run leaves the screen asleep, and taps on a sleeping
+# screen do nothing. Wake it and confirm it is awake (mWakefulness=Awake)
+# before every tap, retrying.
+awake() { [[ "$(sh_ dumpsys power)" == *mWakefulness=Awake* ]]; }
+wake() {
+  local i
+  for i in $(seq 10); do
+    awake && return 0
+    a shell input keyevent WAKEUP >/dev/null 2>&1 || true
+    sleep 1
+  done
+  awake || { echo "error: the screen does not wake up (mWakefulness is not Awake)" >&2; exit 1; }
+}
+wake
 # Mute touch, lock and charging sounds before tapping anything.
 a shell settings put system sound_effects_enabled 0
 a shell settings put system lockscreen_sounds_enabled 0
@@ -133,6 +147,7 @@ for step in $(seq 60); do
     echo "Setup wizard: finished"
     break
   fi
+  wake
   xml=''
   for _ in 1 2 3; do
     a shell uiautomator dump /sdcard/phone-setup.xml >/dev/null 2>&1 &&
@@ -154,6 +169,7 @@ for step in $(seq 60); do
   fi
   last=$action
   echo "  tap: $label"
+  wake
   a shell input tap "$x" "$y"
   sleep 2
 done
