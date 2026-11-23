@@ -370,15 +370,38 @@ def preflight(run: Run, lock_result: Result) -> bool:
 
 # --- identity ------------------------------------------------------------------------
 
+def build_id_verdict(batch: dict, system: str | None, vendor: str | None) -> tuple[str, str, dict]:
+    """identity.build_id from batch.json and the two partitions' stamps (A4).
+
+    kind batch: batch.json must tie the build to the batch
+    (stage.batch_identity_errors), and both partitions must carry that ID.
+    An unstamped build is allowed only for a baseline, whose identity then
+    rests on its dates, slot and boot hash (identity.props and
+    identity.boot_hash, both required); other kinds need a stamp."""
+    want = batch.get("build_id")
+    kind = batch.get("kind")
+    d = {"system": system, "vendor": vendor, "batch": want, "kind": kind}
+    if kind == "batch":
+        errs = stage.batch_identity_errors(batch)
+        if errs:
+            return FAIL, "batch.json does not tie the build to the batch: " + "; ".join(errs), d
+    elif not want or want == stage.UNSTAMPED:
+        if kind == "baseline" and system in (None, stage.UNSTAMPED) and vendor in (None, stage.UNSTAMPED):
+            d["fallback"] = "dates, slot and boot hash"
+            return PASS, ("unstamped baseline: identity rests on its dates, slot and boot hash "
+                          "(identity.props, identity.boot_hash)"), d
+        if kind == "baseline":
+            return FAIL, f"batch.json says unstamped, but the phone says system {system}, vendor {vendor}", d
+        return UNVERIFIED, f"a {kind} build must be stamped (batch.json build ID {want!r})", d
+    if system == want and vendor == want and batch.get("vendor_build_id") == want:
+        return PASS, f"system and vendor build.prop say {want}", d
+    return FAIL, f"system {system}, vendor {vendor}, batch {want}", d
+
+
 def check_build_id(run: Run) -> Result:
-    want = run.batch.get("build_id")
     s, v = flashing.partition_build_ids(run.dev)
-    d = {"system": s, "vendor": v, "batch": want}
-    if not want:
-        return Result("identity.build_id", UNVERIFIED, "batch.json has no build ID (unstamped build)", d)
-    if s == want and v == want and run.batch.get("vendor_build_id") == want:
-        return Result("identity.build_id", PASS, f"system and vendor build.prop say {want}", d)
-    return Result("identity.build_id", FAIL, f"system {s}, vendor {v}, batch {want}", d)
+    st, msg, d = build_id_verdict(run.batch, s, v)
+    return Result("identity.build_id", st, msg, d)
 
 
 def check_boot_hash(run: Run) -> Result:
@@ -753,11 +776,22 @@ def baseline_close(run: Run) -> None:
     kg = regression.baseline_record(None, run.batch_id, run.batch.get("commit_set") or {},
                                     [r["run_id"] for r in rows], rows[:3], run.batch["cameras"]["set"])
     st = flashing.load_state()
-    sha = flashing.boot_partition_sha(run.dev, run.flash_attempt["target"])
-    flashing.slots.close_baseline(st, run.batch_id, run.batch["build_id"], sha, now_iso())
+    target = run.flash_attempt["target"]
+    if flashing.running_slot(run.dev) != target:
+        log(f"Baseline not closed: the phone is not running slot {target}.")
+        return
+    sha = flashing.boot_partition_sha(run.dev, target)
+    bid = run.batch.get("build_id")
+    stamped = bool(bid) and bid != stage.UNSTAMPED
+    identity = None if stamped else {"dates": dict(run.batch["dates"]), "slot": target, "boot_sha256": sha}
+    # One atomic slot-state write carries the promotion and the seed; then
+    # known-good.json is written and the checkpoint marked done (C2).
+    flashing.slots.close_baseline(st, run.batch_id, bid if stamped else None, sha, now_iso(), seed=kg,
+                                  identity=identity)
     flashing.save_state(st)
-    write_json(KNOWN_GOOD, kg)
-    log(f"Baseline closed: known_good_slot {st['known_good_slot']}, RAM reference "
+    flashing.finish_checkpoint(st)
+    log(f"Baseline closed: known_good_slot {st['known_good_slot']} ("
+        f"{'build ID ' + bid if stamped else 'unstamped: dates, slot and boot hash'}), RAM reference "
         f"{kg['ram_reference']['median_mb']:.1f} MB (seed), known-good.json written.")
     run.add(Result("baseline.closed", INFO, f"known-good.json written; slot {st['known_good_slot']} is known-good"))
 

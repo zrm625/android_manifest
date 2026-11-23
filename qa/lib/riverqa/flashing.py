@@ -358,15 +358,54 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
     return EXIT_OK
 
 
-def promote_batch(batch_id: str) -> int:
+def known_good_path() -> Path:
+    return bench_path("qa", "known-good.json")
+
+
+def finish_checkpoint(st: dict) -> bool:
+    """Write known-good.json from a closed baseline's seed if the checkpoint
+    was interrupted between the slot-state write and this one (C2). Returns
+    True if it wrote anything."""
+    seed = slots.checkpoint_pending(st)
+    if seed is None:
+        return False
+    write_json(known_good_path(), seed)
+    slots.seed_written(st, now_iso())
+    save_state(st)
+    log(f"Finished the baseline checkpoint of {st['baseline_closed']['batch']}: known-good.json written.")
+    return True
+
+
+def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
+    """flash --promote: make a merged and tagged batch's slot known-good.
+
+    The fallback is released only with proof, from the same lookup and the
+    same decision recovery uses, that every PR is merged and every repo has
+    the tag at the merge commit (C1). Baseline pairs never come through here:
+    they close only through phone-qa --baseline. Unstamped builds and builds
+    not tied to the batch are refused (A4)."""
     st = load_state()
     if not st or not st.get("pair") or st["pair"]["batch"] != batch_id:
         log(f"error: no reserved pair for {batch_id}")
         return EXIT_ERROR
+    pair = st["pair"]
+    if pair["kind"] != "batch":
+        log(f"error: {batch_id} holds a {pair['kind']} pair, which is never promoted. A baseline closes only "
+            "through phone-qa --baseline; the other kinds roll back (flash --rollback).")
+        return EXIT_ERROR
     batch = stage.load(batch_id)
-    dev = Device(SERIAL)
+    errs = stage.batch_identity_errors(batch)
+    if errs:
+        log(f"error: {batch_id}'s build is not tied to the batch: " + "; ".join(errs))
+        return EXIT_ERROR
+    look = recovery.lookup(batch, runner)
+    decision, why = slots.decide_recovery(pair, look)
+    if decision != slots.PROMOTE:
+        log(f"error: {batch_id} is not proven merged and tagged ({why}). The fallback slot stays reserved.")
+        return EXIT_HALT if decision == slots.HALT else EXIT_ERROR
+    dev = dev or Device(SERIAL)
     dev.guard()
-    target = st["pair"]["target"]
+    target = pair["target"]
     if running_slot(dev) != target:
         log(f"error: the phone is not running the candidate slot {target}")
         return EXIT_ERROR
@@ -375,35 +414,34 @@ def promote_batch(batch_id: str) -> int:
         log(f"error: candidate build IDs {s}/{v} differ from batch.json {batch['build_id']}")
         return EXIT_ERROR
     sha = boot_partition_sha(dev, target)
-    if batch["pair"]["kind"] == "baseline":
-        slots.close_baseline(st, batch_id, s, sha, now_iso())
-    else:
-        slots.promote(st, batch_id, s, sha, now_iso())
+    slots.promote(st, batch_id, s, sha, now_iso())
     save_state(st)
-    log(f"Promoted {batch_id}: known_good_slot is now {target}")
+    log(f"Promoted {batch_id} ({why}): known_good_slot is now {target}")
     return EXIT_OK
 
 
-def recover(runner=None) -> int:
+def recover(runner=None, dev: Device | None = None) -> int:
     st = load_state()
+    if st and finish_checkpoint(st):
+        st = load_state()
     if not st or not st.get("pair"):
         log("No unresolved pair.")
         return EXIT_OK
     pair = st["pair"]
     batch = read_json(batch_dir(pair["batch"]) / "batch.json", {}) or {}
-    look = None if pair["kind"] != "batch" else recovery.lookup(batch, *( [runner] if runner else []))
+    look = None if pair["kind"] != "batch" else recovery.lookup(batch, runner)
     decision, why = slots.decide_recovery(pair, look)
     log(f"Recovery for {pair['batch']} ({pair['kind']}): {decision}: {why}")
     st.setdefault("history", []).append({"event": "recovery-decision", "at": now_iso(),
                                          "batch": pair["batch"], "decision": decision, "why": why})
     save_state(st)
-    dev = Device(SERIAL)
     if decision == slots.HALT:
         log("HALT: notify Zak.")
         return EXIT_HALT
+    dev = dev or Device(SERIAL)
     try:
         if decision == slots.PROMOTE:
-            return promote_batch(pair["batch"])
+            return promote_batch(pair["batch"], runner, dev)
         dev.guard() if dev.state() == "device" else None
         rollback(dev, st, f"recovery: {why}")
         return EXIT_OK
@@ -420,7 +458,9 @@ def show_status() -> int:
     kg = st.get("known_good") or {}
     print(f"known_good_slot: {st['known_good_slot']} ({'provisional' if kg.get('provisional') else 'confirmed'}; "
           f"build {kg.get('build_id')}; boot {str(kg.get('boot_sha256'))[:12]})")
-    print(f"baseline closed: {st.get('baseline_closed')}")
+    bc = st.get("baseline_closed")
+    print("baseline closed: no" if not bc else f"baseline closed: {bc['batch']} at {bc['at']}"
+          + ("" if bc.get("seed_written", True) else " (checkpoint interrupted: run flash --recover)"))
     p = st.get("pair")
     print("pair: none" if not p else f"pair: batch {p['batch']} ({p['kind']}), target {p['target']}, "
           f"fallback {p['fallback']}, written {p['written']}")
@@ -438,6 +478,9 @@ Usage:
   flash --recover         Resolve an unresolved pair: look up the batch's merge and
                           tag state (gh, git ls-remote) and promote, roll back or halt.
   flash --promote ID      The batch was merged and tagged: make its slot known-good.
+                          Checks every PR is merged and every repo has the tag at
+                          the merge commit first (same lookup as --recover).
+                          Never for a baseline (phone-qa --baseline closes those).
   flash --status          Show slot-state.json.
 
   baseline|stripped  Use $BENCH_HOME/out-<env>/target/product/river.

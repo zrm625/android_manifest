@@ -4,7 +4,7 @@
 # than hours.
 #
 # Usage: build [--tree baseline|stripped] [--installclean] [--clean] [--ccache] [--jobs N] [--target T]
-#              [--build-id ID]
+#              [--build-id ID | --batch ID]
 #
 #   --tree     Which tree to build. Default: stripped (this tree).
 #   --installclean  Delete the staged partitions and images first, but keep
@@ -23,6 +23,8 @@
 #              checks. Letters, digits, '.', '_' and '-' only. A batch build
 #              passes "<batch id>-<commit set hash>". Default: $RIVER_BUILD_ID
 #              if set, otherwise "dev-<time>-<commit set hash>".
+#   --batch ID Build for batch ID: the build ID is "ID-<commit set hash>", which
+#              is what phone-qa stage requires of a batch. Refuses a dirty tree.
 #
 # Output goes to $BENCH_HOME/out-<tree>/, which is what scripts/flash installs.
 # A successful build also writes out-<tree>/river-build.json: the build ID and
@@ -34,7 +36,7 @@ source "$(dirname "$(realpath "$0")")/bench/lib.sh"
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-env_name=stripped installclean=0 clean=0 ccache=0 jobs=$(nproc) target=bacon build_id=${RIVER_BUILD_ID:-}
+env_name=stripped installclean=0 clean=0 ccache=0 jobs=$(nproc) target=bacon build_id=${RIVER_BUILD_ID:-} batch=
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tree) env_name=$2; shift ;;
@@ -44,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --jobs) jobs=$2; shift ;;
     --target) target=$2; shift ;;
     --build-id) build_id=$2; shift ;;
+    --batch) batch=$2; shift ;;
     -h|--help) usage 0 ;;
     *) echo "unknown option: $1" >&2; usage 1 ;;
   esac
@@ -52,19 +55,25 @@ done
 tree=$(tree_for "$env_name") || usage 1
 [[ -d "$tree/.repo" ]] || { echo "error: no repo tree at $tree" >&2; exit 1; }
 
-# The commit set: one "<path> <sha>" line per fork, plus the manifest. A
-# dirty repo gets "+dirty", so an uncommitted build never looks committed.
+# The commit set: one "<path> <sha>" line per fork in byte order, plus the
+# manifest. A dirty repo, the manifest included, gets "+dirty", so an
+# uncommitted build never looks committed. phone-qa recomputes the hash
+# (qa/lib/riverqa/stage.py, commit_set_hash), so keep the format in step.
+dirty() { [[ -n "$(git -C "$1" status --porcelain -uno)" ]] && echo +dirty || true; }
 commit_set() {
   local path
   { (cd "$tree" && "$REPO" forall -g "$FORK_GROUP" -c 'echo "$REPO_PATH"' 2>/dev/null) || true; } |
     while read -r path; do
-      printf '%s %s%s\n' "$path" "$(git -C "$tree/$path" rev-parse HEAD)" \
-        "$( [[ -n "$(git -C "$tree/$path" status --porcelain -uno)" ]] && echo +dirty)"
-    done | sort
-  printf '.repo/manifests %s\n' "$(git -C "$tree/.repo/manifests" rev-parse HEAD)"
+      printf '%s %s%s\n' "$path" "$(git -C "$tree/$path" rev-parse HEAD)" "$(dirty "$tree/$path")"
+    done | LC_ALL=C sort
+  printf '.repo/manifests %s%s\n' "$(git -C "$tree/.repo/manifests" rev-parse HEAD)" "$(dirty "$tree/.repo/manifests")"
 }
 commits=$(commit_set)
 commit_hash=$(sha256sum <<<"$commits" | cut -c1-10)
+if [[ -n "$batch" ]]; then
+  [[ "$commits" != *+dirty* ]] || { echo "error: --batch needs a clean tree; dirty: $(grep -F +dirty <<<"$commits" | cut -d' ' -f1 | tr '\n' ' ')" >&2; exit 1; }
+  build_id="$batch-$commit_hash"
+fi
 [[ -n "$build_id" ]] || build_id="dev-$(date +%Y%m%d-%H%M%S)-$commit_hash"
 [[ "$build_id" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || { echo "error: bad build ID '$build_id'" >&2; exit 1; }
 export RIVER_BUILD_ID=$build_id

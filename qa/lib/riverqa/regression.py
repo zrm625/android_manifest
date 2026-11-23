@@ -131,7 +131,11 @@ def baseline_record(tag: str | None, batch_id: str, commit_set: dict, run_ids: l
     if med is None:
         raise ValueError("the baseline needs exactly 3 measured boots")
     b1 = boot_rows[0]
+    seed = {"batch": batch_id, "run_ids": run_ids, "median_mb": round(med, 3)}
     return {
+        # Immutable: the harness version hashes this, never ram_reference,
+        # so retiring the seed at the first tag doesn't change the version.
+        "calibration_seed": seed,
         "latest": {
             "tag": tag, "batch": batch_id, "commit_set": commit_set, "run_ids": run_ids,
             "host_boot_seconds": float(b1["host_boot_seconds"]),
