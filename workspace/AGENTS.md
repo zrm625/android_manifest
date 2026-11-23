@@ -14,7 +14,7 @@ it, edit it there and open a pull request (see [Rules](#rules)).
 | --- | --- | --- |
 | `tree/` | `~/git/lineageos-river` | The source tree you work in (manifest branch `river-22.2`) |
 | `baseline/` | `~/git/lineageos-river-baseline` | Frozen stock tree for comparison (locked branch `baseline-22.2`). Never edit it. |
-| `scripts/` | `tree/.repo/manifests/scripts` | `change`, `build`, `flash`, `phone-check`, `phone-setup`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
+| `scripts/` | `tree/.repo/manifests/scripts` | `change`, `build`, `flash`, `phone-qa`, `phone-setup`, `device-lock`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
 | `bench/` | `/mnt/storage/lineageos-bench` | Working build output (`out-stripped/`), benchmark output (`out-bench-*/`), `results/`, `logs/` |
 | `phone` | Moto G7, USB serial `ZY225DPT7F` | The only test phone |
 
@@ -75,7 +75,10 @@ scripts/flash stripped            # update over a previous build of this tree
 `scripts/flash` reboots the phone to the bootloader and checks that it is
 `river`. It writes `boot`, `dtbo`, `system` and `vendor` to the **inactive**
 A/B slot, switches to that slot, and waits for the phone to boot. The slot that
-was running stays untouched.
+was running stays untouched. Once the QA harness has a known-good slot
+(`$BENCH_HOME/slot-state.json`), `flash` always writes the other slot, never
+the known-good one; `scripts/flash --status` shows which is which, and
+`scripts/flash --rollback` returns to the known-good build (it wipes data).
 
 `--wipe` erases all data on the phone. It is needed whenever the signing keys
 change. Builds from this tree are signed with test keys, so moving from an
@@ -155,14 +158,17 @@ The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
 5. **Check the phone works:**
 
    ```sh
-   scripts/phone-check                  # add --wait right after a flash
+   scripts/phone-qa --quick             # add --wait right after a flash
    ```
 
-   It takes about 2 seconds and prints PASS, WARN or FAIL for: the phone runs
-   the build you just made, boot, SELinux, crashes and tombstones, services
-   crashing or restarting in a loop, Wi-Fi with internet, Bluetooth, GPS,
-   cameras, sensors, fingerprint, audio, and no telephony. It exits 1 on any
-   FAIL. Then use the feature you changed on the phone itself.
+   It takes a few seconds and checks the health group: boot finished, SELinux
+   enforcing, no crashes since boot, no new tombstones, no services crashing
+   or restarting in a loop, and no telephony. These gate: it exits 1 on any
+   FAIL. It also prints INFO lines for the build in `bench/out-stripped`,
+   Wi-Fi, Bluetooth, GPS, cameras, sensors, fingerprint and audio, which need
+   a look but never fail the run. The full QA (`phone-qa --batch`) is for
+   batches; see `tree/.repo/manifests/qa/README.md`. Then use the feature you
+   changed on the phone itself.
 
    If the phone does not boot, see "Roll back" above: the previous build is
    still on the other slot.
@@ -196,7 +202,7 @@ The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
    no image default, so the script sets it.
 
 7. **Open the pull requests and merge** them, one command each however many
-   repos the change touched. Paste the `phone-check` and `device-bench`
+   repos the change touched. Paste the `phone-qa --quick` and `device-bench`
    results into the description:
 
    ```sh
