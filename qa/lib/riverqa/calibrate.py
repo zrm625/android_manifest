@@ -25,9 +25,11 @@ extra-pass proofs. Its control is the chain: an extra full reboot injected
 after ramoops init must FAIL through the kernel-log chain
 (prove_adb_chain).
 
-It also records whether the kernel-log chain survives each gated path and
-how often ramoops corrupts the marker. The raw pstore of every reboot whose
-chain did not pass is kept under $BENCH_HOME/qa/pstore-unproven/ for
+It also records whether the kernel-log chain survives each gated path
+(every normal boot on it got a chain PASS) and how often ramoops corrupts
+the marker. A path where it does not survive relies on the other two
+signals (reboots.combined_verdict). The raw pstore of every reboot whose
+chain did not pass is kept under $BENCH_HOME/qa/pstore-nopass/ for
 diagnosis. Results: $BENCH_HOME/qa/boot-timing.json. The proofs are part of
 the control set (controls.json).
 
@@ -67,15 +69,12 @@ def one(dev: Device, w: UsbWatcher, path: str, timing: dict, *, inject=False, ma
     _ok, log_bytes, _why = read_pstore(dev, "console-ramoops*")
     exact = log_bytes.count(rec.marker.encode()) if rec.marker else 0
     copies = len(bootsig.marker_offsets(log_bytes, rec.marker)) if rec.marker else 0
-    proven = (bootsig.proven_marker(log_bytes, rec.marker, rec.marker_stamps)[0] is not None
-              if rec.marker and rec.marker_stamps else False)
     d = rec.to_json()
     d["marker_copies_exact"] = exact
     d["marker_copies_fuzzy"] = copies
     d["marker_found_fuzzy"] = copies > 0
-    d["marker_proven"] = proven
     if rec.chain[0] != PASS and log_bytes:
-        d["pstore_saved"] = str(save_unproven_pstore(rec, log_bytes))
+        d["pstore_saved"] = str(save_nopass_pstore(rec, log_bytes))
     d["pstore_bytes"] = len(log_bytes)
     if count_before is not None:
         st, msg = reboots.read_boot_count(dev, count_before + 1, settle_s=90)
@@ -84,24 +83,23 @@ def one(dev: Device, w: UsbWatcher, path: str, timing: dict, *, inject=False, ma
     log(f"  {path:8} {kind}{'' if mark_planned else ' unmarked'}: "
         f"boot {rec.host_boot_seconds:.1f} s, uptime {rec.uptime:.1f} s, elapsed {rec.elapsed:.2f} s, "
         f"pass {rec.bootloader_pass:.2f} s, fastboot planned {rec.planned_fastboot} unplanned "
-        f"{rec.unplanned_fastboot}, chain {rec.chain[0]} ({exact} exact copies, proven {proven}), "
+        f"{rec.unplanned_fastboot}, chain {rec.chain[0]} ({exact} exact copies, {copies} within flips), "
         f"uptime-check {rec.uptime_check[0]}{' (' + rec.control + ')' if rec.control else ''}")
     ids = sorted({e['ids'] for e in d['usb_events'] if e['kind'] == 'present'})
     log(f"           usb ids seen: {ids}")
     return d
 
 
-def save_unproven_pstore(rec, log_bytes: bytes):
+def save_nopass_pstore(rec, log_bytes: bytes):
     """Keep the raw pstore of a reboot whose chain did not pass:
-    $BENCH_HOME/qa/pstore-unproven/<time>-<marker>.bin, with the live
-    stamps and the verdict next to it."""
+    $BENCH_HOME/qa/pstore-nopass/<time>-<marker>.bin, with the marker and
+    the verdict next to it."""
     name = time.strftime("%Y%m%d-%H%M%S") + "-" + (rec.marker or "nomarker").replace(":", "_")
-    out = bench_path("qa", "pstore-unproven", name + ".bin")
+    out = bench_path("qa", "pstore-nopass", name + ".bin")
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_bytes(log_bytes)
-    write_json(out.with_suffix(".json"), {"path": rec.path, "marker": rec.marker, "marker_stamps": rec.marker_stamps,
-                                          "chain": list(rec.chain), "control": rec.control,
-                                          "boot_id_before": rec.boot_id_before})
+    write_json(out.with_suffix(".json"), {"path": rec.path, "marker": rec.marker, "chain": list(rec.chain),
+                                          "control": rec.control, "boot_id_before": rec.boot_id_before})
     return out
 
 
@@ -135,8 +133,7 @@ def compute_paths(data: dict) -> None:
         chains = [r["chain"][0] for r in raws]
         data["chain"][path] = {"survives": bool(chains) and all(c == PASS for c in chains), "verdicts": chains,
                                "exact_copies": [r.get("marker_copies_exact") for r in raws],
-                               "fuzzy_found": [r.get("marker_found_fuzzy") for r in raws],
-                               "proven": [r.get("marker_proven") for r in raws]}
+                               "fuzzy_found": [r.get("marker_found_fuzzy") for r in raws]}
         inj = data["inject_measure"].get(path)
         empty = {"A": None, "normal_passes": passes[path], "proof_normal_pass": False,
                  "proof_control_rejected": False, "proof_unmarked_rejected": False}

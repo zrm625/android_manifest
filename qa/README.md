@@ -226,12 +226,14 @@ many lines on river for that to work, so A2 dropped it. The `sysrq` reboot
 resets at once (USB gone 1.17-1.28 s after the command, then 10.06-10.08 s to
 kernel start, like the fastboot path).
 
-The chain needs a copy of the leaving marker proven by its stamp: a copy
-within 3 bit flips whose stamp equals, to the microsecond, a stamp read back
-from live `dmesg` right after the write. No copy at all in a readable log is
-a FAIL (another kernel's log replaced it). Copies with only damaged stamps
-are UNVERIFIED. `boot-timing` keeps the raw pstore of every reboot whose
-chain did not pass in `$BENCH_HOME/qa/pstore-unproven/`.
+The chain passes when the previous kernel's log holds a copy of this
+attempt's leaving marker, within 3 wrong characters, with no new kernel
+session after it (amendment A2.1). Each marker carries a fresh 64-bit random
+nonce, so a copy of any other write can't match (about 1 in 10¹³); printk
+stamps play no part. No copy at all in a readable log is a FAIL (another
+kernel's log replaced it). No marker, or a missing, empty or unreadable
+pstore, is UNVERIFIED. `boot-timing` keeps the raw pstore of every reboot
+whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
 
 ## Known issues
 
@@ -240,10 +242,10 @@ chain did not pass in `$BENCH_HOME/qa/pstore-unproven/`.
   the marker kernel's log survives and the chain passes. Only a kernel or
   bootloader change can cause that, and the same batch's fastboot first boot
   and `sysrq` bench boot are still uptime-gated. See DESIGN.md, amendment A2.
-- **A damaged marker can make a boot UNVERIFIED.** ramoops has no ECC. If
-  every copy's stamp is damaged, the chain can't prove the copy and the boot
-  is UNVERIFIED; rerun it. On the A1′ step-1 data, 2 of 13 boots had exact
-  copies but no proven one.
+- **A badly damaged marker fails the chain.** ramoops has no ECC. If every
+  copy of the marker has more than 3 wrong characters, the log looks like
+  another kernel's and the chain is FAIL. No boot on the A1′ or A2 data had
+  that; the raw pstore is kept in `$BENCH_HOME/qa/pstore-nopass/`.
 - **A stuck fb_mode.** The `sysrq` extra-pass control sets `fastboot oem
   fb_mode_set` for one boot and clears it on success and on failure. If the
   harness was killed in between, the phone stops in fastboot on every boot:
@@ -297,7 +299,7 @@ chain did not pass in `$BENCH_HOME/qa/pstore-unproven/`.
 | `qa/tests/` | Host-side unit tests (`unittest`) |
 | `$BENCH_HOME/batches/<id>/` | `batch.json`, staged images, `flash.json`, per-boot evidence under `boots/` |
 | `$BENCH_HOME/slot-state.json` | The slot pair and `known_good_slot` |
-| `$BENCH_HOME/qa/` | `known-good.json`, `boot-timing.json`, `pstore-unproven/`, `controls.json`, `calibration.json`, `journal.json`, `wipes.jsonl`, `history.jsonl`, `runs/` |
+| `$BENCH_HOME/qa/` | `known-good.json`, `boot-timing.json`, `pstore-nopass/`, `controls.json`, `calibration.json`, `journal.json`, `wipes.jsonl`, `history.jsonl`, `runs/` |
 
 ## Interfaces for the batch runner
 

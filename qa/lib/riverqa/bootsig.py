@@ -3,9 +3,10 @@
 1. Kernel-log chain: before every planned reboot the harness writes a marker
    token to /dev/kmsg (several copies, because ramoops here has no ECC and
    flips bits). At the next boot completion, /sys/fs/pstore/console-ramoops*
-   holds the previous kernel's log, which must contain the latest leaving
-   marker with no new kernel session after it.
-   PASS needs a copy proven by its stamp (amendment A2, chain_verdict).
+   holds the previous kernel's log, which must contain a copy of this
+   attempt's leaving marker with no new kernel session after it. The
+   marker's 64-bit random nonce ties the log to this attempt's write
+   (amendment A2.1, chain_verdict).
 2. Uptime: /proc/uptime at boot completion must be at least the host time
    since the USB disconnect, minus a bootloader allowance A set by
    calibration. Only the fastboot and sysrq paths have an A: on both the
@@ -28,8 +29,14 @@ MARKER_PREFIX = "RQM"
 BANNER_RE = re.compile(rb"Linux version \d+\.\d+")
 
 
+NONCE_HEX = 16           # 64 random bits (amendment A2.1)
+
+
 def make_marker(boot_id: str, nonce: str | None = None) -> str:
-    nonce = nonce or secrets.token_hex(4)
+    """``RQM:<16 hex nonce>:<8 hex boot_id>``. A copy of another write
+    differs in about 15 of the 16 nonce characters, so it can only match
+    within MAX_MARKER_FLIPS by chance (about 1e-13; DESIGN.md, A2.1)."""
+    nonce = nonce or secrets.token_hex(NONCE_HEX // 2)
     return f"{MARKER_PREFIX}:{nonce}:{boot_id.replace('-', '')[:8]}"
 
 
@@ -46,7 +53,10 @@ def marker_offsets(log: bytes, marker: str, max_flips: int = MAX_MARKER_FLIPS) -
     m = marker.encode()
     n = len(m)
     hits = set()
-    # Anchor on every 6-character slice of the token to keep the scan cheap.
+    # Anchor on 6-character slices of the token, every 3 characters, to keep
+    # the scan cheap. A character sits in at most 2 slices, so max_flips
+    # flips break at most 2 * max_flips of them; the 29-character marker
+    # has 8 slices, so a copy within 3 flips always keeps one intact.
     for k in range(0, n - 5, 3):
         piece = m[k:k + 6]
         start = 0
@@ -61,85 +71,16 @@ def marker_offsets(log: bytes, marker: str, max_flips: int = MAX_MARKER_FLIPS) -
     return sorted(hits)
 
 
-TS_RE = re.compile(rb"\[\s*(\d{1,6})\.(\d{6})\]")
-STRICT_STAMP_RE = re.compile(rb"\[( *)(\d{1,6})\.(\d{6})\] ")
+def chain_verdict(pstore_log: bytes | None, marker: str | None) -> tuple[str, str]:
+    """Judge the kernel-log chain for one boot (amendment A2.1).
 
-
-def _strict_at(buf: bytes, pos: int) -> tuple[float, int] | None:
-    """(stamp, end) of a strictly parsed stamp starting at ``pos``: the
-    kernel's own "[%5lu.%06lu] " layout with no leading zero."""
-    m = STRICT_STAMP_RE.match(buf, pos)
-    if not m:
-        return None
-    pad, sec = m.group(1), m.group(2)
-    if len(sec) > 1 and sec.startswith(b"0"):
-        return None                     # a padding space flipped to '0'
-    if len(pad) + len(sec) != max(5, len(sec)):
-        return None
-    return int(sec) + int(m.group(3)) / 1e6, m.end()
-
-
-def stamp_before(log: bytes, off: int) -> float | None:
-    """The strictly parsed stamp that ends exactly at ``off`` (the "[...] "
-    straight before a marker copy), or None. Only the stamp next to the
-    copy counts, never an earlier one on a merged line."""
-    j = log.rfind(b"[", max(0, off - 16), off)
-    if j < 0:
-        return None
-    hit = _strict_at(log, j)
-    return hit[0] if hit is not None and hit[1] == off else None
-
-
-def _same_us(a: float, b: float) -> bool:
-    return round(a * 1e6) == round(b * 1e6)
-
-
-def proven_marker(log: bytes, marker: str, live: list[float]) -> tuple[tuple[int, float] | None, str]:
-    """((offset, stamp), note) of the last copy of ``marker`` proven by its
-    stamp (A1′ rules 1-2, kept by A2 for the chain): a copy within
-    MAX_MARKER_FLIPS wrong characters whose strict stamp (stamp_before)
-    equals one of ``live`` to the microsecond. (None, why) if no copy is
-    proven."""
-    offs = marker_offsets(log, marker)
-    if not offs:
-        return None, f"no copy of the leaving marker (within {MAX_MARKER_FLIPS} bit flips) in the previous kernel's log"
-    proven, seen = [], []
-    for off in offs:
-        t = stamp_before(log, off)
-        if t is None:
-            continue
-        seen.append(t)
-        if any(_same_us(t, x) for x in live):
-            proven.append((off, t))
-    if not proven:
-        got = ", ".join(f"{t:.6f}" for t in seen) or "none parse strictly"
-        return None, (f"{len(offs)} copies of the leaving marker, but no stamp next to one ({got}) equals a live "
-                      f"stamp of this write ({', '.join(f'{x:.6f}' for x in live)}): not proven the same write")
-    off, t = proven[-1]
-    return (off, t), f"copy at {off} proven by its stamp {t:.6f} ({len(proven)} of {len(offs)} copies proven)"
-
-
-def marker_printk_stamps(dmesg: str, marker: str) -> list[float]:
-    """The printk stamps of every copy of ``marker`` in live dmesg, in order."""
-    out = []
-    for line in dmesg.splitlines():
-        if line.rstrip().endswith(marker):
-            m = TS_RE.match(line.encode())
-            if m:
-                out.append(int(m.group(1)) + int(m.group(2)) / 1e6)
-    return out
-
-
-def chain_verdict(pstore_log: bytes | None, marker: str | None, live: list[float] | None) -> tuple[str, str]:
-    """Judge the kernel-log chain for one boot (amendment A2).
-
-    ``live`` holds the stamps of this attempt's marker copies, read back
-    from live dmesg right after the write. PASS needs a copy proven by its
-    stamp (proven_marker) with no new kernel session after it. An extra
+    PASS: the previous kernel's log holds at least one copy of this
+    attempt's marker (within MAX_MARKER_FLIPS) and no new kernel session
+    after the first copy. The nonce alone shows the log belongs to the
+    kernel that wrote this marker; printk stamps play no part. An extra
     kernel that ran past ramoops init replaces the log, so a readable log
-    with no copy of this attempt's marker at all, or a new session after
-    one, is a FAIL. A missing or empty log, a marker that was not read back,
-    or copies whose stamps are all damaged is UNVERIFIED."""
+    with no copy, or a new session after one, is a FAIL. No marker, or a
+    missing or empty log, is UNVERIFIED."""
     if not marker:
         return UNVERIFIED, "no leaving marker was written before this boot"
     if pstore_log is None or len(pstore_log) == 0:
@@ -150,12 +91,9 @@ def chain_verdict(pstore_log: bytes | None, marker: str | None, live: list[float
                       "ran after ramoops init and replaced it")
     if BANNER_RE.search(pstore_log[offs[0]:]):
         return FAIL, "a new kernel session started after the leaving marker"
-    if not live:
-        return UNVERIFIED, "the leaving marker was not read back from live dmesg, so no copy can be proven"
-    rec, why = proven_marker(pstore_log, marker, live)
-    if rec is None:
-        return UNVERIFIED, why
-    return PASS, f"previous kernel log ends with the leaving marker ({why})"
+    exact = pstore_log.count(marker.encode())
+    return PASS, (f"previous kernel log holds {len(offs)} copies of the leaving marker ({exact} exact) "
+                  "and no new session after them")
 
 
 def uptime_verdict(uptime_s: float, elapsed_since_disconnect_s: float, allowance_s: float | None,

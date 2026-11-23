@@ -8,7 +8,7 @@ from riverqa import reboots
 from riverqa.device import Read, UsbEvent
 from riverqa.results import FAIL, INFO, PASS, UNVERIFIED
 
-MARKER = "RQM:11111111:aaaaaaaa"
+MARKER = "RQM:1111111111111111:aaaaaaaa"
 COPY_STEP = 0.00003      # river writes 4 copies about 30 us apart
 
 
@@ -50,157 +50,110 @@ def flip_bytes(text: bytes, positions) -> bytes:
 
 
 class Chain(unittest.TestCase):
-    """Amendment A2: PASS needs a copy proven by its stamp; an extra kernel
+    """Amendment A2.1: PASS needs a copy of this attempt's marker (within 3
+    flips) and no new session after it; stamps play no part. An extra kernel
     after ramoops init leaves no copy, which is a FAIL."""
 
-    def test_proven_copy_passes(self):
-        self.assertEqual(b.chain_verdict(shutdown_log(), MARKER, [100.0])[0], PASS)
-        self.assertEqual(b.chain_verdict(shutdown_log(copies=4), MARKER, copies_at(100.0, 4))[0], PASS)
+    def test_copy_passes(self):
+        self.assertEqual(b.chain_verdict(shutdown_log(), MARKER)[0], PASS)
+        self.assertEqual(b.chain_verdict(shutdown_log(copies=4), MARKER)[0], PASS)
 
-    def test_exact_copy_without_proof_is_unverified(self):
-        # A2: even an exact copy needs its stamp to equal a live one.
-        self.assertEqual(b.chain_verdict(shutdown_log(), MARKER, None)[0], UNVERIFIED)
-        self.assertEqual(b.chain_verdict(shutdown_log(), MARKER, [100.000001])[0], UNVERIFIED)
-        damaged = shutdown_log().replace(b"[  100.000000] RQM", b"[  100.0\xb00000] RQM")
-        self.assertEqual(b.chain_verdict(damaged, MARKER, [100.0])[0], UNVERIFIED)
+    def test_damaged_stamp_passes(self):
+        # Under A2 these were UNVERIFIED; the stamp no longer matters.
+        for bad in (b"[  100.0\xb00000] RQM", b"[  100/000000] RQM", b"[ 0100.000000] RQM",
+                    b"[  100.000000]\xa0RQM", b"K  100.000000] RQM"):
+            log = shutdown_log().replace(b"[  100.000000] RQM", bad)
+            self.assertEqual(b.chain_verdict(log, MARKER)[0], PASS, bad)
 
-    def test_damaged_copy_proven_by_its_stamp_passes(self):
-        flipped = shutdown_log().replace(MARKER.encode(), b"RQM:11111111:aaaaaaab")
-        self.assertEqual(b.chain_verdict(flipped, MARKER, [100.0])[0], PASS)
-        self.assertEqual(b.chain_verdict(flipped, MARKER, [100.000001])[0], UNVERIFIED)
-
-    def test_extra_kernel_log_is_fail(self):
-        for live in ([100.0], None):
-            st, why = b.chain_verdict(other_kernel_log(), MARKER, live)
-            self.assertEqual(st, FAIL)
-            self.assertIn("another kernel ran after ramoops init", why)
-        # A long log with no copy and no banner is the same: the marker
-        # kernel's log is gone.
-        self.assertEqual(b.chain_verdict(b"[  500.000000] something\n" * 10, MARKER, [100.0])[0], FAIL)
-
-    def test_new_session_after_the_marker_is_fail(self):
-        new = shutdown_log() + line(0.0, b"Linux version 4.9.337")
-        self.assertEqual(b.chain_verdict(new, MARKER, [100.0])[0], FAIL)
-        self.assertEqual(b.chain_verdict(new, MARKER, None)[0], FAIL)
-
-    def test_missing_pstore_or_marker_is_unverified(self):
-        self.assertEqual(b.chain_verdict(None, MARKER, [100.0])[0], UNVERIFIED)
-        self.assertEqual(b.chain_verdict(b"", MARKER, [100.0])[0], UNVERIFIED)
-        self.assertEqual(b.chain_verdict(shutdown_log(), None, None)[0], UNVERIFIED)
-
-    def test_nonce_one_character_off_is_never_proof(self):
-        # The log holds only another write's marker, one nonce character
-        # away. Its copies are found (1 flip) but their stamps belong to that
-        # write: UNVERIFIED, never PASS.
-        other = "RQM:11111112:aaaaaaaa"
-        log = shutdown_log(marker_ts=99.0, copies=4, marker=other)
-        self.assertEqual(b.chain_verdict(log, MARKER, copies_at(100.0, 4))[0], UNVERIFIED)
-
-    def test_copy_mixing(self):
-        # Copy 1 has the exact text but a damaged stamp; copy 2 has its live
-        # stamp but text 4 flips away (not a copy). Nothing may combine them.
+    def test_copies_within_three_flips_pass(self):
         m = MARKER.encode()
-        log = shutdown_log(copies=2)
-        log = log.replace(b"[  100.000000] " + m, b"[  100.0\xb00000] " + m)
-        log = log.replace(b"[  100.000030] " + m, b"[  100.000030] " + flip_bytes(m, (4, 8, 12, 16)))
-        st, why = b.chain_verdict(log, MARKER, copies_at(100.0, 2))
-        self.assertEqual(st, UNVERIFIED)
-        self.assertIn("not proven the same write", why)
+        for n in (1, 2, 3):
+            log = shutdown_log().replace(m, flip_bytes(m, range(4, 4 + n)))
+            self.assertEqual(b.chain_verdict(log, MARKER)[0], PASS, n)
+        log = shutdown_log().replace(m, flip_bytes(m, range(4, 8)))
+        self.assertEqual(b.chain_verdict(log, MARKER)[0], FAIL)      # 4 flips: not a copy
 
-    def test_real_style_dump_all_copies_damaged(self):
-        # A1′ data: on a real dump the 4 copies had 2, 1, 2 and 4 wrong
-        # bytes. The 4-byte one is not a copy; the stamps of copies 1 and 3
-        # are damaged; copy 2 keeps a stamp equal to a live one.
+    def test_every_three_flip_copy_is_found(self):
+        # The 6-character anchor scan must never miss a copy within 3 flips,
+        # wherever the flips land in the 29-character marker.
+        m = MARKER.encode()
+        self.assertEqual(len(m), 29)
+        head, tail = line(1.0, b"init"), b"\n" + line(110.0, b"shutdown step")
+        for pos in itertools.combinations(range(len(m)), 3):
+            log = head + b"[  100.000000] " + flip_bytes(m, pos) + tail
+            self.assertEqual(b.marker_offsets(log, MARKER), [len(head) + 15], pos)
+
+    def test_real_style_dump_all_stamps_damaged(self):
+        # A1'/A2 data: the 4 copies had 2, 1, 2 and 4 wrong bytes and three
+        # damaged stamps. Three copies are within 3 flips: PASS.
         m = MARKER.encode()
         log = line(0.0, b"Linux version 4.9.337") + line(1.0, b"init")
         log += b"[  100.00\xb0000] " + flip_bytes(m, (5, 17)) + b"\n"
-        log += b"[  100.000030] " + flip_bytes(m, (9,)) + b"\n"
-        log += b"[\xa0 100.000060] " + flip_bytes(m, (4, 20)) + b"\n"
+        log += b"[\xa0 100.000030] " + flip_bytes(m, (9,)) + b"\n"
+        log += b"[\xa0 100.00006\xb0] " + flip_bytes(m, (4, 20)) + b"\n"
         log += b"[  100.000090] " + flip_bytes(m, (4, 8, 12, 16)) + b"\n"
         log += b"".join(line(t, b"shutdown step") for t in SHUTDOWN)
         self.assertEqual(log.count(m), 0)
-        self.assertEqual(b.chain_verdict(log, MARKER, copies_at(100.0, 4))[0], PASS)
-        self.assertEqual(b.chain_verdict(log, MARKER, None)[0], UNVERIFIED)
+        st, why = b.chain_verdict(log, MARKER)
+        self.assertEqual(st, PASS)
+        self.assertIn("3 copies", why)
 
-    def test_river_step1_dump(self):
-        # The 2026-11-23 step-1 log behind 1faf721: the only exact copy has a
-        # damaged stamp; a fuzzy copy's stamp is 1 us off every live stamp;
-        # the third copy's stamp equals a live one.
-        log = line(0.0, b"Linux version 4.9.337") + line(1.0, b"init")
-        log += b"[\xa0 100.00\xb3000] " + MARKER.encode() + b"\n"
-        log += line(100.000031, MARKER.replace(":1111", ":1i11").encode())
-        third = MARKER.replace(":", "\xaa", 1).encode("latin-1")
-        log += line(100.00006, third)
-        log += b"".join(line(t, b"shutdown step") for t in SHUTDOWN)
-        live = copies_at(100.0, 3)
-        self.assertEqual(b.chain_verdict(log, MARKER, live)[0], PASS)
-        self.assertEqual(b.chain_verdict(log.replace(third, b"other message here..."), MARKER, live)[0],
-                         UNVERIFIED)
+    def test_extra_kernel_log_is_fail(self):
+        st, why = b.chain_verdict(other_kernel_log(), MARKER)
+        self.assertEqual(st, FAIL)
+        self.assertIn("another kernel ran after ramoops init", why)
+        # A long log with no copy and no banner is the same: the marker
+        # kernel's log is gone.
+        self.assertEqual(b.chain_verdict(b"[  500.000000] something\n" * 10, MARKER)[0], FAIL)
+
+    def test_new_session_after_the_marker_is_fail(self):
+        new = shutdown_log() + line(0.0, b"Linux version 4.9.337")
+        st, why = b.chain_verdict(new, MARKER)
+        self.assertEqual(st, FAIL)
+        self.assertIn("new kernel session", why)
+        # Also between copies: the session counts from the first copy.
+        log = shutdown_log() + line(0.0, b"Linux version 4.9.337") + line(5.0, MARKER.encode())
+        self.assertEqual(b.chain_verdict(log, MARKER)[0], FAIL)
+
+    def test_missing_pstore_or_marker_is_unverified(self):
+        self.assertEqual(b.chain_verdict(None, MARKER)[0], UNVERIFIED)
+        self.assertEqual(b.chain_verdict(b"", MARKER)[0], UNVERIFIED)
+        self.assertEqual(b.chain_verdict(shutdown_log(), None)[0], UNVERIFIED)
+        self.assertEqual(b.chain_verdict(shutdown_log(), "")[0], UNVERIFIED)
+
+    def test_marker_from_another_write_does_not_match(self):
+        # Same boot, an independently generated 64-bit nonce: a different
+        # write. Its copies are not this attempt's marker, so the log is
+        # another kernel's (FAIL), never PASS. A copy of this attempt's
+        # marker with 3 flipped nonce characters still matches.
+        mine = b.make_marker("aaaaaaaa-bbbb")
+        other = b.make_marker("aaaaaaaa-bbbb")
+        self.assertEqual(len(mine.split(":")[1]), b.NONCE_HEX)
+        self.assertNotEqual(mine, other)
+        self.assertEqual(b.chain_verdict(shutdown_log(copies=4, marker=other), mine)[0], FAIL)
+        flipped = mine[:4] + "".join("x" if i in (0, 7, 15) else c for i, c in enumerate(mine[4:20])) + mine[20:]
+        self.assertEqual(b.hamming(flipped.encode(), mine.encode()), 3)
+        self.assertEqual(b.chain_verdict(shutdown_log(marker=flipped), mine)[0], PASS)
+
+    def test_random_nonces_never_match_each_other(self):
+        # 10,000 pairs of different writes from the same boot: none is ever
+        # within MAX_MARKER_FLIPS of the other, at any alignment.
+        for _ in range(10000):
+            m1, m2 = b.make_marker("aaaaaaaa-bbbb"), b.make_marker("aaaaaaaa-bbbb")
+            if m1 == m2:
+                continue
+            self.assertEqual(b.marker_offsets(b"[  100.000000] " + m2.encode() + b"\n", m1), [], (m1, m2))
 
     def test_no_single_bit_flip_turns_a_good_log_into_a_fail(self):
         # ramoops damage alone must never look like an extra kernel: flip
         # each bit from the first marker copy to the end, one at a time.
         log = shutdown_log(copies=4)
-        live = copies_at(100.0, 4)
         start = log.index(b"[  100.000000]")
         for i in range(start, len(log)):
             for bit in range(8):
                 bad = bytearray(log)
                 bad[i] ^= 1 << bit
-                self.assertNotEqual(b.chain_verdict(bytes(bad), MARKER, live)[0], FAIL, (i, bit))
-
-
-class StrictStamp(unittest.TestCase):
-    def test_kernel_layout_only(self):
-        for good, want in ((b"[  100.000000] ", 100.0), (b"[ 2751.918245] ", 2751.918245),
-                           (b"[123456.000001] ", 123456.000001)):
-            self.assertEqual(b.stamp_before(good + b"RQM", len(good)), want)
-        for bad in (b"[ 0100.000000] ",        # padding space flipped to '0'
-                    b"[ 100.000000] ",         # wrong padding
-                    b"[  100/000000] ",        # '.' flipped
-                    b"[  100.00\xb0000] ",     # digit flipped to a non-digit
-                    b"K  100.000000] ",        # '[' flipped
-                    b"[  100.000000]\xa0"):    # the space after ']' flipped
-            self.assertIsNone(b.stamp_before(bad + b"RQM", len(bad)), bad)
-
-
-class ProvenMarker(unittest.TestCase):
-    """A1′ rules 1-2, kept by A2: find copies tolerantly, prove one by its stamp."""
-
-    def test_last_proven_copy(self):
-        log = shutdown_log(copies=4)
-        (off, ts), _ = b.proven_marker(log, MARKER, copies_at(100.0, 4))
-        self.assertAlmostEqual(ts, 100.0 + 3 * COPY_STEP)
-        self.assertTrue(log[off:].startswith(MARKER.encode()))
-        self.assertEqual(log[off - 15:off], b"[  100.000090] ")
-
-    def test_damaged_text_within_three_flips_is_found(self):
-        for n in (1, 2, 3):
-            log = shutdown_log().replace(MARKER.encode(), flip_bytes(MARKER.encode(), range(4, 4 + n)))
-            rec, why = b.proven_marker(log, MARKER, [100.0])
-            self.assertIsNotNone(rec, (n, why))
-        log = shutdown_log().replace(MARKER.encode(), flip_bytes(MARKER.encode(), range(4, 8)))
-        self.assertIsNone(b.proven_marker(log, MARKER, [100.0])[0])     # 4 flips: not a copy
-
-    def test_damaged_stamp_is_not_proof(self):
-        for bad in (b"[  100/000000] RQM", b"[ 0100.000000] RQM", b"[  100.000000]\xa0RQM"):
-            log = shutdown_log().replace(b"[  100.000000] RQM", bad)
-            rec, why = b.proven_marker(log, MARKER, [100.0])
-            self.assertIsNone(rec, bad)
-            self.assertIn("not proven the same write", why)
-
-    def test_stamp_off_by_one_microsecond_is_rejected(self):
-        rec, why = b.proven_marker(shutdown_log(marker_ts=100.000001), MARKER, [100.0, 100.000002])
-        self.assertIsNone(rec)
-        self.assertIn("100.000001", why)
-
-    def test_merged_line_uses_the_stamp_next_to_the_marker(self):
-        for joined in (b"init[  100.000000]", b"init\x8a[  100.000000]"):
-            log = shutdown_log().replace(b"init\n[  100.000000]", joined)
-            self.assertEqual(b.proven_marker(log, MARKER, [100.0])[0][1], 100.0)
-        # An earlier stamp on the line is never used in place of a damaged one.
-        log = shutdown_log().replace(b"init\n[  100.000000] RQM", b"init [    1.000000]\x8a  RQM")
-        self.assertIsNone(b.proven_marker(log, MARKER, [1.0, 100.0])[0])
+                self.assertEqual(b.chain_verdict(bytes(bad), MARKER)[0], PASS, (i, bit))
 
 
 class Uptime(unittest.TestCase):
@@ -251,7 +204,7 @@ TIMING = {"paths": {"sysrq": dict(GATED), "fastboot": dict(GATED)}}
 
 
 def record(path="sysrq", **kw):
-    rec = reboots.BootRecord(path=path, marker=MARKER, boot_id_before="x", marker_stamps=[100.0])
+    rec = reboots.BootRecord(path=path, marker=MARKER, boot_id_before="x")
     rec.uptime, rec.elapsed = 35.0, 45.0
     for k, v in kw.items():
         setattr(rec, k, v)
@@ -312,7 +265,7 @@ class Judge(unittest.TestCase):
 
 def raw(bootloader_pass, chain=PASS):
     return {"bootloader_pass": bootloader_pass, "chain": [chain, ""], "marker_copies_exact": 4,
-            "marker_found_fuzzy": True, "marker_proven": chain == PASS}
+            "marker_found_fuzzy": True}
 
 
 DROPBOX0 = "Drop box contents: 0 entries\n"
@@ -356,12 +309,13 @@ class Calibration(unittest.TestCase):
         calibrate.summary(empty)
         self.assertFalse(calibrate.qualified(empty))
 
-    def test_chain_record_counts_unproven_boots(self):
+    def test_chain_record_counts_boots_that_did_not_pass(self):
         from riverqa import calibrate
         d = self.data(sysrq=[raw(10.06), raw(10.07, chain=UNVERIFIED)])
         calibrate.compute_paths(d)
         self.assertFalse(d["chain"]["sysrq"]["survives"])
-        self.assertEqual(d["chain"]["sysrq"]["proven"], [True, False])
+        self.assertEqual(d["chain"]["sysrq"]["verdicts"], [PASS, UNVERIFIED])
+        self.assertNotIn("proven", d["chain"]["sysrq"])
 
     def test_qualified_needs_every_proof_and_the_adb_chain_control(self):
         from riverqa import calibrate
@@ -448,14 +402,16 @@ class CheckedPstoreRead(unittest.TestCase):
                              UNVERIFIED)
 
 
-class Readback(unittest.TestCase):
-    class Dev:
-        """kmsg() results are taken from ``writes_ok`` in order; dmesg holds
-        every marker whose write succeeded, at ``dmesg_ts`` + 1 s per write."""
+class LeaveMarker(unittest.TestCase):
+    """leave_marker writes a fresh 64-bit nonce per attempt, checks the
+    write, and reads nothing back (A2.1)."""
 
-        def __init__(self, dmesg_ts=100.25, writes_ok=(True, True, True)):
-            self.ts, self.ok = dmesg_ts, list(writes_ok)
-            self.markers, self.dmesg, self.reads = [], [], []
+    class Dev:
+        """kmsg() results are taken from ``writes_ok`` in order."""
+
+        def __init__(self, writes_ok=(True, True, True)):
+            self.ok = list(writes_ok)
+            self.markers = []
 
         def root(self):
             pass
@@ -465,41 +421,30 @@ class Readback(unittest.TestCase):
 
         def kmsg(self, text):
             self.markers.append(text)
-            ok = self.ok.pop(0)
-            if ok and self.ts is not None:
-                self.dmesg.append(f"[{self.ts + len(self.dmesg):11.6f}] {text}")
-            return ok
+            return self.ok.pop(0)
 
         def read(self, cmd, timeout=30):
-            self.reads.append(cmd)
-            want = cmd.rsplit(" ", 1)[1]
-            return Read(0, "".join(line + "\n" for line in self.dmesg if want in line))
+            raise AssertionError(f"no live readback under A2.1: {cmd}")
 
-    def test_marker_read_back_with_its_stamps(self):
+    def test_marker_written(self):
         dev = self.Dev()
-        marker, bid, stamps = reboots.leave_marker(dev)
+        marker, bid = reboots.leave_marker(dev)
         self.assertEqual(marker, dev.markers[0])
         self.assertEqual(bid, "aaaaaaaa-bbbb")
-        self.assertEqual(stamps, [100.25])
+        self.assertRegex(marker, r"^RQM:[0-9a-f]{16}:aaaaaaaa$")
 
-    def test_no_readback_keeps_the_marker_without_stamps(self):
-        marker, _bid, stamps = reboots.leave_marker(self.Dev(dmesg_ts=None))
-        self.assertIsNotNone(marker)
-        self.assertIsNone(stamps)
-
-    def test_failed_write_is_retried_and_reads_back_only_its_own_nonce(self):
+    def test_failed_write_is_retried_with_a_new_nonce(self):
         dev = self.Dev(writes_ok=(False, True))
-        dev.dmesg.append(f"[{99.0:11.6f}] {b.make_marker('aaaaaaaa', '00000000')}")   # an older write
-        marker, _bid, stamps = reboots.leave_marker(dev)
+        marker, _bid = reboots.leave_marker(dev)
         self.assertEqual(marker, dev.markers[1])
         self.assertNotEqual(dev.markers[0], dev.markers[1])
-        self.assertEqual(stamps, [101.25])
-        self.assertEqual(len(dev.reads), 1)
 
     def test_all_writes_fail(self):
-        marker, _bid, stamps = reboots.leave_marker(self.Dev(writes_ok=(False, False, False)))
+        dev = self.Dev(writes_ok=(False, False, False))
+        marker, bid = reboots.leave_marker(dev)
         self.assertIsNone(marker)
-        self.assertIsNone(stamps)
+        self.assertEqual(bid, "aaaaaaaa-bbbb")
+        self.assertEqual(len(dev.markers), 3)
 
 
 class Enumeration(unittest.TestCase):

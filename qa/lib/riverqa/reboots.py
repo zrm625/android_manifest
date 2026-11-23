@@ -15,9 +15,9 @@ Three reboot paths (amendment A2):
   time spent writing images never counts.
 
 Every planned reboot:
-1. writes a leaving marker to /dev/kmsg (as root, several copies) and reads
-   its printk stamps back from live dmesg, so the chain can prove the copy
-   it finds in pstore;
+1. writes a leaving marker with a fresh 64-bit nonce to /dev/kmsg (as
+   root, several copies), so the chain can tell this attempt's write from
+   any other (amendment A2.1);
 2. records the USB disconnect after the harness's reboot command;
 3. at boot completion reads boot_id, sys.boot_completed and /proc/uptime in
    one shell command, then judges the kernel-log chain and the uptime.
@@ -82,7 +82,6 @@ class BootRecord:
     chain: tuple = ("UNVERIFIED", "")
     uptime_check: tuple = ("UNVERIFIED", "")
     completed_wall: float = 0.0
-    marker_stamps: list | None = None   # the leaving marker's live printk stamps, one per copy
     pstore_read_error: str = ""         # non-empty: the checked pstore read failed (review round 2)
 
     def to_json(self):
@@ -97,35 +96,27 @@ def control_active() -> str | None:
     return os.environ.get("RIVERQA_CONTROL") or None
 
 
-def leave_marker(dev: Device) -> tuple[str | None, str | None, list[float] | None]:
-    """Write a leaving marker and read its printk stamps back: (marker,
-    boot_id, stamps).
+def leave_marker(dev: Device) -> tuple[str | None, str | None]:
+    """Write a leaving marker: (marker, boot_id).
 
     Each attempt writes a new marker with its own nonce, and its write
     status is checked (review round 2). A failed write is retried with a new
-    nonce and never becomes the leaving marker. The readback looks for this
-    attempt's nonce only, so it can't pick up an older write's stamps.
-    stamps is None if the readback failed (the chain is then UNVERIFIED);
-    marker is None if adb root failed or no write succeeded."""
+    nonce and never becomes the leaving marker. marker is None if adb root
+    failed or no write succeeded (the chain is then UNVERIFIED)."""
     try:
         dev.root()
         bid = dev.boot_id()
     except (TimeoutError, RuntimeError):
-        return None, None, None
+        return None, None
     for _ in range(3):
         m = bootsig.make_marker(bid)
         try:
             ok = dev.kmsg(m) is True
         except (TimeoutError, RuntimeError):
             ok = False
-        if not ok:
-            continue
-        try:
-            r = dev.read(f"dmesg | grep -F {m}", timeout=20)
-        except (TimeoutError, RuntimeError):
-            return m, bid, None
-        return m, bid, (bootsig.marker_printk_stamps(r.out, m) if r.ok else []) or None
-    return None, bid, None
+        if ok:
+            return m, bid
+    return None, bid
 
 
 def _after(w: UsbWatcher, start_mark: int, event) -> list:
@@ -165,8 +156,8 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
         if path == "sysrq" and inject_extra_pass:
             armed = True
             arm_bootloader_stop(dev, boot_timeout)
-        marker, bid, stamps = leave_marker(dev) if dev.state() == "device" else (None, None, None)
-        rec = BootRecord(path=path, marker=marker, boot_id_before=bid, marker_stamps=stamps,
+        marker, bid = leave_marker(dev) if dev.state() == "device" else (None, None)
+        rec = BootRecord(path=path, marker=marker, boot_id_before=bid,
                          control="extra-pass" if inject_extra_pass else None)
         start_mark = w.mark()
         t_cmd = time.monotonic()
@@ -308,12 +299,12 @@ def judge_signals(dev: Device, rec: BootRecord, timing: dict | None = None) -> N
 def judge_record(rec: BootRecord, pstore_log: bytes | None, timing: dict) -> None:
     """The verdicts for one boot from its pstore log. Pure.
 
-    The chain needs a copy of the leaving marker proven by its stamp
-    (bootsig.chain_verdict). On the gated paths (fastboot, sysrq) the uptime
+    The chain needs a copy of this attempt's leaving marker
+    (bootsig.chain_verdict, amendment A2.1). On the gated paths (fastboot, sysrq) the uptime
     clock starts at the recorded USB disconnect. On the adb path (bench boot
     1) uptime is INFO only (amendment A2), but an unplanned fastboot
     enumeration is still a FAIL."""
-    rec.chain = bootsig.chain_verdict(pstore_log, rec.marker, rec.marker_stamps)
+    rec.chain = bootsig.chain_verdict(pstore_log, rec.marker)
     if rec.pstore_read_error:
         rec.chain = (UNVERIFIED, f"pstore read failed: {rec.pstore_read_error}")
     if rec.path in GATED_PATHS:

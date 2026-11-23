@@ -1,6 +1,6 @@
 # Design: `phone-qa`, the QA harness for river batches (revision 11)
 
-Status: **approved by the council in round 11** (Opus 9, Sol 9, Gemini 9). This is revision 11, plus [amendment A2](#amendment-a2-drop-the-pstore-reset-anchor-and-add-an-immediate-reboot-bench-path), which replaces amendments [A1](#amendment-a1-the-adb-path-uptime-clock) and [A1′](#amendment-a1-reconcile-the-strict-anchor-with-the-phone-data). A1 and A1′ are kept below as history only. The implementation notes from each round are at the end and must be applied during the build.
+Status: **approved by the council in round 11** (Opus 9, Sol 9, Gemini 9). This is revision 11, plus [amendment A2](#amendment-a2-drop-the-pstore-reset-anchor-and-add-an-immediate-reboot-bench-path) and its [chain rule A2.1](#amendment-a21-the-nonce-proves-the-chain-not-the-stamp). A2 replaces amendments [A1](#amendment-a1-the-adb-path-uptime-clock) and [A1′](#amendment-a1-reconcile-the-strict-anchor-with-the-phone-data). A1 and A1′ are kept below as history only. The implementation notes from each round are at the end and must be applied during the build.
 
 ## Council review
 
@@ -1182,7 +1182,8 @@ amendments A1 and A1′. A1′ rules 1-2 stay, for the chain only.
    kernel-log chain plus the dropbox boot count. Uptime is recorded as INFO
    only, with no anchor and no gate. An unplanned fastboot enumeration is
    still a FAIL.
-2. **The chain** (`bootsig.chain_verdict`). PASS needs a copy of this
+2. **The chain** (`bootsig.chain_verdict`; [A2.1](#amendment-a21-the-nonce-proves-the-chain-not-the-stamp) replaces this
+   rule: the stamp proof is gone). PASS needs a copy of this
    attempt's marker proven by its stamp (A1′ rules 1-2: a copy within 3 bit
    flips whose strictly parsed stamp equals a live stamp of this attempt's
    write, to the microsecond), with no new kernel session after it. An extra
@@ -1257,3 +1258,84 @@ requirement of `extra-reboot-bench`.
 needed); A for each path, the normal passes, the injected increments and the
 controls; several `sysrq` reboots, whose uptime check must PASS every time;
 and the adb chain control once.
+
+## Amendment A2.1: the nonce proves the chain, not the stamp
+
+Status: specified 2026-11-23. It replaces A2 rule 2 and the stamp proof (A1′
+rules 1-2) that A2 kept for the chain. Everything else in A2 stands.
+
+**Why.** A1′ proved a marker copy by its printk stamp because the pstore
+reset anchor needed that copy's time. A2 deleted the anchor, so the stamp
+proof has no job left. It still cost reruns: ramoops has no ECC, and on the
+phone about a third of normal boots had every copy's stamp damaged, which
+made the chain UNVERIFIED. The chain only has to show that the previous
+kernel's log belongs to the kernel that wrote this attempt's marker. A
+random nonce does that by itself.
+
+**The rule.**
+1. **The nonce is 64 bits.** `make_marker` writes
+   `RQM:<16 hex>:<8 hex boot_id>` (29 characters), with
+   `secrets.token_hex(8)`. Every attempt gets a new nonce, and a failed write
+   is retried with a new one and never becomes the leaving marker.
+2. **The chain** (`bootsig.chain_verdict(log, marker)`):
+   - **PASS:** at least one copy of this attempt's marker within 3 wrong
+     characters (`MAX_MARKER_FLIPS`), and no new kernel session (a `Linux
+     version` banner) after the first copy.
+   - **FAIL:** a readable log with no copy at all (another kernel ran after
+     ramoops init and replaced the log), or a new session after the marker.
+   - **UNVERIFIED:** no marker was written, or pstore is missing, empty or
+     unreadable.
+   - Stamps play no part, and nothing is read back from live `dmesg`.
+3. **The chain record in step 1 stays.** A path "survives" when every normal
+   calibration boot on it got a chain PASS. With the stamp proof gone, a
+   path fails that only if pstore does not reach the next boot with the
+   marker on it, which is what the round-11 design meant by it. On such a
+   path a chain UNVERIFIED still does not count, and a chain FAIL still does.
+4. **Deleted:** `proven_marker`, `stamp_before`, `_same_us`,
+   `STRICT_STAMP_RE`, `_strict_at`, `TS_RE`, `marker_printk_stamps`, the live
+   readback in `reboots.leave_marker`, `BootRecord.marker_stamps`,
+   `marker_proven` and the `proven` list in `boot-timing.json`. Step 1 keeps
+   the raw pstore of every reboot whose chain did not pass in
+   `$BENCH_HOME/qa/pstore-nopass/` (was `pstore-unproven/`).
+
+**The bound.** A copy of a different write (a retry, an earlier attempt or
+an earlier boot) shares at most the `RQM:` prefix and the boot ID with this
+attempt's marker. Its nonce is independent and uniform, so it matches within
+3 flips only if at least 13 of its 16 hex characters happen to equal this
+nonce's. The chance is
+sum over k = 13..16 of C(16, k) · (1/16)^k · (15/16)^(16−k) ≈
+C(16, 3) · 15³ / 16¹⁶ ≈ 1.0 × 10⁻¹³ per pair of writes (C(16, 13) · 16⁻¹³
+≈ 1.2 × 10⁻¹³ as a simple upper bound). Over any realistic number of boots
+this is negligible. The 32-bit nonce of A2 gave about 4.5 × 10⁻⁵ per pair
+(at least 5 of 8 equal), which was only acceptable because the stamp proof
+backed it.
+
+**The scan.** `marker_offsets` anchors on 6-character slices taken every 3
+characters. A character sits in at most 2 slices, so 3 flips break at most
+6. The 29-character marker has 8 slices, so a copy within 3 flips always
+keeps one intact and is always found. With A2's 21-character marker there
+were 6 slices, and 27 of the 1,330 three-flip patterns broke every slice
+(for example flips at 4, 10 and 16), so such a copy was missed.
+
+**Residual risk.** Unchanged from A2: a reset during bench boot 1 before the
+interrupted kernel initialises ramoops leaves the marker kernel's log in
+place, and that boot does not detect it. A2's second residual (all stamps
+damaged, so UNVERIFIED) is gone. A log whose every copy has more than 3
+wrong characters is a FAIL, as under A2; on the A1′ and A2 data no boot had
+that.
+
+**Tests.** The chain: one copy and four copies pass; damaged stamps pass;
+copies with 1-3 flips pass and 4 flips is no copy (FAIL); every 3-flip
+pattern over all 29 positions is found; a real-style dump with damaged
+stamps and 2, 1, 2 and 4 flips passes; another kernel's log, a new session
+after the marker and a new session between copies are FAIL; no marker and a
+missing or empty log are UNVERIFIED; a marker from an independently
+generated nonce (a different write) does not match while a copy of this
+attempt's marker with 3 flipped nonce characters does; 10,000 random pairs of
+different nonces never match each other; no single bit flip turns a good
+log into anything but PASS. `leave_marker`: a fresh nonce per attempt, a
+failed write retried with a new nonce, and no live readback.
+
+**Phone runs.** `phone-qa boot-timing`, no wipe needed; count the chain
+verdicts per path (PASS on normal boots should be about 100%), and check that
+the injected controls still FAIL for the right reason.
