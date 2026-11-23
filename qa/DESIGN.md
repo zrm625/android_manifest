@@ -1879,3 +1879,18 @@ of scope (round 6).
   a trailing `2>/dev/null` or `# comment` are refused.
 - **R7-10.** `reuse_problems` refuses an empty `build_date_utc` on either
   side, even when both are empty.
+
+**Phone notes (2026-11-23, after R7, build 22-20261123-UNOFFICIAL-river, no
+wipe).**
+- `phone-qa --quick` passed (7 passed) before and after calibration.
+- `phone-qa boot-timing` (fresh normals) qualified every path (exit 0). The
+  proofs ran under R7-6's check: `prove` judged them as current-rules data,
+  and the stored record has `rules_version` 3, no unstamped sample, and
+  `record_problems` finds nothing, so `allowance_for` gives A = 12.47 s
+  (fastboot) and 12.29 s (`sysrq`). No sample was excluded. Over its 17
+  reboots the disconnect gap was 0.118-0.158 s and the status read
+  0.078-0.155 s. Every `sysrq` reboot went through the R7-4 allowlist
+  guard (only `reboot_sysrq` writes the trigger). The controls were
+  rejected as before: the marked extra pass by uptime, the unmarked one by
+  the enumeration rule, and the adb early reboot by the chain.
+- Final state: slot a, `known_good_slot` a, no pair, journal empty.
