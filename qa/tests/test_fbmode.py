@@ -246,5 +246,45 @@ class Callers(unittest.TestCase):
             self.assertIsNone(fbmode.pending())
 
 
+
+class FailedRecoveryExitsCleanly(unittest.TestCase):
+    """R5-11, R5-15: a RuntimeError or TimeoutError from fbmode.recover ends
+    the command with a clean exit code; the obligation stays pending."""
+
+    def gone(self):
+        p = Phone("fastboot")
+        fbmode.arm(p)
+        p.where = "gone"
+        return p
+
+    def test_device_bench_halts(self):
+        import io
+        from contextlib import redirect_stderr
+        from riverqa import bench
+        with bench_home():
+            p = self.gone()
+            with mock.patch.object(bench, "Device", lambda *a: p), redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(bench.main(["current"]), flashing.EXIT_HALT)
+            self.assertIn("HALT: fb_mode recovery failed", err.getvalue())
+            self.assertIsNotNone(fbmode.pending())
+
+    def test_boot_timing_and_controls_report_error(self):
+        import io
+        from contextlib import redirect_stderr
+        from riverqa import calibrate, reboots
+        for p_err in (RuntimeError, TimeoutError):
+            with bench_home():
+                p = self.gone()
+                if p_err is TimeoutError:
+                    p.where = "fastboot"
+                    p.wait_for_device = mock.Mock(side_effect=TimeoutError("no adb"))
+                with mock.patch.object(calibrate, "Device", lambda *a: p), redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(calibrate.boot_timing_main([]), 1)
+                    with mock.patch.object(reboots, "load_timing", return_value={"paths": {"sysrq": {}}}):
+                        self.assertEqual(calibrate.prove_main(), 1)
+                self.assertEqual(err.getvalue().count("error: fb_mode recovery failed"), 2, err.getvalue())
+                self.assertIsNotNone(fbmode.pending())
+
+
 if __name__ == "__main__":
     unittest.main()

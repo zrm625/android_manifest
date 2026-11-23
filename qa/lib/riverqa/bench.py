@@ -202,7 +202,11 @@ def run(a) -> int:
     # (review round 4): clear it first. For a batch, that reboot is outside
     # the plan, so the batch's boot counts no longer hold: stop.
     if fbmode.pending() is not None:
-        what = fbmode.recover(dev, flashing.BOOT_TIMEOUT)
+        try:
+            what = fbmode.recover(dev, flashing.BOOT_TIMEOUT)
+        except (RuntimeError, TimeoutError) as e:   # R5-11: a clean HALT; the obligation stays pending
+            log(f"HALT: fb_mode recovery failed: {e}")
+            return flashing.EXIT_HALT
         if a.batch:
             log(f"error: fb_mode recovery: {what}; the phone rebooted outside the batch plan. Flash the batch "
                 "again.")

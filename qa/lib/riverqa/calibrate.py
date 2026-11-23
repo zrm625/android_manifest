@@ -287,6 +287,17 @@ def qualified(data: dict) -> bool:
         ((data.get("controls") or {}).get(ADB_CHAIN_CONTROL) or {}).get("qualified"))
 
 
+def recover_fb_mode(dev) -> bool:
+    """fbmode.recover for calibration. A failure is reported as ``error:``
+    and stops the run cleanly; the obligation stays pending (R5-15)."""
+    try:
+        fbmode.recover(dev, 600, boot=True)
+    except (RuntimeError, TimeoutError) as e:
+        log(f"error: fb_mode recovery failed: {e}. The obligation stays pending; phone-qa recover retries it.")
+        return False
+    return True
+
+
 def boot_timing_main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="phone-qa boot-timing")
     ap.add_argument("--normal", type=int, default=4, help="normal reboots per path to set A (default 4)")
@@ -314,7 +325,8 @@ def prove_main() -> int:
                 log("error: no boot-timing.json; run `phone-qa boot-timing` first")
                 return 2
             dev = Device(SERIAL)
-            fbmode.recover(dev, 600, boot=True)    # resume from fastboot or a leftover fb_mode (R4-3)
+            if not recover_fb_mode(dev):    # resume from fastboot or a leftover fb_mode (R4-3)
+                return 1
             dev.guard()
             dev.root()
             data.setdefault("controls", {})
@@ -344,7 +356,8 @@ def run(n_normal: int, reuse: bool = False) -> int:
     dev = Device(SERIAL)
     # Calibration resumes from a phone sitting in fastboot or left with
     # fb_mode set by a killed run (review round 4).
-    fbmode.recover(dev, 600, boot=True)
+    if not recover_fb_mode(dev):
+        return 1
     dev.guard()
     dev.root()
     old = reboots.load_timing()
