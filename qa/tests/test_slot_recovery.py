@@ -500,6 +500,24 @@ class DevFlash(unittest.TestCase):
             self.assertEqual((p.where, p.boots), ("fastboot", []))
             self.assertIsNone(fbmode.pending())
 
+    def test_device_bench_flash_never_boots_before_writing(self):
+        """R6-4: device-bench --flash with an obligation pending and an
+        unbootable dev slot active clears fb_mode without booting, then
+        flashes."""
+        from riverqa import bench
+        with bench_home():
+            state(pair_kind=None)
+            p = SlotPhone(active="b", bootable=())
+            fbmode.arm(p)
+            with mock.patch.object(bench, "Device", lambda *a: p), \
+                    mock.patch.object(flashing, "flash_dev", return_value=7) as fd, \
+                    redirect_stderr(io.StringIO()) as err:
+                rc = bench.main(["stripped", "--flash"])
+            self.assertEqual(rc, 7, err.getvalue())
+            fd.assert_called_once()
+            self.assertEqual((p.where, p.boots), ("fastboot", []))
+            self.assertIsNone(fbmode.pending())
+
     def test_dev_flash_with_a_pair_refuses_before_touching_the_phone(self):
         with bench_home():
             state()
