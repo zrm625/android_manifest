@@ -170,10 +170,22 @@ class B64ScriptOnHost(unittest.TestCase):
     """b64_script run for real by the host's sh against a scratch directory
     (review round 3). No phone."""
 
-    def read(self, glob):
+    def read(self, glob, ls_lists=None, shell="sh"):
+        """``ls_lists``: names a fake ``ls`` prints instead of the real
+        listing, to stand for a directory that changes after it is listed."""
+        import os
         import subprocess
         from riverqa.device import b64_script, parse_b64_dump
-        r = subprocess.run(["sh", "-c", b64_script(glob)], capture_output=True, text=True, timeout=30)
+        env = dict(os.environ)
+        if ls_lists is not None:
+            bindir = f"{self.d}.bin"
+            os.makedirs(bindir, exist_ok=True)
+            with open(f"{bindir}/ls", "w") as f:
+                f.write("#!/bin/sh\nprintf '%s\\n' " + " ".join(f"'{n}'" for n in ls_lists) + "\n")
+            os.chmod(f"{bindir}/ls", 0o755)
+            self.addCleanup(lambda: __import__("shutil").rmtree(bindir, ignore_errors=True))
+            env["PATH"] = bindir + ":" + env["PATH"]
+        r = subprocess.run([shell, "-c", b64_script(glob)], capture_output=True, text=True, timeout=30, env=env)
         return parse_b64_dump(r.returncode, r.stdout, r.stderr)
 
     def setUp(self):
@@ -228,6 +240,37 @@ class B64ScriptOnHost(unittest.TestCase):
         r = self.read(f"{self.d}/console-ramoops*")
         self.assertFalse(r.ok)
         self.assertFalse(r.no_match)
+
+    def test_one_enumeration_a_listed_file_that_vanished_fails(self):
+        """Review round 4: the read set is exactly what ls listed. A name ls
+        listed that is gone by the time it is read fails the whole read."""
+        self.write("console-ramoops-0", b"abc")
+        r = self.read(f"{self.d}/console-ramoops*", ls_lists=["console-ramoops-0", "console-ramoops-1"])
+        self.assertFalse(r.ok)
+        self.assertFalse(r.no_match)
+        self.assertIn("vanished", r.why)
+
+    def test_one_enumeration_reads_only_what_ls_listed(self):
+        self.write("console-ramoops-0", b"abc")
+        self.write("console-ramoops-1", b"late")          # appeared after the listing
+        self.write("dmesg-ramoops-0", b"x")
+        r = self.read(f"{self.d}/console-ramoops*", ls_lists=["console-ramoops-0", "dmesg-ramoops-0"])
+        self.assertTrue(r.ok, r.why)
+        self.assertEqual([p.rsplit("/", 1)[1] for p, _ in r.files], ["console-ramoops-0"])
+        r = self.read(f"{self.d}/console-ramoops*", ls_lists=["dmesg-ramoops-0"])
+        self.assertTrue(r.no_match)
+
+    def test_other_shells(self):
+        """Whichever of bash, dash and mksh the host has (the phone runs
+        mksh; the phone check runs it there)."""
+        import shutil
+        self.write("console-ramoops-0", b"\x00abc")
+        for sh in ("bash", "dash", "mksh"):
+            if shutil.which(sh):
+                with self.subTest(shell=sh):
+                    r = self.read(f"{self.d}/console-ramoops*", shell=sh)
+                    self.assertTrue(r.ok, r.why)
+                    self.assertEqual(r.data, b"\x00abc")
 
     def test_wildcard_only_in_the_last_component(self):
         from riverqa.device import b64_script

@@ -96,24 +96,29 @@ B64_EXIT = {3: "a listed file vanished or could not be stat'ed", 4: "base64 fail
 
 
 def b64_script(glob: str) -> str:
-    """The remote side of read_files. ``glob`` is expanded by the shell, so
-    it must be a harness constant, never outside input; wildcards are
-    allowed only in its last component.
+    """The remote side of read_files. ``glob`` is a harness constant, never
+    outside input; wildcards are allowed only in its last component.
 
     Review round 3: the directory must exist, be readable and list (exit
-    5 or 6), and a glob that matches nothing exits 7, so neither reads as
-    an empty result. The glob is expanded once; a listed file that vanishes
-    before it is read makes stat fail (exit 3), never a quiet skip."""
+    5 or 6), and a pattern that matches nothing exits 7, so neither reads
+    as an empty result. Review round 4: the directory is enumerated once,
+    by ``ls``, and the read set is exactly the listed names that match the
+    pattern (a shell ``case``, with globbing off). A listed file that
+    vanishes or can't be read before it is read makes stat or base64 fail
+    (exit 3 or 4), never a quiet skip."""
     if not re.fullmatch(r"/[A-Za-z0-9_./*-]+", glob):
         raise ValueError(f"unsafe glob {glob!r}")
-    d = glob.rsplit("/", 1)[0] or "/"
+    d, pat = glob.rsplit("/", 1)
+    d = d or "/"
     if "*" in d:
         raise ValueError(f"wildcards only in the last component: {glob!r}")
-    return (f'd={d}; [ -d "$d" ] && [ -r "$d" ] || exit 5; ls "$d" >/dev/null || exit 6; '
-            f'set -- {glob}; if [ $# -eq 1 ] && [ "$1" = \'{glob}\' ] && [ ! -e "$1" ]; then exit 7; fi; '
-            'n=0; for f in "$@"; do n=$((n+1)); '
+    if not pat:
+        raise ValueError(f"no file pattern in {glob!r}")
+    return (f'd={d}; [ -d "$d" ] && [ -r "$d" ] || exit 5; l=$(ls -1 "$d") || exit 6; '
+            "set -f; IFS='\n'; n=0; m=0; "
+            f'for b in $l; do case "$b" in {pat}) ;; *) continue ;; esac; m=$((m+1)); f="$d/$b"; '
             's=$(stat -c %s "$f") || exit 3; echo "__FILE__ $s $f"; base64 "$f" || exit 4; echo "__EOF__"; '
-            'done; echo "__RC__ $n"')
+            'n=$((n+1)); done; [ $m -gt 0 ] || exit 7; echo "__RC__ $n"')
 
 
 def parse_b64_dump(rc: int, text: str, err: str = "") -> FilesRead:
