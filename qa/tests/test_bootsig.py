@@ -92,10 +92,6 @@ class Combined(unittest.TestCase):
         self.assertEqual(reboots.allowance_for("adb", t), 18.5)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # --- amendment A1: the adb-path clock starts at the old kernel's reset ------------
 
 import itertools  # noqa: E402
@@ -117,7 +113,8 @@ def shutdown_log(stamps, marker_ts=100.0):
 
 def record(**kw):
     rec = reboots.BootRecord(path="adb", marker=MARKER, boot_id_before="x",
-                             marker_pair={"printk_ts": 100.0, "host_mono": 1000.0, "half_width": 0.05})
+                             marker_pair={"marker": MARKER, "printk_ts": 100.0, "host_mono": 1000.0,
+                                          "half_width": 0.05})
     rec.disconnect_mono, rec.completed_mono, rec.uptime = 1005.0, 1050.0, 30.0
     rec.elapsed = rec.elapsed_disconnect = rec.completed_mono - rec.disconnect_mono
     for k, v in kw.items():
@@ -132,17 +129,38 @@ NORMAL.append(110.0)
 
 
 class Corroboration(unittest.TestCase):
-    def test_last_corroborated(self):
-        self.assertEqual(b.corroborated_last([1.0, 1.1, 1.2, 1.3]), 1.3)
+    def test_earliest_of_the_last_run(self):
+        self.assertEqual(b.corroborated_last([1.0, 1.1, 1.2, 1.3]), 1.1)
         self.assertIsNone(b.corroborated_last([1.0, 1.1]))
 
     def test_flipped_last_stamp_cannot_move_it_later(self):
-        self.assertEqual(b.corroborated_last([119.8, 119.9, 120.0, 128.0]), 120.0)   # '0' -> '8'
+        self.assertEqual(b.corroborated_last([119.8, 119.9, 120.0, 128.0]), 119.8)   # '0' -> '8'
         self.assertEqual(b.corroborated_last([40.9, 41.0, 45.1]), None)              # nothing corroborated
-        self.assertEqual(b.corroborated_last([40.8, 40.9, 41.0, 45.1]), 41.0)        # '1' -> '5'
+        self.assertEqual(b.corroborated_last([40.8, 40.9, 41.0, 45.1]), 40.8)        # '1' -> '5'
 
     def test_flip_in_the_middle_moves_it_earlier_only(self):
-        self.assertEqual(b.corroborated_last([40.8, 40.9, 41.0, 45.1, 41.2, 41.3]), 41.0)
+        self.assertEqual(b.corroborated_last([40.8, 40.9, 41.0, 45.1, 41.2, 41.3]), 40.8)
+
+    # (true tail, the same tail with its last stamp flipped but still inside the window)
+    IN_WINDOW_FLIPS = (
+        ([109.5, 109.7, 109.9, 110.0], [109.5, 109.7, 109.9, 110.4]),       # 110.000000 -> 110.400000
+        ([109.5, 109.9, 110.0, 110.02], [109.5, 109.9, 110.0, 110.82]),     # 110.02 -> 110.82
+        ([40.8, 40.95, 41.0, 41.10], [40.8, 40.95, 41.0, 41.90]),           # 41.10 -> 41.90
+    )
+
+    def test_flip_inside_the_window_cannot_move_it_later(self):
+        for true, flipped in self.IN_WINDOW_FLIPS:
+            a_true, a_flip = b.corroborated_last(true), b.corroborated_last(flipped)
+            self.assertLessEqual(a_flip, a_true, flipped)
+            self.assertLessEqual(a_flip, true[-1], flipped)
+            # A flip anywhere in the last run, not only the last stamp.
+            for k in range(len(true)):
+                for bump in (0.05, 0.4, 0.8):
+                    f = list(true)
+                    f[k] = true[k] + bump
+                    got = b.corroborated_last(f)
+                    if got is not None:
+                        self.assertLessEqual(got, max(true), (k, bump, f))
 
 
 class Anchor(unittest.TestCase):
@@ -153,8 +171,10 @@ class Anchor(unittest.TestCase):
     def test_normal_boot_passes_on_the_reset_clock(self):
         rec = self.judge(record(), shutdown_log(NORMAL))
         self.assertEqual(rec.clock_source, "reset-anchor")
-        self.assertAlmostEqual(rec.anchor["host_mono"], 1009.95)     # earliest defensible
-        self.assertAlmostEqual(rec.bootloader_pass, 10.05, places=2)
+        # Last run 109.5, 110.0, 110.0: the anchor is its earliest stamp,
+        # less the pairing's half-width.
+        self.assertAlmostEqual(rec.anchor["host_mono"], 1009.45)
+        self.assertAlmostEqual(rec.bootloader_pass, 10.55, places=2)
         self.assertEqual(rec.uptime_check[0], PASS)
 
     def test_extra_pass_fails(self):
@@ -172,7 +192,7 @@ class Anchor(unittest.TestCase):
         self.assertLess(rec.anchor["printk_ts"], 118.0)
 
     def test_41_1_to_45_1_flip_does_not_pass(self):
-        pair = {"printk_ts": 30.0, "host_mono": 1000.0, "half_width": 0.05}
+        pair = {"marker": MARKER, "printk_ts": 30.0, "host_mono": 1000.0, "half_width": 0.05}
         tail = [30.5 + i * 0.5 for i in range(21)] + [41.1]     # reset at 41.1
         good = shutdown_log(tail, marker_ts=30.0)
         bad = shutdown_log(tail[:-1] + [45.1], marker_ts=30.0)
@@ -183,6 +203,17 @@ class Anchor(unittest.TestCase):
         self.assertEqual(r1.uptime_check[0], FAIL)
         r2 = self.judge(record(marker_pair=pair, uptime=24.9), bad, timing)
         self.assertNotEqual(r2.uptime_check[0], PASS)
+
+    def test_in_window_flips_never_turn_a_fail_into_a_pass(self):
+        for true, flipped in Corroboration.IN_WINDOW_FLIPS:
+            mts = 100.0 if true[-1] > 100 else 30.0
+            pair = {"marker": MARKER, "printk_ts": mts, "host_mono": 1000.0, "half_width": 0.05}
+            lead = [mts + 0.5 + i * 0.5 for i in range(int((true[0] - mts) / 0.5) - 1)]
+            r_true = self.judge(record(marker_pair=pair, uptime=24.0), shutdown_log(lead + true, mts))
+            r_flip = self.judge(record(marker_pair=pair, uptime=24.0), shutdown_log(lead + flipped, mts))
+            self.assertEqual(r_true.uptime_check[0], FAIL, true)
+            self.assertNotEqual(r_flip.uptime_check[0], PASS, flipped)
+            self.assertLessEqual(r_flip.anchor["host_mono"], r_true.anchor["host_mono"], flipped)
 
     def test_missing_marker_is_unverified_never_the_disconnect(self):
         log = b"[    0.000000] Linux version 4.9.337\n" + b"".join(b"[%11.6f] x\n" % t for t in NORMAL)
@@ -210,7 +241,8 @@ class Anchor(unittest.TestCase):
 
     def test_anchor_before_marker_is_refused(self):
         anchor, why = b.reset_anchor(shutdown_log([99.0, 99.1, 99.2]), MARKER,
-                                     {"printk_ts": 100.0, "host_mono": 0.0, "half_width": 0.0}, None)
+                                     {"marker": MARKER, "printk_ts": 100.0, "host_mono": 0.0,
+                                      "half_width": 0.0}, None)
         self.assertIsNone(anchor)
 
     def test_fastboot_path_keeps_the_disconnect_clock(self):
@@ -224,8 +256,12 @@ class Anchor(unittest.TestCase):
 
 class Pairing(unittest.TestCase):
     class Dev:
-        def __init__(self, dmesg_ts=100.25):
-            self.ts, self.writes = dmesg_ts, 0
+        """kmsg() results are taken from ``writes_ok`` in order; dmesg holds
+        every marker whose write succeeded, at ``dmesg_ts`` + 1 s per write."""
+
+        def __init__(self, dmesg_ts=100.25, writes_ok=(True, True, True)):
+            self.ts, self.ok = dmesg_ts, list(writes_ok)
+            self.markers, self.dmesg, self.reads = [], [], []
 
         def root(self):
             pass
@@ -234,18 +270,23 @@ class Pairing(unittest.TestCase):
             return "aaaaaaaa-bbbb"
 
         def kmsg(self, text):
-            self.writes += 1
-            self.marker = text
+            self.markers.append(text)
+            ok = self.ok.pop(0)
+            if ok and self.ts is not None:
+                self.dmesg.append(f"[{self.ts + len(self.dmesg):11.6f}] {text}")
+            return ok
 
         def read(self, cmd, timeout=30):
-            out = "" if self.ts is None else f"[{self.ts:11.6f}] {self.marker}\n"
-            return Read(0, out)
+            self.reads.append(cmd)
+            want = cmd.rsplit(" ", 1)[1]
+            return Read(0, "".join(line + "\n" for line in self.dmesg if want in line))
 
     def test_marker_paired_with_its_printk_timestamp(self):
         dev = self.Dev()
         with mock.patch.object(reboots.time, "monotonic", side_effect=[50.0, 50.1]):
             marker, bid, pair = reboots.leave_marker(dev)
         self.assertEqual(pair["printk_ts"], 100.25)
+        self.assertEqual(pair["marker"], marker)
         self.assertAlmostEqual(pair["host_mono"], 50.05)
         self.assertAlmostEqual(pair["half_width"], 0.05)
 
@@ -253,13 +294,74 @@ class Pairing(unittest.TestCase):
         dev = self.Dev()
         with mock.patch.object(reboots.time, "monotonic", side_effect=[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]):
             marker, bid, pair = reboots.leave_marker(dev)
-        self.assertEqual(dev.writes, 3)
-        self.assertIsNotNone(marker)
+        self.assertEqual(len(dev.markers), 3)
+        self.assertEqual(len(set(dev.markers)), 3)        # a new nonce for every attempt
+        self.assertEqual(marker, dev.markers[-1])
         self.assertIsNone(pair)
 
     def test_no_readback_is_unpaired(self):
         with mock.patch.object(reboots.time, "monotonic", side_effect=[0.0, 0.1]):
             self.assertIsNone(reboots.leave_marker(self.Dev(dmesg_ts=None))[2])
+
+    def test_failed_retry_does_not_pair(self):
+        # Attempt 1 is written but slow; attempts 2 and 3 are fast but their
+        # writes fail. Nothing may pair attempt 1's printk time with a later
+        # host interval, and the leaving marker is the one really written.
+        dev = self.Dev(writes_ok=(True, False, False))
+        with mock.patch.object(reboots.time, "monotonic", side_effect=[0.0, 1.0, 2.0, 2.1, 3.0, 3.1]):
+            marker, bid, pair = reboots.leave_marker(dev)
+        self.assertIsNone(pair)
+        self.assertEqual(marker, dev.markers[0])
+        self.assertEqual(dev.reads, [])
+
+    def test_retry_pairs_only_its_own_write(self):
+        dev = self.Dev(writes_ok=(True, True))
+        with mock.patch.object(reboots.time, "monotonic", side_effect=[0.0, 1.0, 2.0, 2.1]):
+            marker, bid, pair = reboots.leave_marker(dev)
+        self.assertEqual(marker, dev.markers[1])
+        self.assertNotEqual(dev.markers[0], dev.markers[1])
+        self.assertEqual(pair["marker"], marker)
+        self.assertEqual(pair["printk_ts"], 101.25)        # attempt 2's own stamp, not attempt 1's
+        self.assertAlmostEqual(pair["host_mono"], 2.05)
+
+    def test_all_writes_fail(self):
+        with mock.patch.object(reboots.time, "monotonic", side_effect=[0.0, 0.1] * 3):
+            marker, bid, pair = reboots.leave_marker(self.Dev(writes_ok=(False, False, False)))
+        self.assertIsNone(marker)
+        self.assertIsNone(pair)
+
+
+class PstoreMarkerStamp(unittest.TestCase):
+    def judge(self, pair, log, timing=TIMING):
+        rec = record(marker_pair=pair, uptime=30.0)
+        reboots.judge_record(rec, log, timing)
+        return rec
+
+    def test_live_and_pstore_marker_stamps_must_match(self):
+        # The live readback says 99.7 but pstore's copy of the marker is at
+        # 100.0: not the same write, so the anchor can't be trusted.
+        pair = {"marker": MARKER, "printk_ts": 99.7, "host_mono": 1000.0, "half_width": 0.05}
+        rec = self.judge(pair, shutdown_log(NORMAL, marker_ts=100.0))
+        self.assertNotEqual(rec.uptime_check[0], PASS)
+        self.assertEqual(rec.uptime_check[0], UNVERIFIED)
+        self.assertIn("not the same write", rec.anchor_note)
+
+    def test_pairing_for_another_marker_is_refused(self):
+        pair = {"marker": "RQM:22222222:aaaaaaaa", "printk_ts": 100.0, "host_mono": 1000.0, "half_width": 0.05}
+        self.assertEqual(self.judge(pair, shutdown_log(NORMAL)).uptime_check[0], UNVERIFIED)
+
+    def test_gap_is_measured_from_the_pstore_stamp(self):
+        # Within tolerance: the gap starts at pstore's stamp and the
+        # difference widens the uncertainty, so the anchor is no later.
+        pair = {"marker": MARKER, "printk_ts": 100.02, "host_mono": 1000.0, "half_width": 0.05}
+        rec = self.judge(pair, shutdown_log(NORMAL, marker_ts=100.0))
+        self.assertEqual(rec.clock_source, "reset-anchor")
+        self.assertAlmostEqual(rec.anchor["marker_ts"], 100.0)
+        self.assertAlmostEqual(rec.anchor["host_mono"], 1000.0 + 9.5 - 0.05 - 0.02)
+
+    def test_flipped_marker_line_still_parses(self):
+        log = shutdown_log(NORMAL).replace(b"[ 100.000000] RQM", b"[ 100/000000] RQM")
+        self.assertEqual(b.marker_stamps_in_log(log, MARKER), [100.0])
 
 
 class Enumeration(unittest.TestCase):
@@ -336,3 +438,7 @@ class Enumeration(unittest.TestCase):
         self.assertEqual(rec.unplanned_fastboot, 1)
         # The clock starts at the first disconnect after the final reboot.
         self.assertEqual(rec.disconnect_mono, 1.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

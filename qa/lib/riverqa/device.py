@@ -194,11 +194,17 @@ class Device:
             d.check()
             time.sleep(0.5)
 
-    def kmsg(self, text: str, copies: int = 4) -> None:
-        """Write a marker to the kernel log (needs root)."""
+    def kmsg(self, text: str, copies: int = 4) -> bool:
+        """Write a marker to the kernel log (needs root). True only if every
+        copy was written: the copies are chained with && and the remote
+        status is checked (review round 2)."""
         safe = "".join(c for c in text if c.isalnum() or c in ":-_")
-        cmd = "; ".join([f"echo '<6>{safe}' > /dev/kmsg"] * copies)
-        self.sh(cmd, timeout=15)
+        cmd = " && ".join([f"echo '<6>{safe}' > /dev/kmsg"] * copies)
+        try:
+            rc, _, _ = self.sh_rc(cmd, timeout=15)
+        except TimeoutError:
+            return False
+        return rc == 0
 
     def read_file_root(self, path: str, timeout: float = 30) -> bytes:
         return self.sh_bytes(f"cat {shlex.quote(path)}", timeout=timeout)

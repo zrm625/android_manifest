@@ -74,7 +74,7 @@ class BootRecord:
     completed_wall: float = 0.0
     # Amendment A1: where the clock starts, and what it is paired with.
     clock_source: str = "disconnect"    # "disconnect", "reset-anchor" or "none"
-    marker_pair: dict | None = None     # {"printk_ts", "host_mono", "half_width"}
+    marker_pair: dict | None = None     # {"marker", "printk_ts", "host_mono", "half_width"}
     disconnect_mono: float = 0.0        # the recorded disconnect event the clock (or bound) uses
     completed_mono: float = 0.0
     elapsed_disconnect: float = 0.0
@@ -95,31 +95,45 @@ def control_active() -> str | None:
 
 def leave_marker(dev: Device) -> tuple[str | None, str | None, dict | None]:
     """Write a leaving marker and pair it with its own printk timestamp:
-    (marker, boot_id, pair). The host brackets the /dev/kmsg write with
-    time.monotonic() (retrying a slow write), then reads the marker's
-    timestamp back from dmesg. pair is None if the write couldn't be
-    bracketed tightly or read back; marker is None if adb root failed (the
-    chain is then UNVERIFIED for this boot)."""
+    (marker, boot_id, pair).
+
+    Each attempt writes a new marker with its own nonce, and its write
+    status is checked (review round 2). A failed write is never paired and
+    never becomes the leaving marker, and a retry can't pick up an older
+    write's printk time, because the readback looks for this attempt's
+    nonce only. The host brackets the write with time.monotonic(); a write
+    slower than MAX_PAIR_CMD_S is retried. pair is None if no write could
+    be bracketed tightly and read back. marker is the last verified write,
+    or None if adb root failed or no write succeeded (the chain is then
+    UNVERIFIED for this boot)."""
     try:
         dev.root()
         bid = dev.boot_id()
-        marker = bootsig.make_marker(bid)
-        t0 = t1 = 0.0
-        for _ in range(3):
-            t0 = time.monotonic()
-            dev.kmsg(marker)
-            t1 = time.monotonic()
-            if t1 - t0 <= MAX_PAIR_CMD_S:
-                break
-        pair = None
-        if t1 - t0 <= MAX_PAIR_CMD_S:
-            r = dev.read(f"dmesg | grep -F {marker}", timeout=20)
-            ts = bootsig.marker_printk_ts(r.out, marker) if r.ok else None
-            if ts is not None:
-                pair = {"printk_ts": ts, "host_mono": (t0 + t1) / 2, "half_width": (t1 - t0) / 2}
-        return marker, bid, pair
     except (TimeoutError, RuntimeError):
         return None, None, None
+    marker = pair = None
+    for _ in range(3):
+        m = bootsig.make_marker(bid)
+        t0 = time.monotonic()
+        try:
+            ok = dev.kmsg(m) is True
+        except (TimeoutError, RuntimeError):
+            ok = False
+        t1 = time.monotonic()
+        if not ok:
+            continue
+        marker = m
+        if t1 - t0 > MAX_PAIR_CMD_S:
+            continue
+        try:
+            r = dev.read(f"dmesg | grep -F {m}", timeout=20)
+        except (TimeoutError, RuntimeError):
+            break
+        ts = bootsig.marker_printk_ts(r.out, m) if r.ok else None
+        if ts is not None:
+            pair = {"marker": m, "printk_ts": ts, "host_mono": (t0 + t1) / 2, "half_width": (t1 - t0) / 2}
+        break
+    return marker, bid, pair
 
 
 def _after(w: UsbWatcher, start_mark: int, event) -> list:
