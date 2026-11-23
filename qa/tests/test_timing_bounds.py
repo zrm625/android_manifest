@@ -119,6 +119,28 @@ class StatusRead(unittest.TestCase):
         self.assertAlmostEqual(rec.elapsed, 41.5)
         self.assertEqual(rec.uptime_check[0], PASS)
 
+    def test_retry_never_moves_the_boot_time(self):
+        """R5-2 (Sol): boot completion first seen at 54.90 s with a slow
+        read; the fast re-read of the same boot comes 1.15 s later. The boot
+        time is the first observation, not 56.05 s; the uptime evidence
+        comes from the re-read."""
+        from riverqa import regression
+        uptime = 140.0 - 100.0 - 9.9
+        first = BootStatus("bid", True, uptime, 139.3, 140.7, 0.0)     # read 1.4 s, midpoint 140.0
+        again = BootStatus("bid", True, uptime + 1.2, 141.1, 141.2, 0.0)
+        with mock.patch.object(reboots.time, "monotonic", return_value=140.0 - 54.90):
+            rec, _ = judged(100.0, 100.06, [first, again])
+        self.assertLessEqual(rec.host_boot_seconds, 54.90 + first.read_s)
+        self.assertAlmostEqual(rec.host_boot_seconds, 54.90)
+        self.assertAlmostEqual(rec.elapsed, 141.2 - 100.0)            # uptime evidence: the re-read
+        self.assertAlmostEqual(rec.status_read_s, 0.1)
+        self.assertEqual([r["used"] for r in rec.status_reads], [False, True])
+        self.assertAlmostEqual(rec.status_reads[0]["at_s"], 54.90)
+        self.assertAlmostEqual(rec.status_reads[1]["at_s"], 56.05)
+        row = {"used_ram_kb": "1000000", "host_boot_seconds": f"{rec.host_boot_seconds:.2f}",
+               "system_used_kb": "1", "vendor_used_kb": "1"}
+        self.assertIn("boot 1 54.9 s", regression.evaluate([row], None).summary)
+
     def test_a_fast_read_of_another_boot_is_not_used(self):
         uptime = 140.0 - 100.0 - 9.9
         rec, _ = judged(100.0, 100.06, [status(uptime, 140.0, read_s=1.4),

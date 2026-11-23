@@ -90,7 +90,8 @@ class BootRecord:
     elapsed: float = 0.0                # host seconds from the clock's last-present poll to the end of the status read
     disconnect_gap: float | None = None  # first_gone - last_present of the clock's disconnect (review round 4)
     status_read_s: float | None = None   # latency of the status read that carried uptime (review round 4)
-    host_boot_seconds: float = 0.0      # reboot command (after any image writes) to boot completed
+    host_boot_seconds: float = 0.0      # reboot command (after any image writes) to the FIRST read that saw boot completed (R5-2)
+    status_reads: list = field(default_factory=list)  # [{at_s, read_s, used}] every status read after completion (R5-2)
     bootloader_pass: float = 0.0        # elapsed - uptime
     control: str | None = None
     usb_events: list = field(default_factory=list)
@@ -231,7 +232,7 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             rec.control = "extra-pass-unmarked"
         if inject_early_reboot:
             rec.control = inject_reboot_before_completion(dev, boot_timeout, w)
-        st = completed_status(dev, boot_timeout)
+        first, st, reads = completed_status(dev, boot_timeout)
         if owed:
             fbmode.settle()
         rec.completed_wall = st.host_wall
@@ -244,7 +245,11 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
         rec.status_read_s = round(st.read_s, 3)
         start = clock.last_present if clock.last_present is not None else clock.t
         rec.elapsed = st.t1 - start
-        rec.host_boot_seconds = round(st.host_mono - t_cmd, 2)
+        # Boot time is when boot completion was first seen (R5-2): a retry
+        # for a fast uptime read never moves it later.
+        rec.host_boot_seconds = round(first.host_mono - t_cmd, 2)
+        rec.status_reads = [{"at_s": round(r.host_mono - t_cmd, 3), "read_s": round(r.read_s, 3),
+                             "used": r is st} for r in reads]
         rec.bootloader_pass = round(rec.elapsed - rec.uptime, 3)
         rec.usb_events = [asdict(e) for e in w.since(start_mark)]
         rec.unplanned_fastboot = len(fastboot_ids_seen(_after(w, start_mark, window_from)))
@@ -258,20 +263,26 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
 
 
 def completed_status(dev: Device, boot_timeout: float, tries: int = 3):
-    """The first status read that sees boot completed. If that read was
-    slower than bootsig.STATUS_READ_BOUND_S, read again (up to ``tries``
-    times) and use the first fast read of the same boot: a later read only
-    makes elapsed longer, which is safe (review round 4). If no fast read
-    comes, the slow one is returned and the uptime gate is UNVERIFIED."""
-    st = dev.wait_boot_completed(boot_timeout)
+    """(first, used, reads). ``first`` is the first status read that saw
+    boot completed; it alone times the boot (host_boot_seconds, R5-2). If
+    it was slower than bootsig.STATUS_READ_BOUND_S, read again (up to
+    ``tries`` times); ``used``, which carries the uptime evidence, is the
+    first fast read of the same boot: a later read only makes elapsed
+    longer, which is safe (review round 4). If no fast read comes, ``used``
+    is ``first`` and the uptime gate is UNVERIFIED. ``reads`` lists every
+    read that succeeded, in order."""
+    first = dev.wait_boot_completed(boot_timeout)
+    reads = [first]
+    if first.read_s <= bootsig.STATUS_READ_BOUND_S:
+        return first, first, reads
     for _ in range(tries):
-        if st.read_s <= bootsig.STATUS_READ_BOUND_S:
-            break
         again = dev.boot_status()
-        if again is not None and again.completed and again.boot_id == st.boot_id \
-                and again.read_s <= bootsig.STATUS_READ_BOUND_S:
-            return again
-    return st
+        if again is None:
+            continue
+        reads.append(again)
+        if again.completed and again.boot_id == first.boot_id and again.read_s <= bootsig.STATUS_READ_BOUND_S:
+            return first, again, reads
+    return first, first, reads
 
 
 def arm_bootloader_stop(dev: Device, boot_timeout: float) -> None:

@@ -88,6 +88,10 @@ def one(dev: Device, w: UsbWatcher, path: str, timing: dict, *, inject=False, ma
         f"uptime-check {rec.uptime_check[0]}{' (' + rec.control + ')' if rec.control else ''}")
     ids = sorted({e['ids'] for e in d['usb_events'] if e['kind'] == 'present'})
     log(f"           usb ids seen: {ids}")
+    if len(rec.status_reads) > 1:     # R5-2: a slow first read was retried
+        log("           status reads after completion: " + ", ".join(
+            f"{r['at_s']:.2f} s (read {r['read_s']:.3f} s{', used for uptime' if r['used'] else ''})"
+            for r in rec.status_reads) + "; boot time from the first")
     return d
 
 
