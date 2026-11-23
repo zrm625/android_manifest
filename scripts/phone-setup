@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Leave the test phone ready to use after a flash: connect Wi-Fi, walk the
+# LineageOS setup wizard through to the home screen, and apply the settings
+# the image can't default (Extra dim). Run it after device-bench, never
+# before: the benchmark measures the phone with the wizard untouched.
+#
+# Usage: phone-setup [--wifi SSID_FILE PSK_FILE] [--no-extra-dim]
+#
+#   --wifi SSID_FILE PSK_FILE  Connect to this WPA2 network first if the phone
+#                              isn't on Wi-Fi. Each file holds one value. The
+#                              password is never printed.
+#   --no-extra-dim             Leave Extra dim off.
+#
+# Wizard choices: English, location off, no "Help improve LineageOS" stats,
+# gesture navigation, no screen lock, no fingerprint. Images built from
+# river-22.2 already default to most of this (and dark theme, low brightness,
+# no click sounds); the script sets them again so older images match too.
+#
+# Only the phone with serial $BENCH_DEVICE (default ZY225DPT7F) is touched.
+set -euo pipefail
+
+SERIAL=${BENCH_DEVICE:-ZY225DPT7F}
+DEVICE_CODENAME=river
+
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+ssid_file='' psk_file='' extra_dim=1
+while (($#)); do
+  case $1 in
+    --wifi) ssid_file=${2:?}; psk_file=${3:?}; shift 2 ;;
+    --no-extra-dim) extra_dim=0 ;;
+    -h|--help) usage 0 ;;
+    *) echo "unknown option: $1" >&2; usage 1 ;;
+  esac
+  shift
+done
+
+a() { adb -s "$SERIAL" "$@"; }
+# Read the whole output before filtering (see phone-check about SIGPIPE).
+sh_() { a shell "$@" 2>/dev/null | tr -d '\r'; }
+
+state=$(a get-state 2>/dev/null || true)
+[[ "$state" == device ]] || { echo "error: $SERIAL is not connected in adb device mode (state: ${state:-none})" >&2; exit 1; }
+codename=$(sh_ getprop ro.product.device)
+[[ "$codename" == "$DEVICE_CODENAME" ]] || { echo "error: $SERIAL is '$codename', not $DEVICE_CODENAME. Refusing." >&2; exit 1; }
+deadline=$((SECONDS + 900))
+until [[ "$(sh_ getprop sys.boot_completed)" == 1 ]]; do
+  (( SECONDS < deadline )) || { echo "error: phone did not finish booting" >&2; exit 1; }
+  sleep 2
+done
+
+wifi_connected() { sh_ cmd wifi status | grep -q 'Wifi is connected to'; }
+
+# --- Wi-Fi ---------------------------------------------------------------
+if wifi_connected; then
+  echo "Wi-Fi: already connected"
+elif [[ -n "$ssid_file" ]]; then
+  # Quote each value for the phone's shell; keep the password out of output.
+  q() { printf "'%s'" "$(sed "s/'/'\\\\''/g" <<<"$1")"; }
+  ssid=$(<"$ssid_file") psk=$(<"$psk_file")
+  a shell "cmd wifi connect-network $(q "$ssid") wpa2 $(q "$psk")" >/dev/null 2>&1 || true
+  unset psk
+  for _ in $(seq 20); do wifi_connected && break; sleep 2; done
+  wifi_connected && echo "Wi-Fi: connected" || echo "Wi-Fi: not connected yet (the wizard page will offer it)"
+else
+  echo "Wi-Fi: not connected (pass --wifi SSID_FILE PSK_FILE to connect)"
+fi
+
+# --- Setup wizard ----------------------------------------------------------
+# Screens stacked on top of the wizard (for example Settings screens opened by
+# a crash sweep) would make Back walk through all of them. Clear them first.
+a shell am force-stop com.android.settings >/dev/null 2>&1 || true
+a shell input keyevent WAKEUP >/dev/null 2>&1 || true
+# Mute touch, lock and charging sounds before tapping anything.
+a shell settings put system sound_effects_enabled 0
+a shell settings put system lockscreen_sounds_enabled 0
+a shell settings put secure charging_sounds_enabled 0
+
+setup_done() {
+  [[ "$(sh_ settings get secure user_setup_complete)" == 1 &&
+     "$(sh_ settings get global device_provisioned)" == 1 ]]
+}
+
+# Print "X Y LABEL" for the next thing to tap on the current screen, or
+# "NONE <visible texts>" if nothing matches.
+pick='
+import sys, re, xml.etree.ElementTree as ET
+root = ET.fromstring(sys.stdin.read())
+nodes = list(root.iter("node"))
+def centre(n):
+    x1, y1, x2, y2 = map(int, re.findall(r"\d+", n.get("bounds")))
+    return (x1 + x2) // 2, (y1 + y2) // 2
+def find(*labels, checked=None):
+    for label in labels:
+        for n in nodes:
+            if n.get("text", "").strip().lower() == label.lower() and n.get("enabled") == "true":
+                if checked is not None and (n.get("checked") == "true") != checked:
+                    continue
+                return n
+    return None
+# Untick location and "Help improve LineageOS" (usage stats).
+for rid in ("location_checkbox", "enable_metrics_checkbox"):
+    for n in nodes:
+        if n.get("resource-id", "").endswith(":id/" + rid) and n.get("checked") == "true":
+            print(*centre(n), "untick " + rid); sys.exit()
+# Navigation page: make sure gestures are picked before moving on.
+n = find("Gesture navigation", checked=False)
+if n is not None and n.get("checkable") == "true":
+    print(*centre(n), "Gesture navigation"); sys.exit()
+# Screen lock page: no lock.
+n = find("None", "Skip anyway", "Skip screen lock")
+if n is None:
+    n = find("Next", "Start", "Skip", "Continue", "Accept", "Done", "OK", "Got it", "No thanks")
+if n is not None:
+    print(*centre(n), n.get("text")); sys.exit()
+texts = [t for t in (n.get("text", "").strip() for n in nodes) if t]
+print("NONE", " | ".join(texts[:15]))
+'
+
+last='' same=0
+for step in $(seq 60); do
+  if setup_done && ! sh_ dumpsys activity activities | grep -q 'ResumedActivity.*setupwizard'; then
+    echo "Setup wizard: finished"
+    break
+  fi
+  xml=''
+  for _ in 1 2 3; do
+    a shell uiautomator dump /sdcard/phone-setup.xml >/dev/null 2>&1 &&
+      xml=$(sh_ cat /sdcard/phone-setup.xml) && [[ "$xml" == *"<hierarchy"* ]] && break
+    sleep 1
+  done
+  [[ -n "$xml" ]] || { echo "error: could not read the screen" >&2; exit 1; }
+  action=$(python3 -I -c "$pick" <<<"$xml")
+  if [[ "$action" == NONE* ]]; then
+    echo "error: don't know what to tap on this screen: ${action#NONE }" >&2
+    exit 1
+  fi
+  read -r x y label <<<"$action"
+  if [[ "$action" == "$last" ]]; then
+    same=$((same + 1))
+    (( same < 5 )) || { echo "error: stuck on '$label' (tapped it $same times)" >&2; exit 1; }
+  else
+    same=0
+  fi
+  last=$action
+  echo "  tap: $label"
+  a shell input tap "$x" "$y"
+  sleep 2
+done
+setup_done || { echo "error: setup wizard not finished after 60 steps" >&2; exit 1; }
+a shell rm -f /sdcard/phone-setup.xml >/dev/null 2>&1 || true
+
+# --- Settings the image can't default ---------------------------------------
+# No lock screen (the image defaults to this too, via
+# config_disableLockscreenByDefault). Has no effect if a PIN was set.
+a shell cmd lock_settings set-disabled true >/dev/null 2>&1 || true
+a shell cmd location set-location-enabled false
+a shell 'content update --uri content://lineagesettings/secure --bind value:s:0 --where "name=\"stats_collection\""'
+if (( extra_dim )); then
+  a shell settings put secure reduce_bright_colors_activated 1
+fi
+
+# --- Report ------------------------------------------------------------------
+nav=$(sh_ settings get secure navigation_mode)
+case $nav in 0) nav="3-button" ;; 1) nav="2-button" ;; 2) nav="gesture" ;; esac
+night=$(sh_ cmd uimode night | sed 's/Night mode: //')
+lock=$(sh_ cmd lock_settings get-disabled 2>/dev/null || true)
+bright_mode=$(sh_ settings get system screen_brightness_mode)
+dim=$(sh_ settings get secure reduce_bright_colors_activated)
+echo "Phone ready:"
+echo "  navigation      $nav"
+echo "  dark theme      $night"
+echo "  lock screen     $([[ "$lock" == true ]] && echo none || echo 'swipe or secure (not disabled)')"
+echo "  brightness      $([[ "$bright_mode" == 0 ]] && echo manual || echo adaptive), level $(sh_ settings get system screen_brightness)/255"
+echo "  extra dim       $([[ "$dim" == 1 ]] && echo on || echo off)"
+echo "  location        $([[ "$(sh_ cmd location is-location-enabled)" == true ]] && echo on || echo off)"
+echo "  usage stats     $(sh_ 'content query --uri content://lineagesettings/secure --where "name=\"stats_collection\""' | grep -q 'value=0' && echo off || echo ON)"
+echo "  touch sounds    $([[ "$(sh_ settings get system sound_effects_enabled)" == 0 ]] && echo off || echo on)"
+echo "  wifi            $(wifi_connected && echo connected || echo 'not connected')"
