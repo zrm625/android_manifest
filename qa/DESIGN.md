@@ -1680,3 +1680,24 @@ IKCONFIG cover them; the `TARGET_KERNEL_CONFIG` line itself is in
   jobs in sequence.
 - **R5-14.** `boot_count_now` returns None (no count, so the sample is not
   clean) when its last read failed, never an older count.
+
+**Phone notes (2026-11-23, after R5, build 22-20261123-UNOFFICIAL-river, no
+wipe).**
+- `phone-qa boot-timing` qualified every path (exit 0) and stamped
+  `rules_version` 2; `calibrate.record_problems` finds nothing wrong with
+  the record. Over its 17 reboots the disconnect gap was 0.110-0.149 s and
+  the status read 0.081-0.207 s. No read needed a retry, so every
+  `host_boot_seconds` is its first completion read. No sample was
+  excluded. A is 12.46 s (fastboot) and 12.26 s (`sysrq`); the controls
+  were rejected as before (marked by uptime, unmarked by enumeration, the
+  adb early reboot by the chain).
+- R5-1 on the phone: fb_mode armed as the control does
+  (`arm_bootloader_stop`, under the device lock), then the process was
+  killed with SIGKILL; the journal kept the obligation, and a guarded
+  reboot stopped in fastboot on slot a. `flash --recover` (no pair,
+  `known_good_slot` a active) cleared fb_mode in fastboot, set slot a
+  active, rebooted once (one USB disconnect, uptime matching it), verified
+  slot a and build `baseline-2-7cc61b3f30`, resolved the entry and recorded
+  `fb-mode-recovered`. The next reboot went straight to Android, and
+  `phone-qa --quick` passed. The candidate-active case (rollback with slot b
+  active) is covered by the unit tests, not on the phone: it wipes.
