@@ -14,7 +14,7 @@ it, edit it there and open a pull request (see [Rules](#rules)).
 | --- | --- | --- |
 | `tree/` | `~/git/lineageos-river` | The source tree you work in (manifest branch `river-22.2`) |
 | `baseline/` | `~/git/lineageos-river-baseline` | Frozen stock tree for comparison (locked branch `baseline-22.2`). Never edit it. |
-| `scripts/` | `tree/.repo/manifests/scripts` | `change`, `build`, `flash`, `phone-check`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
+| `scripts/` | `tree/.repo/manifests/scripts` | `change`, `build`, `flash`, `phone-check`, `phone-setup`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
 | `bench/` | `/mnt/storage/lineageos-bench` | Working build output (`out-stripped/`), benchmark output (`out-bench-*/`), `results/`, `logs/` |
 | `phone` | Moto G7, USB serial `ZY225DPT7F` | The only test phone |
 
@@ -177,6 +177,21 @@ The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
    baselines, measure right after `scripts/flash stripped --wipe`, without
    touching the phone (setup wizard open, no Wi-Fi), so every baseline is
    measured the same way.
+
+   **Then hand the phone back ready to use.** Never leave it sitting in the
+   setup wizard, or with screens stacked on top of the wizard (Back then walks
+   through every one). After measuring, and after any crash sweep of Settings
+   screens, run:
+
+   ```sh
+   scripts/phone-setup --wifi SSID_FILE PSK_FILE
+   ```
+
+   It connects Wi-Fi, clears stacked Settings screens, walks the wizard to the
+   home screen (gesture navigation, no screen lock), turns on Extra dim, and
+   prints the result. The image already defaults to dark theme, gesture
+   navigation, no lock screen and low brightness. Extra dim has no image
+   default, so the script sets it.
 
 7. **Open the pull requests and merge** them, one command each however many
    repos the change touched. Paste the `phone-check` and `device-bench`
