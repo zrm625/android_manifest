@@ -135,7 +135,18 @@ MIN_CLEAN_NORMALS = 3   # clean normal reboots a path needs before it gets an A 
 # The calibration rules a boot-timing.json was measured under. Bump it when
 # sample_problems or compute_paths change what a clean sample is or how A is
 # set. 2: round 4's bracketed clock and clean-sample rules (R4-1, R4-2).
-CALIBRATION_RULES = 2
+# 3: every sample that can set A (raw normals, inject_measure) carries the
+# stamp itself, written by run() as it measures it, with its disconnect gap
+# and status read at full precision (R5-8, R6-2). A sample without the
+# current stamp is never clean, so it can't be reused or set A.
+CALIBRATION_RULES = 3
+SAMPLE_STAMP = "rules_version"
+
+
+def stamp(r: dict) -> dict:
+    """Mark a sample run() just measured with the current rules (R6-2)."""
+    r[SAMPLE_STAMP] = CALIBRATION_RULES
+    return r
 
 
 def sample_problems(r: dict, *, normal: bool) -> list[str]:
@@ -145,6 +156,11 @@ def sample_problems(r: dict, *, normal: bool) -> list[str]:
     PASS (normal reboots, which record one), or a disconnect or status
     read bracketed more loosely than the bounds. Empty means clean. Pure."""
     why = []
+    if r.get(SAMPLE_STAMP) != CALIBRATION_RULES:
+        # R6-2: its provenance is unknown (e.g. a gap of 0.5004 s stored
+        # rounded as 0.500 s before R5-8), so it can't count as clean.
+        why.append(f"measured under calibration rules {r.get(SAMPLE_STAMP) or 'unstamped'}, not "
+                   f"{CALIBRATION_RULES} (no full-precision provenance)")
     if r.get("unplanned_fastboot"):
         why.append(f"{r['unplanned_fastboot']} unplanned fastboot enumeration(s)")
     chain = (r.get("chain") or [None])[0]
@@ -229,12 +245,17 @@ def record_problems(data: dict) -> list[str]:
     current CALIBRATION_RULES, and compute_paths on its own samples must
     give every gated path the same, non-null A: 3 clean, bracketed normal
     reboots and a clean injected sample. A legacy record (no rules stamp,
-    unbracketed samples) never qualifies. Pure."""
+    unbracketed samples) never qualifies, nor does one whose samples lack
+    the current per-sample stamp (R6-2). Pure."""
     import copy
     why = []
     if data.get("rules_version") != CALIBRATION_RULES:
         why.append(f"measured under calibration rules {data.get('rules_version') or 'from before round 4'}, "
                    f"not the current rules {CALIBRATION_RULES}")
+    unstamped = unstamped_samples(data)
+    if unstamped:
+        why.append(f"{len(unstamped)} sample(s) without the calibration rules {CALIBRATION_RULES} stamp: "
+                   + ", ".join(unstamped[:6]) + (" ..." if len(unstamped) > 6 else ""))
     again = {"raw": copy.deepcopy(data.get("raw") or {}),
              "inject_measure": copy.deepcopy(data.get("inject_measure") or {}),
              "paths": {}, "chain": {}}
@@ -246,6 +267,36 @@ def record_problems(data: dict) -> list[str]:
             why.append(f"{path}: its samples give no A ({again['paths'][path]['why']})")
         elif have is None or abs(float(have) - float(want)) > 1e-9:
             why.append(f"{path}: the stored A {have} is not the {want} its clean samples give")
+    return why
+
+
+def unstamped_samples(data: dict) -> list[str]:
+    """The samples that can set A (every raw normal and every injected-pass
+    measurement) without the current rules stamp, as "path#i" (R6-2)."""
+    out = [f"{p}#{i}" for p in reboots.GATED_PATHS for i, r in enumerate((data.get("raw") or {}).get(p) or [])
+           if r.get(SAMPLE_STAMP) != CALIBRATION_RULES]
+    out += [f"{p} inject" for p, r in sorted((data.get("inject_measure") or {}).items())
+            if (r or {}).get(SAMPLE_STAMP) != CALIBRATION_RULES]
+    return out
+
+
+def reuse_problems(old: dict, build_date_utc: str) -> list[str]:
+    """Why ``--reuse-normals`` can't reuse a stored record's normal reboots,
+    or [] (R6-2): it must be from this build, written under the current
+    rules, and every normal sample on every gated path must carry the
+    current stamp (so its bracket values are full precision). Pure."""
+    why = []
+    if old.get("build_date_utc") != build_date_utc:
+        why.append(f"measured on build date {old.get('build_date_utc')}, not this build's {build_date_utc}")
+    if old.get("rules_version") != CALIBRATION_RULES:
+        why.append(f"written under calibration rules {old.get('rules_version') or 'unstamped'}, not "
+                   f"{CALIBRATION_RULES}")
+    missing = [p for p in reboots.GATED_PATHS if not (old.get("raw") or {}).get(p)]
+    if missing:
+        why.append("no normal reboots for " + ", ".join(missing))
+    bad = [x for x in unstamped_samples({"raw": old.get("raw") or {}}) if "inject" not in x]
+    if bad:
+        why.append(f"{len(bad)} normal sample(s) without the rules {CALIBRATION_RULES} stamp")
     return why
 
 
@@ -406,25 +457,28 @@ def run(n_normal: int, reuse: bool = False) -> int:
             "build_date_utc": dev.getprop("ro.build.date.utc"), "raw": {p: [] for p in reboots.GATED_PATHS},
             "inject_measure": {}, "paths": {}, "chain": {}, "controls": {}}
     timing_none = {}  # no allowance while measuring
-    if reuse and old.get("build_date_utc") == data["build_date_utc"] and all(old.get("raw", {}).get(p)
-                                                                             for p in reboots.GATED_PATHS):
-        data["raw"] = {p: old["raw"][p] for p in reboots.GATED_PATHS}
-        data["reused_normals_from"] = old.get("measured_at")
-        log(f"Reusing {sum(len(v) for v in data['raw'].values())} normal reboots from {old.get('measured_at')}")
+    if reuse:
+        why_not = reuse_problems(old, data["build_date_utc"])
+        if why_not:     # R6-2: unknown provenance is never reused; measure fresh normals
+            log("Not reusing the stored normal reboots (" + "; ".join(why_not) + "); measuring fresh ones")
+        else:
+            data["raw"] = {p: old["raw"][p] for p in reboots.GATED_PATHS}
+            data["reused_normals_from"] = old.get("measured_at")
+            log(f"Reusing {sum(len(v) for v in data['raw'].values())} normal reboots from {old.get('measured_at')}")
     w = UsbWatcher(dev.serial).start()
     try:
         if not data.get("reused_normals_from"):
             for _ in range(n_normal):
                 for path in reboots.GATED_PATHS:
                     before = boot_count_now(dev)
-                    r = one(dev, w, path, timing_none, count_before=before)
+                    r = stamp(one(dev, w, path, timing_none, count_before=before))
                     r["boots_before"] = before
                     data["raw"][path].append(r)
                     write_json(bench_path("qa", "boot-timing.partial.json"), data)
         # One injected extra pass per path, to measure how long an extra
         # bootloader pass really is on this phone (separate from the proofs).
         for path in reboots.GATED_PATHS:
-            data["inject_measure"][path] = one(dev, w, path, timing_none, inject=True, mark_planned=True)
+            data["inject_measure"][path] = stamp(one(dev, w, path, timing_none, inject=True, mark_planned=True))
             write_json(bench_path("qa", "boot-timing.partial.json"), data)
         compute_paths(data)
         reboots.save_timing(data)

@@ -361,9 +361,10 @@ class Judge(unittest.TestCase):
         self.assertEqual(reboots.combined_verdict(dict(sig, uptime=[PASS, "x"]), "sysrq", timing)[0], UNVERIFIED)
 
 def raw(bootloader_pass, chain=PASS, **kw):
+    from riverqa import calibrate
     r = {"bootloader_pass": bootloader_pass, "chain": [chain, ""], "marker_copies_exact": 4,
          "marker_found_fuzzy": True, "boot_count": [PASS, ""], "unplanned_fastboot": 0,
-         "disconnect_gap": 0.06, "status_read_s": 0.1}
+         "disconnect_gap": 0.06, "status_read_s": 0.1, "rules_version": calibrate.CALIBRATION_RULES}
     r.update(kw)
     return r
 
@@ -589,6 +590,107 @@ class Calibration(unittest.TestCase):
         with mock.patch.object(calibrate, "prove_main", return_value=0) as pm:
             self.assertEqual(qa.main(["controls", "--boot-timing"]), 0)
         pm.assert_called_once()
+
+
+def unstamped(bootloader_pass, **kw):
+    """A sample as code before R6-2 stored it: no per-sample rules stamp."""
+    r = raw(bootloader_pass, **kw)
+    r.pop("rules_version")
+    return r
+
+
+class CalibrationProvenance(unittest.TestCase):
+    """R6-2: --reuse-normals and controls --boot-timing trust only samples
+    stamped with the current calibration rules (full-precision brackets).
+
+    Sol's case: before R5-8 a disconnect gap of 0.5004 s was stored rounded
+    as 0.500 s, which passes the 0.5 s bound. Reused, the bad 14.2 s sample
+    counts as clean and A comes out 14.8, so a real 14.2 s extra pass
+    passes."""
+
+    BUILD = "1795436282"
+
+    def old_record(self, stamped=False):
+        from riverqa import calibrate
+        mk = raw if stamped else unstamped
+        return {"measured_at": "2026-11-20T00:00:00+00:00", "rules_version": calibrate.CALIBRATION_RULES,
+                "build_date_utc": self.BUILD,
+                "raw": {"fastboot": [mk(10.072), mk(10.065), mk(10.064), mk(10.08)],
+                        "sysrq": [mk(10.0), mk(10.0), mk(14.2, disconnect_gap=0.500)]},
+                "inject_measure": {}, "paths": {}, "chain": {}, "controls": {}}
+
+    def run_calibration(self, old):
+        """calibrate.run(4, reuse=True) with the phone faked at the level of
+        one(): fresh normals are ~10.07 s, injected passes 14.465 / 15.4 s.
+        Returns (saved boot-timing.json, normal reboots measured)."""
+        import io
+        from contextlib import redirect_stderr
+        from riverqa import calibrate, controls
+        fresh = {"fastboot": 10.07, "sysrq": 10.06}
+        normals = []
+
+        def one(dev, w, path, timing, *, inject=False, count_before=None, **kw):
+            if inject:
+                return unstamped(14.465 if path == "fastboot" else 15.4)
+            normals.append(path)
+            return unstamped(fresh[path] + 0.001 * len(normals))
+
+        class Dev:
+            serial = "ZY225DPT7F"
+
+            def guard(self):
+                pass
+
+            def root(self):
+                pass
+
+            def getprop(self, name):
+                return CalibrationProvenance.BUILD if name == "ro.build.date.utc" else "22-test"
+        reboots.save_timing(old)
+        with mock.patch.object(calibrate, "Device", lambda *a: Dev()), \
+                mock.patch.object(calibrate, "recover_fb_mode", return_value=True), \
+                mock.patch.object(calibrate, "UsbWatcher"), \
+                mock.patch.object(calibrate, "boot_count_now", return_value=1), \
+                mock.patch.object(calibrate, "one", side_effect=one), \
+                mock.patch.object(calibrate, "prove"), \
+                mock.patch.object(controls, "record_step1"), redirect_stderr(io.StringIO()):
+            calibrate.run(4, True)
+        return reboots.load_timing(), normals
+
+    def test_unstamped_normals_are_not_reused(self):
+        with bench_home():
+            saved, normals = self.run_calibration(self.old_record())
+        a = saved["paths"]["sysrq"]["A"]
+        self.assertIsNotNone(a, saved["paths"]["sysrq"].get("why"))
+        self.assertLess(a, 14.2, "the 0.500 s-gap sample from an unstamped record set A")
+        self.assertEqual(len(normals), 8, "fresh normals were not measured")
+        self.assertFalse(saved.get("reused_normals_from"))
+
+    def test_stamped_normals_are_reused(self):
+        with bench_home():
+            old = self.old_record(stamped=True)
+            old["raw"]["sysrq"][2] = raw(10.01)
+            saved, normals = self.run_calibration(old)
+        self.assertEqual(normals, [])
+        self.assertEqual(saved["reused_normals_from"], old["measured_at"])
+        self.assertIsNotNone(saved["paths"]["sysrq"]["A"])
+
+    def test_renewal_refuses_unstamped_samples(self):
+        """record_problems: a record that claims the current rules, with an
+        A its samples reproduce under the old rules, but samples that carry
+        no stamp (the 0.500 s gap among them), is not renewed."""
+        from riverqa import calibrate
+        rec = self.old_record()
+        rec["raw"]["sysrq"].append(unstamped(10.01))
+        rec["inject_measure"] = {"fastboot": unstamped(14.465), "sysrq": unstamped(15.4)}
+        legacy = {"raw": rec["raw"], "inject_measure": rec["inject_measure"], "paths": {}, "chain": {}}
+        with mock.patch.object(calibrate, "sample_problems", lambda r, normal: []):
+            calibrate.compute_paths(legacy)     # what an unstamp-blind rule makes of it
+        rec["paths"] = legacy["paths"]
+        self.assertIsNotNone(rec["paths"]["sysrq"]["A"])
+        probs = calibrate.record_problems(rec)
+        self.assertTrue(probs, "a record with unstamped samples qualified for renewal")
+        self.assertTrue(any("stamp" in x for x in probs), probs)
 
 
 class CheckedPstoreRead(unittest.TestCase):
