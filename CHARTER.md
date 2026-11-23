@@ -12,7 +12,7 @@ these rules on 2026-11-23. Change them only in a pull request that Zak approves.
 | Must-work list | Every item passes | `phone-qa` (the QA harness) on every batch. |
 | Autonomy | No hands | Build, flash, set up, QA, then merge or send back, with no one at the phone. |
 | No regressions | Boot ≤ 55 s; RAM no worse; `/system` no bigger unless RAM went down | See [Regressions](#regressions). |
-| Stay current | Monthly | Security patches and upstream LineageOS merges go through the same queue. |
+| Stay current | Monthly | Security patches and upstream LineageOS merges go through the same queue. Moving the pinned projects in `default.xml` is done by hand for now (see [Tooling changes](#tooling-changes)). |
 
 ### Measuring RAM
 
@@ -98,6 +98,11 @@ The river has three cameras: the rear main, the rear depth, and the front.
   frame to frame at maximum exposure, which shows the sensor and pipeline
   work. A black photo from those two is noted in the report but doesn't fail
   the batch.
+- A change that changes which cameras are switched on never merges
+  automatically. Zak merges it by hand. Then a new baseline is run, which
+  records the new camera set and keeps the lowest known-good RAM reference.
+  The new baseline changes the QA harness version, so the harness is
+  qualified again before the next batch.
 
 ## Pipeline
 
@@ -115,11 +120,27 @@ Building and testing are the bottleneck, so changes are tested in batches.
    batch and tags the known-good state. Zak doesn't have to approve anything
    else.
 5. **Failed batch.**
-   - Find out which change caused the failure and why.
-   - Mark that change as tried, and record how it failed.
-   - Queue it again once it is fixed.
-   - The other changes in the batch go into the next batch and are tested the
-     same way.
+   - A batch of several changes is split: each change is tested again on its
+     own, in its own batch.
+   - When a change fails on its own, the tester reads the evidence and finds
+     out why. If the change caused it, the tester marks it as tried and
+     records how it failed; it is queued again once it is fixed and the
+     council has approved the fix. If the phone, the desk or the workstation
+     caused it, the change goes back into the queue.
+   - If several different changes fail the same way in a row, the tester
+     stops and reports a likely problem with the desk or the workstation.
+
+### Tooling changes
+
+The QA harness and the batch tools can't be tested by the batch they run.
+Changes to them (`qa/`, `scripts/`, `workspace/` and other tooling in the
+manifest repo, never `default.xml`) go through the council as a code review.
+After all three approve, they are merged by hand with `change merge`, and the
+harness or batch tools are qualified again before the next batch.
+
+For now, moving the pinned upstream projects in `default.xml` is also done by
+hand, with a council review and a new baseline, until the batch tools can test
+manifest changes.
 
 ### What still needs Zak
 
@@ -149,7 +170,8 @@ These need Zak's approval even when the council has approved the change:
 ## Order of work
 
 1. The QA harness, `phone-qa`. This is the first task to go through the council.
-2. The queue and batch tools: worker checkouts, `change batch`, and slot rescue.
+2. The queue and batch tools: batch branches in the main tree (a second
+   checkout would need a cold build), the batch runner, and slot rescue.
 3. The tester thread.
 4. Perch through the council, then the first real batch.
 5. Per-camera build switches.
