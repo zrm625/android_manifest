@@ -4,6 +4,10 @@ This tree is **zrm625's fork** of LineageOS 22.2 for the Moto G7 (`river`). The
 `repo` manifest is [zrm625/android_manifest](https://github.com/zrm625/android_manifest).
 The aim is a stripped-down build. Removing projects and features is expected.
 
+Goals, the must-work list, and the batch pipeline rules (council approval,
+queue, merge) are in [CHARTER.md](CHARTER.md). Read it before you change
+anything.
+
 The start-here guide for building, installing on the phone, and using the
 build is `~/git/river/AGENTS.md` (source: `workspace/AGENTS.md` in this repo).
 This file covers the source tree.
