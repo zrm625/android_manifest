@@ -179,10 +179,9 @@ class Round9Majors(unittest.TestCase):
             self.assertIsNotNone(fbmode.pending())
             self.assertIn("check that X reaches Android", err)
             self.assertIn("If no slot boots, stop and tell Zak", err)
-            for argv in (("--no-reboot",),):
-                rc, err = dev_flash(p, *argv)
-                self.assertEqual(rc, flashing.EXIT_ERROR, err)
-                self.assertIn("advises no flash until you have found one", err)
+            rc, err = dev_flash(p, "--no-reboot")
+            self.assertEqual(rc, flashing.EXIT_ERROR, err)
+            self.assertIn("advises no flash until you have found one", err)
             self.assertEqual(flashes(p.calls), [])
 
     def test_recover_reads_the_armed_identity_only_to_boot(self):

@@ -54,6 +54,8 @@ class SlotPhone(Boots):
         pass
 
     def getprop(self, name):
+        if name == "sys.boot_completed":       # R12-1: a phone in Android has booted
+            return "1" if self.where == "android" else ""
         return f"_{self.running}" if name == "ro.boot.slot_suffix" else ""
 
     def sh(self, cmd, timeout=30):

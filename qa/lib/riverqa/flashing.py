@@ -323,10 +323,18 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     # baseline (a guard failure only with an obligation pending), else exit
     # 1; Unreachable goes to main, which halts.
     source = "getprop" if dev.state() == "device" else "fastboot"
+    # R12-1: before the first baseline, what may be overwritten is decided
+    # by the active slot alone, so it must be shown to boot: the phone found
+    # in Android with sys.boot_completed=1.
+    booted = False
+    # Before the first baseline with an obligation pending, every halt gives
+    # the R10-3/R11-1 way back, never flash --recover (Sol, round 12).
+    pre_advice = armed_way_back(owed, None) if st is None and owed is not None else None
     try:
         if source == "getprop":
             dev.guard()
             got = dev.getprop("ro.boot.slot_suffix") or ""
+            booted = (dev.getprop("sys.boot_completed") or "").strip() == "1"
         else:
             to_fastboot(dev, 30)
             dev.fastboot_guard()
@@ -335,7 +343,7 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         raise
     except (RuntimeError, TimeoutError) as e:
         if owed is not None or (st is None and not isinstance(e, GuardError)):
-            return recovery_halt(RuntimeError(f"cannot read the active slot: {e}"))
+            return recovery_halt(RuntimeError(f"cannot read the active slot: {e}"), advice=pre_advice)
         log(f"error: cannot read the active slot: {e}")
         return EXIT_ERROR
     current = got.lstrip("_")
@@ -345,15 +353,22 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     elif current in slots.SLOTS:
         target = slots.other(current)
     else:
-        return recovery_halt(fbmode.SlotUnreadable(dev.serial, got, source))
-    if st is None and owed is not None and fbmode.armed_slot(owed) is None and source != "getprop":
-        # R11-1: an entry from before round 8 records no slot, so nothing
-        # says which slot still boots. Only a phone found running Android
-        # proves its active slot boots, making the other slot a safe target.
-        return recovery_halt(RuntimeError(
-            f"slot {current} is active but the phone is in fastboot, and the pending fb_mode obligation records "
-            "no slot; with no known-good slot yet, nothing shows which slot still boots. Not writing either"),
-            advice=armed_way_back(owed, current))
+        return recovery_halt(fbmode.SlotUnreadable(dev.serial, got, source), advice=pre_advice)
+    if st is None and not booted:
+        # R11-1, R12-1: with no known-good slot yet, slot {current} is kept
+        # only because it is active, so it must be shown to boot before the
+        # other slot is written. adb answering is not enough: the phone must
+        # have completed boot. This also stops a second --no-reboot flash
+        # from writing the original slot before the first one has booted.
+        where = "in fastboot" if source == "fastboot" else "in Android but has not completed boot"
+        msg = (f"slot {current} is active and the phone is {where}; with no known-good slot yet, nothing "
+               f"shows that slot {current} boots, so this flash would not write slot {target}")
+        if owed is not None:
+            return recovery_halt(RuntimeError(msg), advice=armed_way_back(owed, current))
+        log(f"error: {msg}.")
+        log(f"Boot the phone to Android on a slot that works and let it finish booting (for slot X: fastboot -s "
+            f"{SERIAL} --set-active=X, then fastboot -s {SERIAL} reboot), then run the flash again.")
+        return EXIT_ERROR
     if st is None and owed is not None and fbmode.armed_slot(owed) == target:
         # R10-3: before the first baseline the armed slot is the only slot
         # known to boot. Refused before anything is cleared or written.
@@ -369,7 +384,7 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     try:
         fbmode.recover(dev, BOOT_TIMEOUT, boot=False)
     except (RuntimeError, TimeoutError) as e:     # R5-11, R6-1: HALT, not EXIT_ERROR
-        return recovery_halt(RuntimeError(f"fb_mode recovery failed: {e}"))
+        return recovery_halt(RuntimeError(f"fb_mode recovery failed: {e}"), advice=pre_advice)
     want = product_want(product, target)
     attempt = {"attempt_id": new_id("devflash"), "target": target}
     log(f"Flashing {product} to slot {target} (current slot: {current or '?'})")
@@ -397,13 +412,21 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         if isinstance(e, WipeFailed):
             # R10-5, R11-2: slot target is (or may be) active and its wipe is
             # not confirmed; always a halt.
+            # R12-2: the advice keeps the caller's --wipe choice and starts
+            # by confirming which slot is active.
+            check = f"Check which slot is active first (fastboot -s {SERIAL} getvar current-slot). "
+            if wipe:
+                state = f"Slot {target} is, or may be, active, and its userdata wipe is not confirmed. "
+                own = (f"If slot {target} is active, erase userdata by hand (fastboot -s {SERIAL} erase userdata) "
+                       f"and reboot (fastboot -s {SERIAL} reboot), or go back with fastboot -s {SERIAL} "
+                       f"--set-active={back}.")
+            else:
+                state = f"Slot {target} may be active (this flash was run without --wipe). "
+                own = (f"If slot {target} is active, reboot it (fastboot -s {SERIAL} reboot) or go back with "
+                       f"fastboot -s {SERIAL} --set-active={back}; if slot {back} is still active, reboot it.")
             return recovery_halt(RuntimeError(f"the dev flash of slot {target} stopped at --set-active or the "
                                               f"wipe: {e}"),
-                                 advice=f"Slot {target} is, or may be, active, and its userdata wipe is not "
-                                 "confirmed. " + (
-                                     way_back(target) if fbmode.pending() is not None else
-                                     f"Erase it by hand (fastboot -s {SERIAL} erase userdata, then fastboot -s "
-                                     f"{SERIAL} reboot), or go back with fastboot -s {SERIAL} --set-active={back}."))
+                                 advice=state + check + (way_back(target) if fbmode.pending() is not None else own))
         if fbmode.pending() is not None:
             return recovery_halt(RuntimeError(f"the dev flash of slot {target} stopped: {e}"), advice=way_back(None))
         log(f"error: the dev flash of slot {target} stopped: {e}")

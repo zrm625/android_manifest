@@ -169,7 +169,9 @@ class R10_1Sentinel(unittest.TestCase):
                 self.assertIsNone(flashing.load_state())
                 self.assertIsNotNone(fbmode.pending())
         with self.subTest(path="dev flash"), bench_home():
-            p = R9Phone(where="fastboot", active="a", bootable=("a", "b"), builds={"a": BID, "b": DEV_BID})
+            # R12-1: before the first baseline the flash needs the phone booted.
+            p = R9Phone(where="android", active="a", bootable=("a", "b"), fb=False,
+                        builds={"a": BID, "b": DEV_BID})
             arm_entry("a", (SENTINEL, SENTINEL))
             rc, err = dev_flash(p, reboot=booting_reboot)
             self.assertEqual(rc, flashing.EXIT_OK, err)
@@ -244,7 +246,10 @@ class R10_3PreBaseline(unittest.TestCase):
                 arm_entry("a")
                 rc, err = dev_flash(p, reboot=booting_reboot)
                 self.assertEqual(rc, flashing.EXIT_HALT, err)
-                self.assertIn("where the pending fb_mode obligation was armed", err)
+                # In fastboot R12-1 refuses first (slot b isn't shown to boot);
+                # booted in Android, the R10-3 armed-slot refusal does.
+                self.assertIn("nothing shows that slot b boots" if where == "fastboot" else
+                              "where the pending fb_mode obligation was armed", err)
                 self.assertIn("--set-active=a", err)
                 self.assertIn("phone-qa recover", err)
                 self.assertNotIn("--rollback", err)
@@ -368,7 +373,8 @@ class R10_5EraseFailure(unittest.TestCase):
                 with self.subTest(argv=argv, state=st), bench_home():
                     if st:
                         state(pair_kind=None)
-                    p = R9Phone(where="fastboot", active="a", bootable=("a", "b"))
+                    p = R9Phone(where="fastboot" if st else "android", active="a", bootable=("a", "b"),
+                                fb=bool(st))
                     real = p.fastboot
 
                     def fastboot(*args, timeout=120, real=real):
@@ -379,6 +385,7 @@ class R10_5EraseFailure(unittest.TestCase):
                     rc, err = dev_flash(p, *argv, reboot=reboot)
                     self.assertEqual(rc, flashing.EXIT_HALT, err)
                     self.assertIn("Slot b is, or may be, active, and its userdata wipe is not confirmed", err)
+                    self.assertIn("getvar current-slot", err)
                     self.assertIn("--set-active=a", err)
                     self.assertEqual(p.active, "b")
 
@@ -394,7 +401,8 @@ class R11_2WriteTimeouts(unittest.TestCase):
                     with self.subTest(step=step, argv=argv, state=st), bench_home():
                         if st:
                             state(pair_kind=None)
-                        p = R9Phone(where="fastboot", active="a", bootable=("a", "b"))
+                        p = R9Phone(where="fastboot" if st else "android", active="a", bootable=("a", "b"),
+                                    fb=bool(st))
                         real, real_ok = p.fastboot, p.fastboot_ok
 
                         def fastboot(*args, timeout=120, real=real, step=step):
