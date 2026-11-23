@@ -4,7 +4,8 @@ batch.json carries what the runner opened for the batch:
 
     "prs": [{"repo": "zrm625/android_manifest", "number": 12}, ...],
     "tag": "known-good-7",
-    "tag_repos": ["https://github.com/zrm625/android_manifest", ...]
+    "tag_repos": ["https://github.com/zrm625/android_manifest", ...],
+    "merge_started": {"at": "..."}     # flash --merge-started, before any merge or tag
 
 ``gh`` and ``git ls-remote`` are called through ``runner`` so tests can stub
 them. flash --recover and flash --promote use the same lookup, and the same
@@ -31,7 +32,7 @@ def slug(repo: str) -> str:
 def lookup(batch: dict, runner=None) -> dict | None:
     """The batch's merge and tag state, or None if any lookup failed.
 
-    {"prs": [{"repo", "url", "merged", "merge_commit"}],
+    {"prs": [{"repo", "url", "merged", "merge_commit", "head"}],   # head: the PR's head SHA
      "tags": [{"repo", "present", "commit"}]}  # commit: what the tag points at
     """
     runner = runner or default_runner
@@ -40,14 +41,14 @@ def lookup(batch: dict, runner=None) -> dict | None:
     try:
         for pr in batch.get("prs") or []:
             r = runner(["gh", "pr", "view", str(pr["number"]), "--repo", pr["repo"],
-                        "--json", "state,mergedAt,url,mergeCommit"])
+                        "--json", "state,mergedAt,url,mergeCommit,headRefOid"])
             if r.returncode != 0:
                 return None
             data = json.loads(r.stdout)
             merged = data.get("state") == "MERGED"
             commit = (data.get("mergeCommit") or {}).get("oid")
             prs.append({"repo": slug(pr["repo"]), "url": data.get("url"), "merged": merged,
-                        "merge_commit": commit if merged else None})
+                        "merge_commit": commit if merged else None, "head": data.get("headRefOid")})
         for repo in batch.get("tag_repos") or []:
             if not tag:
                 return None

@@ -21,6 +21,12 @@ phone-qa:
       "cameras": {"set": [0, 1, 2], "source": "bootstrap" | "<device repo file>"},
       "camera_set_change": null | {"url", "set"},
       "prs": [], "tag": null, "tag_repos": [],
+                     # runner: the PRs it opened, the tag and every repo the
+                     # tag goes in (all of commit_set)
+      "merge_started": null | {"at": "..."},
+                     # runner: flash --merge-started, durably, before any
+                     # merge or tag action (recovery tells "never started"
+                     # from "interrupted mid-merge" by it)
       "pair": null | {...},                 # written by flash
       "first_boot_seconds": null,           # written by flash (information only)
       "bench_runs": [],                     # run IDs of the current flash attempt (device-bench)
@@ -81,6 +87,15 @@ def expected_repos(manifest: Path | None = None) -> set[str]:
     paths = {p.get("path") or p.get("name") for p in root.iter("project")
              if "zrm625-fork" in (p.get("groups") or "").split(",")}
     return paths | {MANIFEST_PATH}
+
+
+def repo_slugs(manifest: Path | None = None) -> dict[str, str]:
+    """GitHub owner/name for each repo path in expected_repos()."""
+    root = ET.parse(manifest or MANIFEST_DIR / "default.xml").getroot()
+    out = {(p.get("path") or p.get("name")): f"zrm625/{p.get('name').rsplit('/', 1)[-1]}"
+           for p in root.iter("project") if "zrm625-fork" in (p.get("groups") or "").split(",")}
+    out[MANIFEST_PATH] = "zrm625/android_manifest"
+    return out
 
 
 def commit_set_hash(commit_set: dict) -> str:
@@ -175,6 +190,7 @@ def stage(batch_id: str, product: Path, kind: str, experiment: bool, build_info:
         "cameras": camera_set(),
         "camera_set_change": None,
         "prs": [], "tag": None, "tag_repos": [],
+        "merge_started": None,
         "pair": None,
         "first_boot_seconds": None,
         "bench_runs": [],

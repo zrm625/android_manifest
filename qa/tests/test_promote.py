@@ -14,6 +14,9 @@ from riverqa import core, flashing, recovery, slots, stage
 
 REPOS = {"build/make", "vendor/lineage", ".repo/manifests"}
 COMMITS = {"build/make": "1" * 40, "vendor/lineage": "2" * 40, ".repo/manifests": "3" * 40}
+# r0 and r1 have PRs (heads: the tested commits); r2, the manifest, has none.
+SLUGS = {"build/make": "zrm625/r0", "vendor/lineage": "zrm625/r1", ".repo/manifests": "zrm625/r2"}
+HEADS = {0: "1" * 40, 1: "2" * 40}
 HASH = stage.commit_set_hash(COMMITS)
 BID = f"b1-{HASH}"
 BOOT = "c" * 64
@@ -33,10 +36,11 @@ def runner(merged, tagged):
         if cmd[0] == "gh":
             n = int(cmd[3])
             return subprocess.CompletedProcess(cmd, 0, json.dumps({"state": "MERGED" if merged[n] else "OPEN",
-                                                                   "url": f"u{n}",
+                                                                   "url": f"u{n}", "headRefOid": HEADS[n],
                                                                    "mergeCommit": {"oid": f"m{n}"}}), "")
         n = int(cmd[3][-1])
-        out = f"m{n}\trefs/tags/kg-1\n" if tagged[n] else ""
+        at = f"m{n}" if n < 2 else COMMITS[".repo/manifests"]
+        out = f"{at}\trefs/tags/kg-1\n" if tagged[n] else ""
         return subprocess.CompletedProcess(cmd, 0, out, "")
     return run
 
@@ -49,7 +53,8 @@ def setup(home, kind="batch", build_id=BID, commit_set=None):
     b = {"batch": "b1", "kind": kind, "build_id": build_id, "vendor_build_id": build_id,
          "commit_set": commit_set or COMMITS, "commit_set_hash": HASH, "pair": dict(st["pair"]),
          "prs": [{"repo": "zrm625/r0", "number": 0}, {"repo": "zrm625/r1", "number": 1}], "tag": "kg-1",
-         "tag_repos": ["https://github.com/zrm625/r0", "https://github.com/zrm625/r1"]}
+         "tag_repos": ["https://github.com/zrm625/r0", "https://github.com/zrm625/r1",
+                       "https://github.com/zrm625/r2"]}
     core.write_json(core.batch_dir("b1") / "batch.json", b)
 
 
@@ -57,7 +62,8 @@ def promote(merged, tagged, dev=None):
     err = io.StringIO()
     with mock.patch.object(flashing, "Device", lambda *a: dev or phone()), \
             mock.patch.object(recovery, "default_runner", runner(merged, tagged)), \
-            mock.patch.object(stage, "expected_repos", lambda manifest=None: set(REPOS)), redirect_stderr(err):
+            mock.patch.object(stage, "expected_repos", lambda manifest=None: set(REPOS)), \
+            mock.patch.object(stage, "repo_slugs", lambda manifest=None: dict(SLUGS)), redirect_stderr(err):
         rc = flashing.main(["--promote", "b1"])
     return rc, err.getvalue(), flashing.load_state()
 
@@ -66,7 +72,7 @@ class PromoteCommand(unittest.TestCase):
     def test_pending_batch_keeps_the_fallback(self):
         with bench_home() as h:
             setup(h)
-            rc, err, st = promote([False, False], [False, False])
+            rc, err, st = promote([False, False], [False, False, False])
         self.assertEqual(rc, flashing.EXIT_ERROR)
         self.assertEqual(st["known_good_slot"], "a")
         self.assertEqual(st["pair"]["batch"], "b1")
@@ -75,17 +81,17 @@ class PromoteCommand(unittest.TestCase):
     def test_partly_merged_batch_halts(self):
         with bench_home() as h:
             setup(h)
-            rc, _, st = promote([True, False], [False, False])
+            rc, _, st = promote([True, False], [False, False, False])
             self.assertEqual(rc, flashing.EXIT_HALT)
             self.assertEqual(st["known_good_slot"], "a")
-            rc, _, st = promote([True, True], [True, False])   # merged, one tag missing
+            rc, _, st = promote([True, True], [True, True, False])   # merged, one tag missing
             self.assertEqual(rc, flashing.EXIT_HALT)
             self.assertIsNotNone(st["pair"])
 
     def test_merged_and_tagged_batch_is_promoted(self):
         with bench_home() as h:
             setup(h)
-            rc, err, st = promote([True, True], [True, True])
+            rc, err, st = promote([True, True], [True, True, True])
         self.assertEqual(rc, flashing.EXIT_OK, err)
         self.assertEqual(st["known_good_slot"], "b")
         self.assertIsNone(st["pair"])
@@ -95,7 +101,7 @@ class PromoteCommand(unittest.TestCase):
     def test_baseline_pair_is_never_promoted(self):
         with bench_home() as h:
             setup(h, kind="baseline")
-            rc, err, st = promote([True, True], [True, True])
+            rc, err, st = promote([True, True], [True, True, True])
         self.assertEqual(rc, flashing.EXIT_ERROR)
         self.assertEqual(st["pair"]["kind"], "baseline")
         self.assertIn("phone-qa --baseline", err)
@@ -107,6 +113,31 @@ class PromoteCommand(unittest.TestCase):
                 rc, err, st = promote([True, True], [True, True], dev=phone(build_id=bid))
             self.assertEqual(rc, flashing.EXIT_ERROR, bid)
             self.assertEqual(st["known_good_slot"], "a")
+
+
+class MergeStartedCommand(unittest.TestCase):
+    def test_marker_is_written_once_and_kept(self):
+        with bench_home() as h:
+            setup(h)
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(flashing.main(["--merge-started", "b1"]), flashing.EXIT_OK)
+            first = core.read_json(core.batch_dir("b1") / "batch.json")["merge_started"]
+            self.assertTrue(first["at"])
+            with redirect_stderr(io.StringIO()):
+                self.assertEqual(flashing.main(["--merge-started", "b1"]), flashing.EXIT_OK)
+            self.assertEqual(core.read_json(core.batch_dir("b1") / "batch.json")["merge_started"], first)
+
+    def test_recover_with_marker_and_nothing_merged_halts(self):
+        with bench_home() as h:
+            setup(h)
+            b = core.read_json(core.batch_dir("b1") / "batch.json")
+            b["merge_started"] = {"at": "t5"}
+            core.write_json(core.batch_dir("b1") / "batch.json", b)
+            with mock.patch.object(stage, "repo_slugs", lambda manifest=None: dict(SLUGS)), \
+                    redirect_stderr(io.StringIO()):
+                rc = flashing.recover(runner=runner([False, False], [False, False, False]), dev=phone())
+            self.assertEqual(rc, flashing.EXIT_HALT)
+            self.assertEqual(flashing.load_state()["pair"]["batch"], "b1")
 
 
 class Checkpoint(unittest.TestCase):

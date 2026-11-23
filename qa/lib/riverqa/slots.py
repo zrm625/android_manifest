@@ -204,37 +204,74 @@ def seed_written(state: dict, at: str) -> None:
 PROMOTE, ROLLBACK, HALT = "promote", "rollback", "halt"
 
 
-def merged_and_tagged(lookup: dict) -> tuple[bool | None, str]:
-    """True only if every PR merged, every repo has the tag, and in each repo
-    with a PR the tag points at that PR's merge commit. False if nothing is
-    merged or tagged. None if it is partly done (or tagged elsewhere)."""
-    prs, tags = lookup.get("prs") or [], lookup.get("tags") or []
-    if not prs or not tags:
-        return None, "batch.json lists no PRs or no tag repos for this batch"
-    merged = [p["merged"] for p in prs]
-    tagged = [t["present"] for t in tags]
-    if not any(merged) and not any(tagged):
-        return False, "no PR merged and no tag"
-    if not (all(merged) and all(tagged)):
-        return None, (f"partly merged/tagged ({sum(merged)}/{len(merged)} PRs, {sum(tagged)}/{len(tagged)} tags)")
-    tag_at = {t["repo"]: t.get("commit") for t in tags}
-    wrong = []
-    for p in prs:
-        repo = p.get("repo")
-        if repo not in tag_at:
-            wrong.append(f"{repo}: has a PR but is not in tag_repos")
-        elif not p.get("merge_commit") or tag_at[repo] != p["merge_commit"]:
-            wrong.append(f"{repo}: tag at {str(tag_at[repo])[:12]}, merge commit {str(p.get('merge_commit'))[:12]}")
-    if wrong:
-        return None, "merged and tagged, but the tag is not at the merge commit: " + "; ".join(wrong)
-    return True, "every PR merged and every repo tagged at its merge commit"
+def commit_set_proof(batch: dict, lookup: dict, slugs: dict[str, str]) -> list[str]:
+    """Why the lookup does not prove the batch's tested commit set was
+    merged and tagged (C1, review round 2). Empty only if, for every repo
+    in commit_set: with a PR, the PR's head is the tested commit, the PR is
+    merged and the tag points at its merge commit; without a PR, the tag
+    points at exactly the tested commit. A PR or tag repo outside the commit
+    set, or a repo the record doesn't cover, is a stale or incomplete
+    record."""
+    cs = batch.get("commit_set") or {}
+    if not cs:
+        return ["batch.json has no tested commit set"]
+    errs = []
+    want = {}
+    for path, sha in sorted(cs.items()):
+        slug = slugs.get(path)
+        if not slug:
+            errs.append(f"{path}: no GitHub repo known for it in default.xml")
+        else:
+            want[slug] = (path, sha)
+    prs, tags = {}, {}
+    for p in lookup.get("prs") or []:
+        if p.get("repo") in prs:
+            errs.append(f"{p.get('repo')}: more than one PR recorded")
+        prs[p.get("repo")] = p
+    for t in lookup.get("tags") or []:
+        tags[t.get("repo")] = t
+    for slug in sorted(set(prs) - set(want)):
+        errs.append(f"{slug}: has a PR but is not in the tested commit set (stale record)")
+    for slug in sorted(set(tags) - set(want)):
+        errs.append(f"{slug}: in tag_repos but not in the tested commit set (stale record)")
+    for slug, (path, sha) in sorted(want.items()):
+        t = tags.get(slug)
+        if t is None:
+            errs.append(f"{path}: not in tag_repos")
+            continue
+        if not t.get("present"):
+            errs.append(f"{path}: tag missing")
+            continue
+        p = prs.get(slug)
+        if p is None:
+            if t.get("commit") != sha:
+                errs.append(f"{path}: no PR, so the tag must be at the tested commit {sha[:12]}, "
+                            f"not {str(t.get('commit'))[:12]}")
+            continue
+        if p.get("head") != sha:
+            errs.append(f"{path}: PR head {str(p.get('head'))[:12]} is not the tested commit {sha[:12]}")
+        if not p.get("merged") or not p.get("merge_commit"):
+            errs.append(f"{path}: PR not merged")
+        elif t.get("commit") != p["merge_commit"]:
+            errs.append(f"{path}: tag at {str(t.get('commit'))[:12]}, merge commit {p['merge_commit'][:12]}")
+    return errs
 
 
-def decide_recovery(pair: dict, lookup: dict | None) -> tuple[str, str]:
+def decide_recovery(pair: dict, lookup: dict | None, batch: dict | None = None,
+                    slugs: dict[str, str] | None = None) -> tuple[str, str]:
     """What to do with an unresolved pair at the start of a batch.
 
     ``lookup`` is None when the GitHub/tag lookup failed (network or gh down),
-    otherwise recovery.lookup()'s result.
+    otherwise recovery.lookup()'s result. ``batch`` is batch.json (its
+    commit_set and merge_started); ``slugs`` maps its repo paths to GitHub
+    repos (stage.repo_slugs()).
+
+    - Every repo of the tested commit set proven merged and tagged
+      (commit_set_proof): promote.
+    - Nothing merged and nothing tagged (or nothing recorded at all), and no
+      merge_started: the run stopped before merging, so roll back.
+    - Anything else, including merge_started with incomplete evidence and a
+      stale or incomplete prs/tag_repos record: halt.
     """
     kind = pair.get("kind")
     if kind in ("calibration", "experiment", "baseline"):
@@ -243,9 +280,18 @@ def decide_recovery(pair: dict, lookup: dict | None) -> tuple[str, str]:
         return HALT, f"unknown pair kind {kind!r}"
     if lookup is None:
         return HALT, "merge/tag lookup failed; a failed lookup never counts as 'none merged'"
-    done, why = merged_and_tagged(lookup)
-    if done is True:
-        return PROMOTE, why
-    if done is False:
-        return ROLLBACK, why + ": roll back"
-    return HALT, why + "; needs Zak"
+    batch = batch or {}
+    ms = batch.get("merge_started")
+    started = ((ms.get("at") if isinstance(ms, dict) else None) or "an unrecorded time") if ms else None
+    prs, tags = lookup.get("prs") or [], lookup.get("tags") or []
+    if not any(p.get("merged") for p in prs) and not any(t.get("present") for t in tags):
+        what = "no PRs or tag repos recorded" if not prs and not tags else "no PR merged and no tag"
+        if not started:
+            return ROLLBACK, f"{what}, and no merge_started: stopped before merging: roll back"
+        return HALT, f"{what}, but merge_started at {started}: interrupted mid-merge; needs Zak"
+    errs = commit_set_proof(batch, lookup, slugs or {})
+    if not errs:
+        return PROMOTE, ("every repo of the tested commit set is merged and tagged "
+                         "(PR heads are the tested commits; tags at merge commits or tested commits)")
+    return HALT, ("not proven: " + "; ".join(errs[:8]) + (f"; +{len(errs) - 8} more" if len(errs) > 8 else "")
+                  + "; needs Zak")

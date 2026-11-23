@@ -214,9 +214,10 @@ class _PromotePhone:
 
 
 def host_control(name: str) -> tuple[bool, str]:
-    """tag-pushed-host-killed: a batch whose PRs are merged and whose tag is
-    pushed at the merge commits, with the host killed before slot-state.json
-    was updated. Drive flash --recover itself, against a scratch $BENCH_HOME
+    """tag-pushed-host-killed: a batch whose PRs (heads at the tested
+    commits) are merged and whose tag is pushed in every repo of the tested
+    commit set (at the merge commit, or the tested commit where there is no
+    PR), with the host killed before slot-state.json was updated. Drive flash --recover itself, against a scratch $BENCH_HOME
     with stubbed gh and git ls-remote, and judge the persisted slot-state.json:
     the batch must be promoted, never rolled back."""
     import tempfile
@@ -228,7 +229,8 @@ def host_control(name: str) -> tuple[bool, str]:
         with tempfile.TemporaryDirectory() as tmp:
             core.BENCH_HOME = Path(tmp)
             repos = sorted(stage.expected_repos())
-            commits = {p: "a" * 40 for p in repos}
+            slugs = stage.repo_slugs()
+            commits = {p: f"{i + 1:040x}" for i, p in enumerate(repos)}
             h = stage.commit_set_hash(commits)
             bid = f"ctl-{h}"
             st = slots.first_run("a", "f" * 64, "t0")
@@ -239,21 +241,23 @@ def host_control(name: str) -> tuple[bool, str]:
             flashing.save_state(st)
             prs = [{"repo": "zrm625/android_manifest", "number": 1},
                    {"repo": "zrm625/android_device_motorola_river", "number": 2}]
+            by_slug = {slugs[p]: p for p in repos}
             wj(core.batch_dir("ctl") / "batch.json", {
                 "batch": "ctl", "kind": "batch", "build_id": bid, "vendor_build_id": bid, "commit_set": commits,
-                "commit_set_hash": h, "prs": prs, "tag": "known-good-ctl",
-                "tag_repos": [f"https://github.com/{p['repo']}" for p in prs]})
-            merge = {p["repo"]: f"{p['number']:040x}" for p in prs}
+                "commit_set_hash": h, "prs": prs, "tag": "known-good-ctl", "merge_started": {"at": "t3"},
+                "tag_repos": [f"https://github.com/{slugs[p]}" for p in repos]})
+            merge = {p["repo"]: f"{0xabc0 + p['number']:040x}" for p in prs}
 
             def stub(cmd):
                 if cmd[0] == "gh":
                     repo = cmd[cmd.index("--repo") + 1]
                     return subprocess.CompletedProcess(cmd, 0, json.dumps(
                         {"state": "MERGED", "url": f"https://github.com/{repo}/pull/x",
-                         "mergeCommit": {"oid": merge[repo]}}), "")
+                         "headRefOid": commits[by_slug[repo]], "mergeCommit": {"oid": merge[repo]}}), "")
                 repo = cmd[3].removeprefix("https://github.com/")
+                at = merge.get(repo) or commits[by_slug[repo]]
                 return subprocess.CompletedProcess(
-                    cmd, 0, f"{'9' * 40}\trefs/tags/known-good-ctl\n{merge[repo]}\trefs/tags/known-good-ctl^{{}}\n", "")
+                    cmd, 0, f"{'9' * 40}\trefs/tags/known-good-ctl\n{at}\trefs/tags/known-good-ctl^{{}}\n", "")
             rc = flashing.recover(runner=stub, dev=_PromotePhone("b", bid))
             after = flashing.load_state()
     finally:

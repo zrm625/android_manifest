@@ -420,7 +420,7 @@ def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
         log(f"error: {batch_id}'s build is not tied to the batch: " + "; ".join(errs))
         return EXIT_ERROR
     look = recovery.lookup(batch, runner)
-    decision, why = slots.decide_recovery(pair, look)
+    decision, why = slots.decide_recovery(pair, look, batch, stage.repo_slugs())
     if decision != slots.PROMOTE:
         log(f"error: {batch_id} is not proven merged and tagged ({why}). The fallback slot stays reserved.")
         return EXIT_HALT if decision == slots.HALT else EXIT_ERROR
@@ -441,6 +441,27 @@ def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
     return EXIT_OK
 
 
+def merge_started(batch_id: str) -> int:
+    """flash --merge-started: the runner calls this, and waits for it to
+    succeed, before any merge or tag action for the batch. It records
+    merge_started in batch.json with an atomic, fsynced write, so recovery
+    can tell a run that stopped before merging (roll back) from one
+    interrupted mid-merge (halt). Idempotent: the first time is kept."""
+    path = batch_dir(batch_id) / "batch.json"
+    batch = read_json(path)
+    if batch is None:
+        log(f"error: no batch.json for {batch_id}")
+        return EXIT_ERROR
+    if batch.get("kind") != "batch":
+        log(f"error: {batch_id} is a {batch.get('kind')} run, which is never merged")
+        return EXIT_ERROR
+    if not batch.get("merge_started"):
+        batch["merge_started"] = {"at": now_iso()}
+        write_json(path, batch)
+    log(f"merge_started for {batch_id} at {batch['merge_started'].get('at')}")
+    return EXIT_OK
+
+
 def recover(runner=None, dev: Device | None = None) -> int:
     st = load_state()
     if st and finish_checkpoint(st):
@@ -451,7 +472,7 @@ def recover(runner=None, dev: Device | None = None) -> int:
     pair = st["pair"]
     batch = read_json(batch_dir(pair["batch"]) / "batch.json", {}) or {}
     look = None if pair["kind"] != "batch" else recovery.lookup(batch, runner)
-    decision, why = slots.decide_recovery(pair, look)
+    decision, why = slots.decide_recovery(pair, look, batch, stage.repo_slugs() if pair["kind"] == "batch" else {})
     log(f"Recovery for {pair['batch']} ({pair['kind']}): {decision}: {why}")
     st.setdefault("history", []).append({"event": "recovery-decision", "at": now_iso(),
                                          "batch": pair["batch"], "decision": decision, "why": why})
@@ -499,9 +520,14 @@ Usage:
   flash --recover         Resolve an unresolved pair: look up the batch's merge and
                           tag state (gh, git ls-remote) and promote, roll back or halt.
   flash --promote ID      The batch was merged and tagged: make its slot known-good.
-                          Checks every PR is merged and every repo has the tag at
-                          the merge commit first (same lookup as --recover).
+                          Checks, for every repo of the tested commit set, that its
+                          PR's head is the tested commit, the PR is merged and the
+                          tag is at the merge commit, or with no PR that the tag is
+                          at the tested commit (same lookup as --recover).
                           Never for a baseline (phone-qa --baseline closes those).
+  flash --merge-started ID
+                          Record in batch.json, durably, that merging has begun.
+                          The runner runs this before any merge or tag action.
   flash --status          Show slot-state.json.
 
   baseline|stripped  Use $BENCH_HOME/out-<env>/target/product/river.
@@ -535,6 +561,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--rollback", action="store_true")
     ap.add_argument("--recover", action="store_true")
     ap.add_argument("--promote")
+    ap.add_argument("--merge-started")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args(argv)
@@ -563,6 +590,8 @@ def main(argv: list[str]) -> int:
                 return recover()
             if a.promote:
                 return promote_batch(a.promote)
+            if a.merge_started:
+                return merge_started(a.merge_started)
             if a.batch:
                 return flash_batch(a.batch, a.images, a.wipe)
             if a.images and not a.src:
