@@ -30,7 +30,7 @@ CONTROL_OVERRIDE = QA_HOME / "control-override.json"
 HISTORY = QA_HOME / "history.jsonl"
 TELEPHONY_RE = re.compile(r"feature:android\.hardware\.telephony")
 BAD_DROPBOX = ("system_server_crash", "system_app_crash", "data_app_crash", "SYSTEM_TOMBSTONE",
-               "system_server_native_crash")
+               "system_server_native_crash", "system_app_native_crash", "data_app_native_crash")
 WATCHED_PROCS = {
     "system_server": "system_server",
     "cameraserver": "cameraserver",
@@ -102,6 +102,10 @@ class Run:
         self.server = None
         self.helper = None
         self.halted: str | None = None
+        self.logcat = None
+        self.logcat_file = None
+        self.logcat_dead: str | None = None
+        self.logcat_restarts: list = []
 
     def _flash_attempt(self) -> dict | None:
         if not self.batch_id:
@@ -210,26 +214,104 @@ def check_snapshot(run: Run) -> Result:
     st = dev.boot_status()
     if st is None:
         return Result("preflight.snapshot", UNVERIFIED, "cannot read boot status")
+    reads = diagnostic_reads(dev)
+    bad = [f"{k}: {v[2]}" for k, v in reads.items() if not v[0]]
+    if bad:
+        return Result("preflight.snapshot", UNVERIFIED, "diagnostics unreadable at preflight: " + "; ".join(bad))
     run.snapshot = {
         "boot_id": st.boot_id, "uptime": st.uptime,
         "procs": proc_info(dev),
-        "dropbox": bootsig.dropbox_tags(dev.sh("dumpsys dropbox", timeout=60)),
-        "tombstones": sorted(dev.sh("ls /data/tombstones 2>/dev/null").split()),
-        "pstore": hashlib.sha256(dev.sh_bytes("cat /sys/fs/pstore/* 2>/dev/null")).hexdigest(),
+        "dropbox": bootsig.dropbox_tags(reads["dropbox"][1]),
+        "tombstones": sorted(reads["tombstones"][1].split()),
+        "pstore": hashlib.sha256(reads["pstore"][1]).hexdigest(),
+        "crash": reads["crash"][1],
         "hal_deaths": hal_deaths(dev),
     }
     write_json(run.dir / "snapshot.json", run.snapshot)
-    # Stream logcat for the whole run.
-    import subprocess
-    run.logcat_file = open(run.dir / "logcat.txt", "w")
-    dev.sh("logcat -c -b crash 2>/dev/null; true") if False else None
-    run.logcat = subprocess.Popen(["adb", "-s", dev.serial, "logcat", "-b", "crash,kernel,main", "-v", "threadtime",
-                                   "-T", "1"], stdout=run.logcat_file, stderr=subprocess.DEVNULL)
+    start_logcat(run)
     missing = [k for k, v in run.snapshot["procs"].items() if v is None]
     return Result("preflight.snapshot", PASS if not missing else UNVERIFIED,
                   f"boot_id {st.boot_id[:8]}, uptime {st.uptime:.0f} s" +
                   (f"; not running: {', '.join(missing)}" if missing else ""),
                   {"procs": run.snapshot["procs"]})
+
+
+def diagnostic_reads(dev: Device) -> dict[str, tuple[bool, object, str]]:
+    """The reads preflight snapshots and the final checks compare: each is
+    (ok, content, why). Content is text, except pstore (bytes)."""
+    out = {}
+    for key, kind, cmd in (("dropbox", "dropbox", "dumpsys dropbox"), ("tombstones", "tombstones", "ls /data/tombstones"),
+                           ("crash", "crash", "logcat -b crash -d")):
+        ok, text, why = evidence.checked_read(dev, kind, cmd)
+        out[key] = (ok, text, why)
+    out["pstore"] = evidence.read_pstore(dev, "*")
+    return out
+
+
+# --- the streamed logcat (A3) -------------------------------------------------------
+# The stream dies when USB re-enumerates (the USB check). It is restarted right
+# after that check from the phone time taken before it, appending to the same
+# file. A stream found dead at any other point was not restarted, and the
+# final health check is then UNVERIFIED.
+
+def phone_epoch(dev: Device) -> str | None:
+    r = dev.read("date +%s.%N")
+    t = r.out.strip()
+    return t[:t.index(".") + 4] if r.ok and re.match(r"^\d+\.\d+$", t) else None
+
+
+def start_logcat(run: Run, since: str | None = None) -> None:
+    import subprocess
+    fresh = since is None
+    f = open(run.dir / "logcat.txt", "w" if fresh else "a")
+    if not fresh:
+        f.write(f"--------- phone-qa: stream restarted from {since}\n")
+        f.flush()
+    run.logcat_file = f
+    run.logcat = subprocess.Popen(["adb", "-s", run.dev.serial, "logcat", "-b", "crash,kernel,main", "-v", "threadtime",
+                                   "-T", since or "1"], stdout=f, stderr=subprocess.DEVNULL)
+
+
+def logcat_alive(run: Run) -> bool:
+    p = getattr(run, "logcat", None)
+    return p is not None and p.poll() is None
+
+
+def logcat_check(run: Run, where: str) -> None:
+    """Record a stream that died where it wasn't expected to."""
+    if getattr(run, "logcat", None) is not None and not logcat_alive(run):
+        run.logcat_dead = run.logcat_dead or f"streamed logcat died before {where} and was not restarted"
+
+
+def logcat_restart(run: Run, since: str | None, where: str) -> None:
+    """After the USB check: restart the stream from ``since`` (phone time
+    taken before the check). Without a start time the gap can't be covered."""
+    if getattr(run, "logcat", None) is None:
+        return
+    if logcat_alive(run):
+        return
+    run.logcat_file.close()
+    if since is None:
+        run.logcat_dead = run.logcat_dead or f"streamed logcat died at {where}; no phone time to restart from"
+        return
+    start_logcat(run, since)
+    run.logcat_restarts.append({"after": where, "since": since})
+
+
+def stop_logcat(run: Run) -> None:
+    """Terminate the stream (every exit path). Safe to call twice."""
+    p = getattr(run, "logcat", None)
+    if p is not None:
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(5)
+            except Exception:  # noqa: BLE001
+                p.kill()
+        run.logcat = None
+    f = getattr(run, "logcat_file", None)
+    if f is not None and not f.closed:
+        f.close()
 
 
 def hal_deaths(dev: Device) -> str | None:
@@ -442,7 +524,11 @@ def check_boot_signals(run: Run) -> Result:
 
 def check_dropbox(run: Run, since: list[str] | None = None) -> Result:
     dev = run.dev
-    tags = bootsig.dropbox_tags(dev.sh("dumpsys dropbox", timeout=60))
+    cid = "health.dropbox" if since is None else "final.dropbox"
+    ok, dump, why = evidence.checked_read(dev, "dropbox", "dumpsys dropbox")
+    if not ok:
+        return Result(cid, UNVERIFIED, f"dumpsys dropbox unreadable: {why}")
+    tags = bootsig.dropbox_tags(dump)
     pool = list(tags)
     if since is not None:
         # Entries compared by name and count, never by timestamp.
@@ -453,9 +539,10 @@ def check_dropbox(run: Run, since: list[str] | None = None) -> Result:
     kmsg = [t for t in pool if t == "SYSTEM_LAST_KMSG"]
     panic = False
     if kmsg:
-        text = dev.sh("dumpsys dropbox --print SYSTEM_LAST_KMSG", timeout=120)
-        panic = bool(re.search(r"Kernel panic|Internal error: Oops", text))
-    cid = "health.dropbox" if since is None else "final.dropbox"
+        r = dev.read("dumpsys dropbox --print SYSTEM_LAST_KMSG", timeout=120)
+        if not r.ok:
+            return Result(cid, UNVERIFIED, f"cannot print SYSTEM_LAST_KMSG (exit {r.rc})")
+        panic = bool(re.search(r"Kernel panic|Internal error: Oops", r.out))
     if bad or panic:
         return Result(cid, FAIL, "dropbox: " + ", ".join(sorted(set(bad)) + (["SYSTEM_LAST_KMSG panic"] if panic else [])),
                       {"tags": tags})
@@ -475,10 +562,10 @@ def check_pstore(run: Run) -> Result:
     rc, out, err = run.dev.sh_rc("ls /sys/fs/pstore")
     if rc != 0:
         return Result("health.pstore", UNVERIFIED, "cannot read /sys/fs/pstore")
-    data = run.dev.sh_bytes("cat /sys/fs/pstore/* 2>/dev/null", timeout=60)
+    ok, data, why = evidence.read_pstore(run.dev, "*")
+    if not ok:
+        return Result("health.pstore", UNVERIFIED, why)
     files = out.split()
-    if any(f.startswith(("dmesg-", "pmsg-")) and "ramoops" in f for f in files):
-        pass
     hit = re.search(rb"Kernel panic|Internal error: Oops|Unable to handle kernel", data)
     if hit or any(f.startswith("dmesg-ramoops") for f in files):
         return Result("health.pstore", FAIL, f"pstore shows a panic or oops ({', '.join(files)})")
@@ -486,7 +573,10 @@ def check_pstore(run: Run) -> Result:
 
 
 def check_services(run: Run) -> Result:
-    crashed, loops = evidence.service_problems(run.dev.sh("dmesg", timeout=60))
+    ok, dmesg, why = evidence.checked_read(run.dev, "dmesg", "dmesg")
+    if not ok:
+        return Result("health.services", UNVERIFIED, f"dmesg unreadable: {why}")
+    crashed, loops = evidence.service_problems(dmesg)
     if crashed:
         return Result("health.services", FAIL, "crashed: " + ", ".join(crashed))
     if loops:
@@ -495,7 +585,10 @@ def check_services(run: Run) -> Result:
 
 
 def check_telephony(run: Run) -> Result:
-    feats = TELEPHONY_RE.findall(run.dev.sh("pm list features"))
+    ok, text, why = evidence.checked_read(run.dev, "features", "pm list features")
+    if not ok:
+        return Result("health.telephony", UNVERIFIED, f"pm list features unreadable: {why}")
+    feats = TELEPHONY_RE.findall(text)
     return Result("health.telephony", FAIL if feats else PASS,
                   f"{len(feats)} telephony features" if feats else "no telephony features (Wi-Fi only)")
 
@@ -533,7 +626,10 @@ def health(run: Run) -> None:
 # --- quick mode --------------------------------------------------------------------------
 
 def quick_crashes(run: Run) -> Result:
-    procs = evidence.crash_processes(run.dev.sh("logcat -b crash -d", timeout=60))
+    ok, text, why = evidence.checked_read(run.dev, "crash", "logcat -b crash -d")
+    if not ok:
+        return Result("health.crashes", UNVERIFIED, f"logcat -b crash unreadable: {why}")
+    procs = evidence.crash_processes(text)
     return Result("health.crashes", FAIL if procs else PASS,
                   ("crashes since boot: " + ", ".join(procs)) if procs else "none since boot")
 
@@ -542,7 +638,15 @@ def quick_tombstones(run: Run) -> Result:
     up = float(run.dev.sh("cat /proc/uptime").split()[0])
     now = int(run.dev.sh("date +%s").strip())
     boot = now - up
-    rc, out, _ = run.dev.sh_rc("for f in /data/tombstones/tombstone_*; do [ -e \"$f\" ] && stat -c '%Y %n' \"$f\"; done")
+    rc, listing, err = run.dev.sh_rc("ls /data/tombstones")
+    if rc != 0:
+        return Result("health.tombstones", UNVERIFIED, f"cannot list /data/tombstones: {err.strip()}")
+    out = ""
+    names = [f for f in listing.split() if f.startswith("tombstone")]
+    if names:
+        rc, out, err = run.dev.sh_rc("stat -c '%Y %n' " + " ".join(f"/data/tombstones/{n}" for n in names))
+        if rc != 0:
+            return Result("health.tombstones", UNVERIFIED, f"cannot stat tombstones: {err.strip()}")
     new, old = [], []
     for line in out.splitlines():
         parts = line.split()

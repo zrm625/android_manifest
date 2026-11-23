@@ -9,6 +9,10 @@ Evidence for one boot lives in a directory with:
   dropbox.txt    dumpsys dropbox (tags only matter)
   pstore.bin     /sys/fs/pstore/console-ramoops* (the previous kernel's log)
   signals.json   the three boot signals for this boot
+
+meta.json's ``captured`` records, for each file, whether the read succeeded
+and passed its format check. judge() treats anything not captured cleanly as
+UNVERIFIED: a failed read must never look like an empty, clean log.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ DIED_RE = re.compile(r"init: Service '([^']+)' \(pid \d+\) (?:exited with status
 # First-boot allowlist. Calibration may need entries here; each one is written
 # down with its reason and never applied quietly. Empty on purpose.
 FIRST_BOOT_ALLOW: dict[str, str] = {}
+CAPTURED_FILES = ("dmesg.txt", "crash.txt", "dropbox.txt", "pstore.bin")
 
 
 def service_problems(dmesg: str) -> tuple[list[str], list[str]]:
@@ -67,6 +72,65 @@ def crash_processes(crash_log: str) -> list[str]:
     return sorted(set(procs))
 
 
+# Format checks for diagnostic reads (A2). Each takes (rc, text) and returns
+# (ok, why). A read that fails, or doesn't look like what it should, is not
+# evidence of anything.
+def _rc_only(rc, text):
+    return (rc == 0, "" if rc == 0 else f"exit {rc}")
+
+
+def _dropbox(rc, text):
+    if rc != 0:
+        return False, f"exit {rc}"
+    return ("Drop box contents" in text, "" if "Drop box contents" in text else "no 'Drop box contents' header")
+
+
+def _dmesg(rc, text):
+    if rc != 0:
+        return False, f"exit {rc}"
+    return (bool(text.strip()), "" if text.strip() else "empty dmesg")
+
+
+def _features(rc, text):
+    if rc != 0:
+        return False, f"exit {rc}"
+    return ("feature:" in text, "" if "feature:" in text else "no 'feature:' lines")
+
+
+CHECKS = {"dropbox": _dropbox, "dmesg": _dmesg, "features": _features, "crash": _rc_only,
+          "tombstones": _rc_only, "pstore": _rc_only}
+
+
+def validate(kind: str, rc: int, text) -> tuple[bool, str]:
+    """Is this diagnostic read usable? ``text`` may be str or bytes."""
+    if isinstance(text, bytes):
+        text = text.decode(errors="replace")
+    return CHECKS[kind](rc, text)
+
+
+def checked_read(dev, kind: str, cmd: str, timeout: float = 60) -> tuple[bool, str, str]:
+    """(ok, text, why) for one shell read, with its format check."""
+    rc, out, err = dev.sh_rc(cmd, timeout=timeout)
+    ok, why = validate(kind, rc, out)
+    return ok, out, (why + (f": {err.strip()[-200:]}" if err.strip() and not ok else ""))
+
+
+def read_pstore(dev, pattern: str = "*") -> tuple[bool, bytes, str]:
+    """(ok, bytes, why) for /sys/fs/pstore/<pattern>. exec-out carries no exit
+    status, so the files are listed first over the shell protocol; a failed
+    listing, a failed transfer or no bytes at all is not a clean read. With
+    pattern "*" an empty pstore is a clean, empty read."""
+    rc, out, err = dev.sh_rc(f"ls /sys/fs/pstore/{pattern}" if pattern != "*" else "ls /sys/fs/pstore")
+    if rc != 0:
+        return False, b"", f"cannot list /sys/fs/pstore/{pattern} (exit {rc}: {err.strip()[-120:]})"
+    if pattern == "*" and not out.split():
+        return True, b"", ""
+    rc2, data, _ = dev.sh_bytes_rc(f"cat /sys/fs/pstore/{pattern} 2>/dev/null", timeout=60)
+    if rc2 != 0 or not data:
+        return False, data, f"reading /sys/fs/pstore/{pattern} failed (adb exit {rc2}, {len(data)} bytes)"
+    return True, data, ""
+
+
 def collect(dev, out: Path, *, expected_boot_id: str, context: dict) -> dict:
     """Save evidence for the running boot (adb root first). Returns meta."""
     dev.root()
@@ -85,10 +149,16 @@ def collect(dev, out: Path, *, expected_boot_id: str, context: dict) -> dict:
         "collected_at": now_iso(),
         **context,
     }
-    (out / "dmesg.txt").write_text(dev.sh("dmesg", timeout=60))
-    (out / "crash.txt").write_text(dev.sh("logcat -b crash -d", timeout=60))
-    (out / "dropbox.txt").write_text(dev.sh("dumpsys dropbox", timeout=60))
-    (out / "pstore.bin").write_bytes(dev.sh_bytes("cat /sys/fs/pstore/console-ramoops* 2>/dev/null", timeout=60))
+    captured = {}
+    for fname, kind, cmd in (("dmesg.txt", "dmesg", "dmesg"), ("crash.txt", "crash", "logcat -b crash -d"),
+                             ("dropbox.txt", "dropbox", "dumpsys dropbox")):
+        ok, text, why = checked_read(dev, kind, cmd)
+        (out / fname).write_text(text)
+        captured[fname] = {"ok": ok, "why": why}
+    ok, data, why = read_pstore(dev, "console-ramoops*")
+    (out / "pstore.bin").write_bytes(data)
+    captured["pstore.bin"] = {"ok": ok, "why": why}
+    meta["captured"] = captured
     # The boot_id must not have changed while collecting.
     meta["boot_id_after_collection"] = dev.boot_id()
     write_json(out / "meta.json", meta)
@@ -107,6 +177,13 @@ def judge(ev_dir: Path, *, first_boot: bool = False) -> tuple[str, str, dict]:
     after = meta.get("boot_id_after_collection")
     if not want or not got or got != want or after != want:
         return UNVERIFIED, f"boot_id mismatch (completed {want}, collected {got}, after {after})", meta
+    captured = meta.get("captured")
+    if not isinstance(captured, dict):
+        return UNVERIFIED, "evidence has no capture record (collected by an older harness)", meta
+    bad = [f"{f} ({(captured.get(f) or {}).get('why') or 'not recorded'})" for f in CAPTURED_FILES
+           if not (captured.get(f) or {}).get("ok")]
+    if bad:
+        return UNVERIFIED, "not captured cleanly: " + ", ".join(bad), meta
     problems = []
     try:
         dmesg = (ev_dir / "dmesg.txt").read_text()

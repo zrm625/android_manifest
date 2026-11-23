@@ -1324,87 +1324,157 @@ def run_features(run) -> None:
     if not ok:
         run.add(Result("system.sideload", FAIL, f"helper install failed: {msg}"))
         return
+    from .qa import logcat_check, logcat_restart, phone_epoch
     for cid, fn in FEATURES:
         if run.halted:
             break
         if not run.wanted(cid):
             continue
         run.guard()
+        logcat_check(run, cid)
+        since = phone_epoch(run.dev) if cid == "hardware.usb" else None
         run_check(run, cid, fn)
-        run.journal.entries  # noqa: B018 - journal is saved on every change
+        if cid == "hardware.usb":
+            logcat_restart(run, since, cid)
+
+
+SIDELOAD_KEYS = ("helper", "brave", "tailscale", "t3code")
+
+
+def sideload_result(sl: dict) -> Result:
+    """system.sideload: all four expected APKs installed, launched (not the
+    helper, which is instrumented instead) and uninstalled, each verified."""
+    missing = [f"{k}: {s}" for k in SIDELOAD_KEYS for s in ("install", "launch", "uninstall")
+               if (k != "helper" or s != "launch") and (sl.get(k) or {}).get(s) is not True]
+    return Result("system.sideload", FAIL if missing else PASS, "; ".join(missing) if missing else
+                  f"{len(SIDELOAD_KEYS)} APKs installed, opened and uninstalled, each verified", sl)
 
 
 def cleanup_and_final(run) -> None:
-    dev = run.dev
-    notes, bad = [], []
     try:
-        if dev.state() != "device":
-            run.add(Result("cleanup.verified", FAIL, "phone not reachable for cleanup"))
-            return
-        dev.root()
-        # Apps first, then everything else in the journal, the helper last.
-        for e in [e for e in list(run.journal.entries) if e["kind"] == "package" and e["key"] != helper.PKG]:
-            ok, msg = restore_now(run, RES, "package", e["key"])
-            (notes if ok else bad).append(msg)
-            for k, v in (getattr(run, "sideload", {}) or {}).items():
-                if run.fixtures.get("files", {}).get(k, {}).get("package") == e["key"]:
-                    v["uninstall"] = ok
-        from .restore import restore_entry
-        for e in [e for e in list(run.journal.entries) if e.get("run_id") == run.run_id and
-                  not (e["kind"] == "package" and e["key"] == helper.PKG)]:
-            ok, msg = restore_entry(run, e)
-            (notes if ok else bad).append(msg)
-        if getattr(run, "sideload", None) is not None and run.journal.find(RES, "package", helper.PKG):
-            ok = helper.uninstall(run)
-            run.sideload.setdefault("helper", {})["uninstall"] = ok
-            (notes if ok else bad).append("helper " + ("uninstalled" if ok else "still installed"))
+        cleanup(run)
+    finally:
         if getattr(run, "server", None):
             run.server.stop()
-        dev.sh("input keyevent KEYCODE_HOME; input keyevent KEYCODE_SLEEP")
-        left = [e for e in run.journal.entries if e.get("run_id") == run.run_id]
-        if left:
-            bad.append(f"{len(left)} journal entries not restored")
-        run.add(Result("cleanup.verified", FAIL if bad else PASS, "; ".join(bad) or f"{len(notes)} steps verified",
-                       {"done": notes, "failed": bad}))
-        if getattr(run, "sideload", None) is not None and run.wanted("system.sideload"):
-            sl = run.sideload
-            missing = [f"{k}: {s}" for k, v in sl.items() for s in ("install", "launch", "uninstall")
-                       if (k != "helper" or s != "launch") and v.get(s) is not True]
-            run.add(Result("system.sideload", FAIL if missing else PASS,
-                           ("; ".join(missing)) if missing else
-                           f"{len(sl)} APKs installed, opened and uninstalled, each verified", sl))
-    finally:
-        if getattr(run, "logcat", None):
-            run.logcat.terminate()
     final_checks(run)
 
 
-def final_checks(run) -> None:
-    from .qa import check_dropbox, check_services, hal_deaths, proc_info
+def cleanup(run) -> None:
+    """Undo this run's journal entries in plan_recovery order (resources, then
+    phone, then host; hidden_api_policy after the Bluetooth entries), apps
+    first and the helper last. Every step is verified."""
+    from .device import GuardError
+    from .restore import restore_entry
     dev = run.dev
-    snap = run.snapshot
-    if not snap or dev.state() != "device":
-        for cid in ("final.health", "final.processes", "final.hal_deaths", "final.boot_id", "final.settings"):
-            run.add(Result(cid, UNVERIFIED, "no preflight snapshot or phone unreachable"))
+    notes, bad = [], []
+    if dev.state() != "device":
+        run.add(Result("cleanup.verified", FAIL, "phone not reachable for cleanup"))
         return
-    parts = []
-    db = check_dropbox(run, since=snap["dropbox"])
-    parts.append((db.state, db.summary))
-    tomb = sorted(dev.sh("ls /data/tombstones 2>/dev/null").split())
-    parts.append((PASS if tomb == snap["tombstones"] else FAIL,
-                  "no new tombstones" if tomb == snap["tombstones"] else "new tombstones"))
+    try:
+        run.guard()
+    except GuardError as e:
+        run.halted = run.halted or f"guard failed before cleanup: {e}"
+        run.add(Result("cleanup.verified", FAIL, f"guard failed before cleanup: {e}"))
+        return
+    dev.root()
+    mine = [e for e in run.journal.entries if e.get("run_id") == run.run_id]
+    order, _ = jmod.plan_recovery(mine, jmod.current_wipe_seq(run.journal.qa_home))
+    apps = [e for e in order if e["kind"] == "package" and e["key"] != helper.PKG]
+    rest = [e for e in order if e["kind"] != "package"]
+    for e in apps + rest:
+        ok, msg = restore_entry(run, e)
+        (notes if ok else bad).append(msg)
+        if e["kind"] == "package":
+            for k, v in (getattr(run, "sideload", {}) or {}).items():
+                if run.fixtures.get("files", {}).get(k, {}).get("package") == e["key"]:
+                    v["uninstall"] = ok
+    if getattr(run, "sideload", None) is not None and run.journal.find(RES, "package", helper.PKG):
+        ok = helper.uninstall(run)
+        run.sideload.setdefault("helper", {})["uninstall"] = ok
+        (notes if ok else bad).append("helper " + ("uninstalled" if ok else "still installed"))
+    dev.sh("input keyevent KEYCODE_HOME; input keyevent KEYCODE_SLEEP")
+    left = [e for e in run.journal.entries if e.get("run_id") == run.run_id]
+    if left:
+        bad.append(f"{len(left)} journal entries not restored")
+    run.add(Result("cleanup.verified", FAIL if bad else PASS, "; ".join(bad) or f"{len(notes)} steps verified",
+                   {"done": notes, "failed": bad}))
+    if getattr(run, "sideload", None) is not None and run.wanted("system.sideload"):
+        run.add(sideload_result(run.sideload))
+
+
+def final_health_parts(snap: dict, reads: dict, logcat_path: Path, logcat_dead: str | None) -> list[tuple[str, str]]:
+    """Tombstones, pstore, the streamed logcat and the crash buffer, each
+    against the preflight snapshot. A failed read or a dead stream is
+    UNVERIFIED, never PASS. Pure apart from reading the logcat file."""
     import hashlib
-    ps = hashlib.sha256(dev.sh_bytes("cat /sys/fs/pstore/* 2>/dev/null")).hexdigest()
-    parts.append((PASS if ps == snap["pstore"] else FAIL, "pstore unchanged" if ps == snap["pstore"] else "pstore changed"))
-    sv = check_services(run)
-    parts.append((sv.state, sv.summary))
-    lc = (run.dir / "logcat.txt").read_text(errors="replace") if (run.dir / "logcat.txt").exists() else None
+    parts = []
+    ok, text, why = reads["tombstones"]
+    if not ok:
+        parts.append((UNVERIFIED, f"/data/tombstones unreadable: {why}"))
+    else:
+        tomb = sorted(text.split())
+        parts.append((PASS if tomb == snap["tombstones"] else FAIL,
+                      "no new tombstones" if tomb == snap["tombstones"] else "new tombstones"))
+    ok, data, why = reads["pstore"]
+    if not ok:
+        parts.append((UNVERIFIED, f"pstore unreadable: {why}"))
+    else:
+        same = hashlib.sha256(data).hexdigest() == snap["pstore"]
+        parts.append((PASS if same else FAIL, "pstore unchanged" if same else "pstore changed"))
+    lc = logcat_path.read_text(errors="replace") if logcat_path.exists() else None
     if lc is None:
         parts.append((UNVERIFIED, "no streamed logcat"))
     else:
         crashes = re.findall(r"FATAL EXCEPTION|Fatal signal \d+|>>> \S+ <<<|ANR in \S+", lc)
-        parts.append((FAIL if crashes else PASS, f"streamed logcat: {len(crashes)} crashes/ANRs"))
-    run.add(Result("final.health", worst([p[0] for p in parts]), "; ".join(p[1] for p in parts)))
+        if crashes:
+            parts.append((FAIL, f"streamed logcat: {len(crashes)} crashes/ANRs"))
+        elif logcat_dead:
+            parts.append((UNVERIFIED, logcat_dead))
+        else:
+            parts.append((PASS, "streamed logcat: no crashes or ANRs"))
+    ok, text, why = reads["crash"]
+    if not ok:
+        parts.append((UNVERIFIED, f"logcat -b crash unreadable at the end: {why}"))
+    else:
+        before = {}
+        for line in (snap.get("crash") or "").splitlines():
+            before[line] = before.get(line, 0) + 1
+        new = []
+        for line in text.splitlines():
+            if before.get(line):
+                before[line] -= 1
+            else:
+                new.append(line)
+        from .evidence import crash_processes
+        procs = crash_processes("\n".join(new))
+        parts.append((FAIL if procs else PASS, ("crash buffer: new crashes " + ", ".join(procs)) if procs
+                      else "crash buffer: nothing new since preflight"))
+    return parts
+
+
+def final_checks(run) -> None:
+    from .qa import check_dropbox, check_services, diagnostic_reads, hal_deaths, logcat_check, proc_info, stop_logcat
+    dev = run.dev
+    snap = run.snapshot
+    logcat_check(run, "the final checks")
+    stop_logcat(run)
+    if not snap or dev.state() != "device":
+        for cid in ("final.health", "final.processes", "final.hal_deaths", "final.boot_id", "final.settings"):
+            run.add(Result(cid, UNVERIFIED, "no preflight snapshot or phone unreachable"))
+        return
+    run.guard()
+    parts = []
+    db = check_dropbox(run, since=snap["dropbox"])
+    parts.append((db.state, db.summary))
+    reads = diagnostic_reads(dev)
+    parts += final_health_parts(snap, reads, run.dir / "logcat.txt", run.logcat_dead)
+    sv = check_services(run)
+    parts.append((sv.state, sv.summary))
+    if getattr(run, "bootcount_expected", None) is not None:
+        from .qa import check_boot_count_now
+        parts.append(check_boot_count_now(run))
+    run.add(Result("final.health", worst([p[0] for p in parts]), "; ".join(p[1] for p in parts),
+                   {"logcat_restarts": run.logcat_restarts}))
     now = proc_info(dev)
     changed = [k for k, v in snap["procs"].items() if not v or not now.get(k) or now[k]["pid"] != v["pid"]
                or now[k]["start"] != v["start"]]
