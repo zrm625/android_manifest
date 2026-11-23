@@ -18,7 +18,12 @@ def _setting(run, e):
         dev.sh(f"settings delete {ns} {shlex.quote(name)}")
     else:
         dev.sh(f"settings put {ns} {shlex.quote(name)} {shlex.quote(str(e['original']))}")
-    now = dev.sh(f"settings get {ns} {shlex.quote(name)}").strip()
+    # A checked read, like every other restore (review round 3): a failed
+    # `settings get` is never taken as the value.
+    r = dev.read(f"settings get {ns} {shlex.quote(name)}")
+    if not r.ok:
+        return False, f"{e['key']}: unreadable (exit {r.rc})"
+    now = r.out.strip()
     want = "null" if e["original"] is None else str(e["original"])
     return now == want, f"{e['key']}={now}"
 
@@ -151,29 +156,45 @@ def _sysfs(run, e):
     return r.ok and now == str(e["original"]), f"{e['key']}={now if r.ok else 'unreadable'}"
 
 
+def uninstall_checked(dev, pkg: str) -> tuple[bool, str]:
+    """``pm uninstall`` then a checked package listing: gone only if the
+    listing succeeded and has no exact ``package:<pkg>`` line. A failed
+    listing is never proof the package is gone (review rounds 2 and 3)."""
+    dev.sh(f"pm uninstall {pkg}", timeout=60)
+    r = dev.read(f"pm list packages {pkg}", timeout=60)
+    if not r.ok:
+        return False, f"{pkg}: package list unreadable (exit {r.rc}), not proof it is gone"
+    gone = f"package:{pkg}" not in r.out.split()
+    return gone, f"{pkg} {'uninstalled' if gone else 'still installed'}"
+
+
 def _package(run, e):
     if e["key"] == "river.qa":
         return True, "helper is uninstalled last, by cleanup"
-    run.dev.sh(f"pm uninstall {e['key']}", timeout=60)
-    r = run.dev.read(f"pm list packages {e['key']}", timeout=60)
-    if not r.ok:
-        return False, f"{e['key']}: package list unreadable (exit {r.rc}), not proof it is gone"
-    gone = f"package:{e['key']}" not in r.out.split()
-    return gone, f"{e['key']} {'uninstalled' if gone else 'still installed'}"
+    return uninstall_checked(run.dev, e["key"])
 
 
 def live_alarms(dump: str) -> str | None:
-    """The part of `dumpsys alarm` that lists live alarms: the pending
+    """The parts of `dumpsys alarm` that list live alarms: the pending
     alarms and the user-blocked background alarms, up to "Pending alarms per
-    uid". The removal history further down names cleared alarms and is not
-    included (review round 2). None if the dump doesn't have that shape."""
+    uid", and the past-due non-wakeup alarms, up to "Number of delayed
+    alarms" (AlarmManagerService.dumpImpl; review round 3). The removal
+    history further down names cleared alarms and is not included (review
+    round 2). None if the dump doesn't have that shape."""
     end = dump.find("Pending alarms per uid")
     if end < 0:
         return None
     m = re.search(r"^\s*\d+ pending alarms:|^\s*Pending user blocked background alarms:", dump, re.M)
     if m is None or m.start() > end:
         return None
-    return dump[m.start():end]
+    pd = re.search(r"^\s*Past-due non-wakeup alarms:", dump[end:], re.M)
+    if pd is None:
+        return None
+    pd_start = end + pd.start()
+    pd_end = dump.find("Number of delayed alarms", pd_start)
+    if pd_end < 0:
+        return None
+    return dump[m.start():end] + dump[pd_start:pd_end]
 
 
 def _alarm(run, e):

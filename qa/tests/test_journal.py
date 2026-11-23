@@ -85,11 +85,14 @@ class FakeRun:
         return None
 
 
-def alarm_dump(live="", history=""):
-    """`dumpsys alarm` in the shape AlarmManagerService prints it."""
+def alarm_dump(live="", history="", past_due=""):
+    """`dumpsys alarm` in the shape AlarmManagerService.dumpImpl prints it."""
     pending = f"1 pending alarms: \n  {live}\n" if live else ""
+    due = f"1\n  {past_due}\n" if past_due else "(none)\n"
     return ("Current Alarm Manager state:\n  Settings:\n\n" + pending +
             "\nPending user blocked background alarms: \n  none\n\nPending alarms per uid: []\n\n"
+            "Idle mode state:\n  Idling until: null\n\nPast-due non-wakeup alarms: " + due +
+            "  Number of delayed alarms: 0, total delay time: 0\n\n"
             "Removal history:\n" + history + "\nAlarm Stats:\n")
 
 
@@ -117,6 +120,32 @@ class Handlers(unittest.TestCase):
         # Exit 0 but not an alarm dump: no proof either.
         odd = FakeShell({r"^pm clear": (0, "Success\n"), r"^dumpsys alarm$": (0, "Alarm Stats:\n")})
         self.assertFalse(self.restore(odd, "alarm", "river-qa-1", where=j.RESOURCE)[0])
+
+    def test_past_due_alarm_is_a_leftover(self):
+        # Review round 3: a DeskClock alarm waiting in the past-due
+        # non-wakeup list is still live.
+        dump = alarm_dump(past_due="RTC #0: Alarm{2 type 1 origWhen 1 com.android.deskclock}")
+        dev = FakeShell({r"^pm clear": (0, "Success\n"), r"^dumpsys alarm$": (0, dump)})
+        self.assertEqual(self.restore(dev, "alarm", "river-qa-1", where=j.RESOURCE)[::2], (False, 1))
+        # A dump without the past-due section is not the expected shape.
+        cut = alarm_dump().replace("Past-due non-wakeup alarms: (none)\n", "")
+        self.assertIsNone(restore.live_alarms(cut))
+
+    def test_setting_restore_uses_a_checked_read(self):
+        dev = FakeShell({r"^settings get": (1, "1\n")})        # the read failed, whatever it printed
+        self.assertFalse(self.restore(dev, "setting", "secure/navigation_mode", original="1")[0])
+        dev = FakeShell({r"^settings get": (0, "1\n")})
+        self.assertTrue(self.restore(dev, "setting", "secure/navigation_mode", original="1")[0])
+
+    def test_helper_uninstall_needs_a_good_listing(self):
+        from riverqa import helper
+        for listing, want in (((1, ""), False), ((0, "package:river.qa\n"), False), ((0, ""), True),
+                              ((0, "package:river.qa.other\n"), True)):
+            with tempfile.TemporaryDirectory() as d:
+                run = FakeRun(FakeShell({r"^pm list packages": listing}), d)
+                run.journal.record(j.RESOURCE, "package", "river.qa", None)
+                self.assertEqual(helper.uninstall(run), want, listing)
+                self.assertEqual(run.journal.find(j.RESOURCE, "package", "river.qa") is None, want)
 
     def test_cleared_alarm_in_the_removal_history_does_not_block(self):
         dump = alarm_dump(history="  u0a50:\n    #1: rtc_wakeup, com.android.deskclock, removed by pm clear\n")

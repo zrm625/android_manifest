@@ -1033,3 +1033,7 @@ tail, otherwise UNVERIFIED; the silent tail) and these:
   observation bounds. Without one, PASS needs the whole interval inside
   target ± 10 s; an interval that spans either boundary is UNVERIFIED.
   Absent at −15 s and then a firing poll from −11 s to −9 s is not a PASS.
+- **Journal recovery.** The helper is uninstalled through the same checked
+  path as other packages: a failed package listing is not proof it is gone.
+  Leftover alarms are looked for in the past-due non-wakeup list too, not
+  only the pending alarms. Setting restores verify with a checked read.

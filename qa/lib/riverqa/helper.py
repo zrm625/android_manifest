@@ -176,8 +176,10 @@ def fg_problem(res: HelperResult) -> str | None:
 
 
 def uninstall(run) -> bool:
-    run.dev.sh(f"pm uninstall {PKG}")
-    gone = PKG not in run.dev.sh(f"pm list packages {PKG}")
+    """Uninstall the helper through the checked path (review round 3): a
+    failed package listing is not proof it is gone."""
+    from .restore import uninstall_checked
+    gone, _why = uninstall_checked(run.dev, PKG)
     if gone:
         e = run.journal.find(jmod.RESOURCE, "package", PKG)
         if e:
