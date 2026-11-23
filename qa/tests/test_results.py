@@ -117,6 +117,12 @@ class Gate(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("4/5 clean --calibrate runs" in w for w in why))
 
+    def test_camera_set_change_is_never_eligible(self):
+        # A7: even with every check passing and Zak's approval verified.
+        ok, why = eligibility(all_pass(), gate(camera_set_change=True))
+        self.assertFalse(ok)
+        self.assertEqual(why, ["camera set change: Zak merges by hand"])
+
 
 if __name__ == "__main__":
     unittest.main()

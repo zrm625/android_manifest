@@ -117,6 +117,7 @@ class GateInputs:
     kind: str | None = None        # batch.json kind; only "batch" can merge
     thresholds_calibrated: bool = False
     calibration_runs: int = 0      # clean --calibrate runs for this harness version
+    camera_set_change: bool = False  # batch.json has camera_set_change (A7: Zak merges by hand)
 
 
 def eligibility(results: dict[str, Result], g: GateInputs) -> tuple[bool, list[str]]:
@@ -132,6 +133,10 @@ def eligibility(results: dict[str, Result], g: GateInputs) -> tuple[bool, list[s
         reasons.append("experiment batch")
     if g.kind != "batch":
         reasons.append(f"batch kind is {g.kind!r}, not 'batch'")
+    if g.camera_set_change:
+        # A7: the camera set is a must-work item, and removing one needs
+        # Zak. The approval check stays in the report as evidence only.
+        reasons.append("camera set change: Zak merges by hand")
     low = parse_bool(g.low_ram)
     if g.low_ram is None:
         reasons.append("ro.config.low_ram could not be read")

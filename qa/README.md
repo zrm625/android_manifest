@@ -275,7 +275,11 @@ measurements behind the change are in `$BENCH_HOME/qa/anchor-experiment.json`.
   any merge or tag action the runner runs `flash --merge-started <id>` and
   waits for it to succeed; that records `merge_started` in `batch.json`. It also adds
   `camera_set_change` (`url` of Zak's comment or review on one of the
-  batch's PRs, and the new `set`) when Zak approves a camera change. `flash`
+  batch's PRs, and the new `set`) when Zak approves a camera change. A
+  batch with `camera_set_change` is never eligible ("camera set change: Zak
+  merges by hand", amendment A7). `hardware.cameras` still checks the
+  approval and the new set, and the report shows the result as evidence,
+  but Zak merges that batch by hand. `flash`
   adds `pair`, `first_boot_seconds` and `flash_attempt`, and moves the old
   `bench_runs` to `prior_bench_runs` at every new attempt. `device-bench`
   appends to `bench_runs`. Control runs add `control_injections`.
