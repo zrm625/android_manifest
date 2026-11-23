@@ -168,22 +168,76 @@ SYSRQ_REBOOT = "sync; echo b > /proc/sysrq-trigger"
 
 
 # Ways a shell command writes a file (R5-9): a redirection (>, >>, >|,
-# 1>), tee, dd of=, or a copy/move/link onto it. The target is the
-# sysrq-trigger path, possibly quoted.
+# 1>), tee or dd of=, with the sysrq-trigger path (possibly quoted) as the
+# target. A copy, move or link is judged on its destination (R6-9, below).
 _SYSRQ_WRITE = re.compile(
     r"""(?:\d?>>?\|?\s*['"]?\S*sysrq-trigger)"""
     r"""|(?:\btee\b[^|;&\n]*sysrq-trigger)"""
-    r"""|(?:\bof=['"]?\S*sysrq-trigger)"""
-    r"""|(?:\b(?:cp|mv|ln|install)\b[^|;&\n]*sysrq-trigger)""")
+    r"""|(?:\bof=['"]?\S*sysrq-trigger)""")
+_SYSRQ_COPY = re.compile(r"""\b(?:cp|mv|ln|install)\b[^|;&\n]*sysrq-trigger[^|;&\n]*""")
+_DIRLIKE = re.compile(r"""^(?:\.{1,2}|(?:.*/)?proc)$""")
+
+
+def _copy_onto_trigger(segment: str) -> bool:
+    """Does this cp/mv/ln/install command write the sysrq trigger (R6-9)?
+    Only its destination counts: the last operand, or the -t directory. It
+    writes the trigger if the destination names sysrq-trigger, or if it may
+    be /proc (``/proc``, ``.``, ``..``) and a source is named
+    sysrq-trigger. ``cp /proc/sysrq-trigger /tmp/x`` (the trigger only as a
+    source) is allowed. Anything that can't be parsed counts as a write."""
+    for text in (segment, segment.rstrip("'\" ")):
+        try:
+            argv = shlex.split(text)
+            break
+        except ValueError:
+            continue
+    else:
+        return True
+    if not argv or Path(argv[0]).name not in ("cp", "mv", "ln", "install"):
+        return True
+    operands, target_dir, it = [], None, iter(argv[1:])
+    for tok in it:
+        if tok == "--":
+            operands.extend(it)
+            break
+        if tok in ("-t", "--target-directory"):
+            target_dir = next(it, None)
+            if target_dir is None:
+                return True
+        elif tok.startswith("--target-directory="):
+            target_dir = tok.split("=", 1)[1]
+        elif tok.startswith("-t") and len(tok) > 2:
+            target_dir = tok[2:]
+        elif tok.startswith("-") and tok != "-":
+            continue
+        else:
+            operands.append(tok)
+    if target_dir is None:
+        if len(operands) < 2:
+            return True
+        dest, sources = operands[-1], operands[:-1]
+    else:
+        dest, sources = target_dir, operands
+    if "sysrq-trigger" in dest:
+        return True
+    return bool(_DIRLIKE.match(dest.rstrip("/") or "/")) and any(
+        Path(src.rstrip("/")).name == "sysrq-trigger" for src in sources)
 
 
 def _is_sysrq(args: tuple) -> bool:
     """A write to the sysrq trigger (review rounds 4 and 5): a redirection,
     tee, dd of= or a copy onto /proc/sysrq-trigger. Read-only mentions
-    (ls, stat, test -e, grep) and other uses of the word, such as
-    /proc/sys/kernel/sysrq, are allowed (R5-9)."""
+    (ls, stat, test -e, grep), a copy with the trigger only as its source
+    (R6-9), and other uses of the word, such as /proc/sys/kernel/sysrq, are
+    allowed (R5-9). Indirect targets (``t=/proc/sysrq-trigger; echo b >
+    $t``, a symlink written later) are out of scope: the threat model is
+    accidental breakage, not a crafted command (DESIGN, round 6)."""
     cmd = " ".join(str(a) for a in args)
-    return "sysrq-trigger" in cmd and _SYSRQ_WRITE.search(cmd) is not None
+    if "sysrq-trigger" not in cmd:
+        return False
+    if _SYSRQ_WRITE.search(cmd):
+        return True
+    return any(_copy_onto_trigger(m.group(0)) for m in _SYSRQ_COPY.finditer(cmd))
 
 
 class Device:

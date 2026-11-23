@@ -108,6 +108,27 @@ class RebootGuard(unittest.TestCase):
                     Device().sh(cmd)
         self.assertEqual(len(fake.cmds), len(reads))
 
+    def test_copy_judged_on_its_destination(self):
+        """R6-9: a cp/mv/ln/install with the trigger only as its source is
+        allowed; one onto the trigger, or into /proc from a file named
+        sysrq-trigger, is refused."""
+        fake = FakeRun()
+        allowed = ("cp /proc/sysrq-trigger /data/local/tmp/x", "cp -p /proc/sysrq-trigger /sdcard/",
+                   "ln -s /proc/sysrq-trigger /data/local/tmp/t", "su -c 'cp /proc/sysrq-trigger /tmp/x'",
+                   "cp -t /tmp /proc/sysrq-trigger")
+        refused = ("cp /data/local/tmp/b /proc/sysrq-trigger", "install -m 200 b /proc/sysrq-trigger",
+                   "su -c 'cp /tmp/b /proc/sysrq-trigger'", "cp /tmp/sysrq-trigger /proc",
+                   "cp /tmp/sysrq-trigger /proc/", "cp -t /proc /tmp/sysrq-trigger",
+                   "cd /proc && cp /tmp/sysrq-trigger .", "mv b /proc/sysrq-trigger",
+                   "cp --target-directory=/proc sysrq-trigger", "cp 'unbalanced /proc/sysrq-trigger")
+        with mock.patch.object(device, "run", fake):
+            for cmd in allowed:
+                Device().sh(cmd)
+            for cmd in refused:
+                with self.assertRaises(GuardError, msg=cmd):
+                    Device().sh(cmd)
+        self.assertEqual(len(fake.cmds), len(allowed), fake.cmds)
+
     def test_sysrq_reboot_after_the_guard_and_as_root(self):
         class Root(FakeRun):
             def __call__(self, cmd, timeout, input=None, text=True, env=None):
