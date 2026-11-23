@@ -254,6 +254,77 @@ class Anchor(unittest.TestCase):
         self.assertEqual(rec.uptime_check[0], FAIL)       # 30 < 45 - 12
 
 
+def raw(path, bootloader_pass, tail=None, first_after_wipe=False, anchored=True):
+    r = {"bootloader_pass": bootloader_pass, "chain": [PASS, ""], "marker_copies_exact": 4,
+         "marker_found_fuzzy": True, "first_after_wipe": first_after_wipe}
+    if path == "adb":
+        r["clock_source"] = "reset-anchor" if anchored else "none"
+        r["anchor"] = {"tail_s": tail} if anchored else None
+        r["anchor_note"] = "" if anchored else "chain is UNVERIFIED, so there is no reset anchor"
+    return r
+
+
+class Calibration(unittest.TestCase):
+    """compute_paths and the report (R2-7)."""
+
+    def data(self, adb, inj_adb=None, fastboot=None):
+        return {"raw": {"adb": adb, "fastboot": fastboot if fastboot is not None else
+                        [raw("fastboot", 10.02), raw("fastboot", 10.05)]},
+                "inject_measure": {"adb": inj_adb or raw("adb", 13.8, 4.0), "fastboot": raw("fastboot", 14.0)},
+                "paths": {}, "chain": {}, "controls": {}}
+
+    def test_tail_bound_includes_the_first_reboot_after_a_wipe(self):
+        from riverqa import calibrate
+        d = self.data([raw("adb", 10.0, 6.4, first_after_wipe=True), raw("adb", 10.01, 4.1),
+                       raw("adb", 10.01, 4.0)])
+        calibrate.compute_paths(d)
+        self.assertEqual(d["paths"]["adb"]["max_shutdown_tail"], 6.4)
+        self.assertEqual(d["paths"]["adb"]["first_after_wipe_tails"], [6.4])
+
+    def test_no_first_reboot_after_a_wipe_means_no_bound(self):
+        from riverqa import calibrate
+        for adb in ([raw("adb", 10.0, 4.1), raw("adb", 10.01, 4.0)],
+                    [raw("adb", 10.0, first_after_wipe=True, anchored=False), raw("adb", 10.01, 4.0),
+                     raw("adb", 10.02, 4.1)]):
+            d = self.data(adb)
+            calibrate.compute_paths(d)
+            self.assertIsNone(d["paths"]["adb"]["max_shutdown_tail"])
+            self.assertIn("flash --wipe", d["paths"]["adb"]["tail_why"])
+            self.assertTrue(any("no shutdown-tail bound" in line for line in calibrate.summary(d)))
+
+    def test_slower_tail_than_calibrated_is_unverified(self):
+        # Calibrated bound 6.5 s; this boot's reset came 7.45 s after the
+        # disconnect (a slower first-after-wipe shutdown): UNVERIFIED, never PASS.
+        rec = record(disconnect_mono=1002.0)
+        reboots.judge_record(rec, shutdown_log(NORMAL), TIMING)
+        self.assertEqual(rec.uptime_check[0], UNVERIFIED)
+        self.assertIn("shutdown tail", rec.anchor_note)
+
+    def test_no_usable_anchors_reports_the_reason(self):
+        from riverqa import calibrate
+        d = self.data([raw("adb", 16.5, anchored=False), raw("adb", 16.6, anchored=False)],
+                      inj_adb=raw("adb", 20.4, anchored=False))
+        calibrate.compute_paths(d)
+        p = d["paths"]["adb"]
+        self.assertIsNone(p["A"])
+        self.assertIn("no usable adb reboots", p["why"])
+        self.assertIn("chain is UNVERIFIED", p["why"])
+        lines = calibrate.summary(d)            # no KeyError
+        self.assertTrue(any("adb" in line and "not qualified" in line for line in lines))
+        self.assertFalse(calibrate.qualified(d))
+        # Nothing at all measured.
+        empty = {"raw": {"adb": [], "fastboot": []}, "inject_measure": {}, "paths": {}, "chain": {}}
+        calibrate.compute_paths(empty)
+        calibrate.summary(empty)
+        self.assertFalse(calibrate.qualified(empty))
+
+    def test_controls_boot_timing_command(self):
+        from riverqa import calibrate, qa
+        with mock.patch.object(calibrate, "prove_main", return_value=0) as pm:
+            self.assertEqual(qa.main(["controls", "--boot-timing"]), 0)
+        pm.assert_called_once()
+
+
 class CheckedPstoreRead(unittest.TestCase):
     """The boot judge reads pstore through the checked binary read (R2-4)."""
 

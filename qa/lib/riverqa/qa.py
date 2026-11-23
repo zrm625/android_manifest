@@ -1065,8 +1065,11 @@ Usage:
   phone-qa stage ID [--product DIR] [--kind batch|baseline|calibration|experiment] [--experiment]
                                        Copy a build's images into $BENCH_HOME/batches/ID.
   phone-qa boot-timing [--normal N]    Calibration step 1: reboot-path timing and the
-                                       allowance A, with no flash.
+                                       allowance A. Run it straight after `flash --wipe`.
   phone-qa controls                    Show which controls are qualified for this harness.
+  phone-qa controls --boot-timing      Run the step-1 proofs again with the recorded A and
+                                       tail bound; records the boot-timing controls under the
+                                       current harness version.
   phone-qa journal                     Show leftovers in the state journal.
   phone-qa helper                      Build (or verify) the river-qa helper APK.
   phone-qa version                     Print the harness version.
@@ -1092,6 +1095,12 @@ def main(argv: list[str]) -> int:
         from .calibrate import boot_timing_main
         return boot_timing_main(argv[1:])
     if sub == "controls":
+        if argv[1:] == ["--boot-timing"]:
+            from .calibrate import prove_main
+            return prove_main()
+        if argv[1:]:
+            print("usage: phone-qa controls [--boot-timing]")
+            return 1
         from .controls import show_controls
         return show_controls(harness_version())
     if sub == "journal":

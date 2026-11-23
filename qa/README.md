@@ -78,6 +78,7 @@ with `flash --rollback`. Rollback wipes data, so run `phone-setup` after it.
 | `phone-qa --control NAME --batch ID` | One deliberately broken run from the control set | never |
 | `phone-qa boot-timing` | Calibration step 1: the bootloader allowance A per reboot path | n/a |
 | `phone-qa controls` | Which controls are qualified for this harness version | n/a |
+| `phone-qa controls --boot-timing` | The step-1 proofs again, under the current harness version | n/a |
 | `phone-qa stage ID` | Copy a build's images into `$BENCH_HOME/batches/ID` | n/a |
 | `phone-qa helper` | Build or verify the helper APK | n/a |
 | `phone-qa journal` | Show anything the state journal still has to restore | n/a |
@@ -91,13 +92,19 @@ Groups: `preflight`, `identity`, `health`, `radios`, `hardware`, `system`,
 
 The steps run in this order (DESIGN.md, "Calibration and bootstrap"):
 
-1. `phone-qa boot-timing` on the running build, with no flash. It writes
-   `$BENCH_HOME/qa/boot-timing.json`. Until both proofs pass for a reboot
-   path, the uptime signal on that path is UNVERIFIED. On the adb path the
-   clock starts at the old kernel's reset ([amendment
+1. `flash --wipe` the known-good build, then run `phone-qa boot-timing`
+   straight away, before any other adb reboot. It flashes nothing itself and
+   writes `$BENCH_HOME/qa/boot-timing.json`. Until both proofs pass for a
+   reboot path, the uptime signal on that path is UNVERIFIED. On the adb path
+   the clock starts at the old kernel's reset ([amendment
    A1](DESIGN.md#amendment-a1-the-adb-path-uptime-clock)); only reboots that
    got a reset anchor set A, and their largest shutdown tail becomes the bound
-   for every later anchor. Changing this file changes the harness version.
+   for every later anchor. The first adb reboot after a wipe (every batch's
+   first bench boot) has the longest tail, so the bound is set only if that
+   reboot, step 1's first adb reboot, got an anchor; otherwise the adb path
+   has no bound and its uptime signal stays UNVERIFIED. A later boot with a
+   slower tail than the bound is UNVERIFIED, never PASS. Changing this file
+   changes the harness version.
 2. The baseline: build `river-22.2` HEAD with `scripts/build`, then:
 
    ```sh
@@ -146,7 +153,35 @@ The steps run in this order (DESIGN.md, "Calibration and bootstrap"):
    - `tag-pushed-host-killed`: `phone-qa --control tag-pushed-host-killed
      --batch ID` runs `flash --recover` against a scratch `$BENCH_HOME` with
      stubbed `gh` and `git ls-remote`; no phone.
-   - The four `boot-timing-*` controls come from step 1.
+   - The four `boot-timing-*` controls come from step 1, or from
+     `phone-qa controls --boot-timing`, which runs only the step-1 proofs
+     again with the recorded A and tail bound.
+
+### Order of qualification
+
+The controls and the calibration runs count only for the harness version
+they ran under. The version hashes the harness code, `thresholds.json`,
+`fixtures.json`, the `paths` and `chain` blocks of `boot-timing.json` (the
+proofs included) and the baseline's `calibration_seed`. So qualify in this
+order, and start again from the step that changed if anything in that list
+changes:
+
+1. Freeze the harness: no more commits to `qa/` or `scripts/phone-qa`.
+2. `flash --wipe` the known-good build, then `phone-qa boot-timing` (step 1).
+3. The baseline (step 2). It writes `calibration_seed`.
+4. Perch calibration and thresholds (steps 3 and 4). Writing
+   `thresholds.json` is the last change to a version input.
+5. `phone-qa controls --boot-timing`. This renews the four `boot-timing-*`
+   controls under the final version. It rewrites the proofs in
+   `boot-timing.json`, so it must come after every other version input has
+   changed and before every other control.
+6. Note `phone-qa version`. This is the final version.
+7. Every other control (step 5 above) until `phone-qa controls` shows all of
+   them qualified.
+8. Flash the Perch calibration batch again and run `phone-qa --calibrate`
+   five times, each with exit 0 and the full check set.
+9. Check that `phone-qa version` still prints the version from step 6 and
+   that `phone-qa controls` exits 0.
 
 ## The uptime clock on the adb reboot path (amendment A1)
 
@@ -158,8 +193,10 @@ separate a normal boot from one with an extra bootloader pass. Amendment A1
 
 - the leaving marker's host write time is paired with its own printk
   timestamp, read back from `dmesg`;
-- the reset is the last pstore timestamp after the marker that three
-  consecutive non-decreasing stamps within 1 s corroborate, so a bit flip
+- the marker's own timestamp in pstore must match that readback, and the gap
+  to the reset is measured inside pstore from it;
+- the reset is the earliest stamp of the last run of three consecutive
+  non-decreasing pstore stamps within 1 s after the marker, so a bit flip
   can't move it later;
 - it must fall between the USB disconnect and the disconnect plus the largest
   calibrated shutdown tail;
@@ -173,10 +210,11 @@ measurements behind the change are in `$BENCH_HOME/qa/anchor-experiment.json`.
 ## Known issues
 
 - **The shutdown-tail bound comes from step 1 only.** The bound is the
-  largest tail among step 1's normal adb reboots. A later build with a longer
-  shutdown would make its anchors out of bounds, and its bench boots
-  UNVERIFIED (never PASS). If that happens, re-run `boot-timing` with more
-  normal reboots (`--normal N`).
+  largest tail among step 1's normal adb reboots, which must include the
+  first adb reboot after a wipe (F1). A later build with a longer shutdown
+  would make its anchors out of bounds, and its bench boots UNVERIFIED
+  (never PASS). If that happens, `flash --wipe` and re-run `boot-timing`,
+  with more normal reboots if needed (`--normal N`).
 - **Camera-set approvals and the gh account.** The approval must be a
   comment or review by `zrm625` on one of the batch's own PRs, naming the new
   set on a line `approve camera set: 0,1,2`. `gh` on forge is logged in as
