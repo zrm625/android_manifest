@@ -918,8 +918,12 @@ chain UNVERIFIED and the boot's combined verdict UNVERIFIED on every path.
 so it is less independent of the kernel-log chain than before. The boot count
 is still independent of both.
 
-**Phone runs still needed.** Re-run step 1 on the phone: a normal first boot
-after a wipe, later adb boots, and both injected controls on each path.
+**Phone runs still needed.** `flash --wipe`, then step 1 straight away: the
+first adb reboot after the wipe must get an anchor, later adb boots, and both
+injected controls on each path. These runs also show on the phone that the
+checked kmsg write, the base64 pstore read (its size must match `stat`) and
+the 50 ms live/pstore marker match work as designed. Then the order of
+qualification in the README.
 
 ## Code review round 2: changes to the amendment and the design
 
