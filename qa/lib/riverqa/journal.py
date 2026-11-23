@@ -91,10 +91,15 @@ def plan_recovery(entries: list[dict], wipe_seq_now: int) -> tuple[list[dict], l
             drop.append(e)
         else:
             restore.append(e)
-    order = {RESOURCE: 0, PHONE: 1, HOST: 2}
-    restore.sort(key=lambda e: (order[e["where"]], e["created_at"]), reverse=False)
-    # Newest first within each class.
+    # Newest first within each class. created_at has one-second resolution,
+    # so ties fall back to journal order (later entries are newer). Then
+    # hidden_api_policy goes after every Bluetooth entry: restoring the scan
+    # mode and removing the bond call hidden APIs through the helper.
+    pos = {e["id"]: i for i, e in enumerate(entries)}
     out = []
     for cls in (RESOURCE, PHONE, HOST):
-        out += sorted([e for e in restore if e["where"] == cls], key=lambda e: e["created_at"], reverse=True)
+        out += sorted([e for e in restore if e["where"] == cls],
+                      key=lambda e: (e["created_at"], pos[e["id"]]), reverse=True)
+    policy = [e for e in out if e["kind"] == "setting" and e["key"] == "global/hidden_api_policy"]
+    out = [e for e in out if e not in policy] + policy
     return out, drop

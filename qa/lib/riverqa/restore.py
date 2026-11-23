@@ -49,12 +49,45 @@ def _needs_helper(run):
     return ok
 
 
+HIDDEN_API_KEY = "global/hidden_api_policy"
+
+
+class relaxed_hidden_api:
+    """Make sure hidden_api_policy is relaxed while a handler calls hidden
+    APIs through the helper (C4). If this run's journal already holds the
+    policy's original, that entry restores it later (plan_recovery orders it
+    after the Bluetooth entries). Otherwise the original is journalled here,
+    so a crash leaves it to recovery, and restored on the way out."""
+
+    def __init__(self, run):
+        self.run, self.own = run, None
+
+    def __enter__(self):
+        dev = self.run.dev
+        cur = dev.sh("settings get global hidden_api_policy").strip()
+        if cur != "1":
+            existing = self.run.journal.find(jmod.PHONE, "setting", HIDDEN_API_KEY)
+            e = self.run.journal.record(jmod.PHONE, "setting", HIDDEN_API_KEY, None if cur == "null" else cur,
+                                        attempt_id=getattr(self.run, "attempt_id", lambda: None)(),
+                                        run_id=getattr(self.run, "run_id", None))
+            self.own = None if existing else e
+            dev.sh("settings put global hidden_api_policy 1")
+        return self
+
+    def __exit__(self, *exc):
+        if self.own is not None:
+            ok, _ = _setting(self.run, self.own)
+            if ok:
+                self.run.journal.resolve(self.own)
+
+
 def _bt_scan_mode(run, e):
     from . import helper
     if not _needs_helper(run):
         return False, "helper not installable"
     run.dev.sh("cmd bluetooth_manager enable; cmd bluetooth_manager wait-for-state:STATE_ON", timeout=30)
-    r = helper.instrument(run, "bt_set_scan_mode", {"mode": e["original"]}, timeout=40, need_foreground=False)
+    with relaxed_hidden_api(run):
+        r = helper.instrument(run, "bt_set_scan_mode", {"mode": e["original"]}, timeout=40, need_foreground=False)
     return r.get("scan_mode") == str(e["original"]), f"scan mode {r.get('scan_mode')}"
 
 
@@ -80,9 +113,16 @@ def _volume(run, e):
     return f"volume is {int(e['original'])} " in out, out.strip().splitlines()[-1] if out.strip() else "?"
 
 
+BAD_NTP_HOST = "192.0.2.1"   # the bad-ntp control's server (TEST-NET-1)
+
+
 def _ntp(run, e):
-    out = run.dev.sh("cmd network_time_update_service reset_server_config_for_tests").strip()
-    return True, f"NTP server config reset ({out or 'ok'})"
+    """Reset the test server config, then verify the dump no longer names
+    the control's server."""
+    rc, out, err = run.dev.sh_rc("cmd network_time_update_service reset_server_config_for_tests")
+    r = run.dev.read("dumpsys network_time_update_service")
+    ok = rc == 0 and r.ok and bool(r.out.strip()) and BAD_NTP_HOST not in r.out
+    return ok, f"NTP server config {'reset' if ok else 'NOT verified reset'} (exit {rc}, dump exit {r.rc})"
 
 
 def _wifi(run, e):
@@ -108,10 +148,14 @@ def _package(run, e):
 
 def _alarm(run, e):
     # A dismissed alarm stays in DeskClock's database; the test phone has no
-    # alarms of its own, so clear DeskClock.
-    run.dev.sh("am force-stop com.android.deskclock; pm clear com.android.deskclock")
-    left = run.dev.sh("dumpsys alarm | grep -c com.android.deskclock").strip()
-    return True, f"DeskClock cleared (alarm entries now {left})"
+    # alarms of its own, so clear DeskClock. Verified: pm clear printed
+    # Success and dumpsys alarm lists nothing for DeskClock afterwards.
+    run.dev.sh("am force-stop com.android.deskclock")
+    rc, out, _ = run.dev.sh_rc("pm clear com.android.deskclock")
+    r = run.dev.read("dumpsys alarm")
+    left = r.out.count("com.android.deskclock") if r.ok else None
+    ok = rc == 0 and "Success" in out and left == 0
+    return ok, f"DeskClock {'cleared' if ok else 'NOT cleared'} (pm clear: {out.strip() or rc}, alarm entries {left})"
 
 
 def _marker(run, e):
@@ -140,10 +184,11 @@ def _watchdog(run, e):
 def _bond(run, e):
     from . import helper
     addr = e["key"]
-    ok_phone = True
+    ok_phone = False
     if _needs_helper(run):
         run.dev.sh("cmd bluetooth_manager enable; cmd bluetooth_manager wait-for-state:STATE_ON", timeout=30)
-        r = helper.instrument(run, "bt_unbond", {"addr": addr}, timeout=40, need_foreground=False)
+        with relaxed_hidden_api(run):
+            r = helper.instrument(run, "bt_unbond", {"addr": addr}, timeout=40, need_foreground=False)
         ok_phone = r.get("bond_state") == "10"
     phone_addr = (e.get("extra") or {}).get("phone_addr")
     ok_host = True
@@ -198,7 +243,9 @@ def restore_entry(run, e) -> tuple[bool, str]:
 
 def recover_journal(run) -> tuple[list, list, list]:
     """Restore leftovers (only called after the lock is held and the guards
-    confirmed the phone)."""
+    confirmed the phone). Each handler verifies its restoration before the
+    entry is resolved; anything left over is reported as failed, and
+    preflight stops on it."""
     restore, drop = jmod.plan_recovery(run.journal.entries, jmod.current_wipe_seq(run.journal.qa_home))
     for e in drop:
         run.journal.resolve(e)
@@ -215,4 +262,7 @@ def recover_journal(run) -> tuple[list, list, list]:
             done.append("helper uninstalled")
         else:
             failed.append("helper still installed")
+    left = [e for e in run.journal.entries if e["id"] in {x["id"] for x in restore}]
+    if left and not failed:
+        failed.append(f"{len(left)} entries still unresolved: " + ", ".join(f"{e['kind']} {e['key']}" for e in left))
     return done, drop, failed
