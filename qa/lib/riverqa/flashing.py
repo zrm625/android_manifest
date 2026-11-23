@@ -117,7 +117,7 @@ def clear_then_set_active(dev: Device, slot: str, then: str = "flash --rollback"
     except Halt:
         raise
     except (RuntimeError, TimeoutError) as e:
-        raise Halt(f"fastboot --set-active={slot} failed: {e}") from e
+        raise Halt(f"fastboot --set-active={slot} failed: {e}", advice=owed_note(then)) from e   # R9-11
     return owed
 
 
@@ -185,7 +185,8 @@ def rollback(dev: Device, st: dict, reason: str, attempt_id: str | None = None,
         clear_then_set_active(dev, fallback, then=then)
         r = dev.fastboot("erase", "userdata", timeout=300)
         if r.returncode != 0:
-            raise Halt(f"rollback: fastboot erase userdata failed: {(r.stderr or r.stdout).strip()[-300:]}")
+            raise Halt(f"rollback: fastboot erase userdata failed: {(r.stderr or r.stdout).strip()[-300:]}",
+                       advice=owed_note(then))                                           # R9-11
         seq = journal.record_wipe(qa_home(), attempt_id, "rollback")
         dev.reboot_fastboot()
     except Halt:
