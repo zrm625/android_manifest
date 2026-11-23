@@ -92,18 +92,37 @@ Groups: `preflight`, `identity`, `health`, `radios`, `hardware`, `system`,
 ## Calibration and bootstrap
 
 The steps run in this order (DESIGN.md, "Calibration and bootstrap" and
-"Code review round 9"):
+"Code review rounds 9 and 10"):
 
 0. Dev-flash a stamped build from this tree: build `river-22.2` with
-   `scripts/build`, then `flash stripped`. Every build from this tree
-   carries `ro.river.build_id` and `ro.vendor.river.build_id` (`device.mk`).
-   A dev flash needs no calibration: it times nothing. Steps 1 and 2 need a
-   stamped running build. `phone-qa boot-timing`, `phone-qa controls
-   --boot-timing` and the first `--baseline` flash refuse an unstamped one
-   (exit 1) before any calibration reboot or write: "running build is
-   unstamped; dev-flash a build from this tree first (`flash stripped`)".
-   The dev flash also settles any leftover fb_mode obligation, including one
-   from before round 8.
+   `scripts/build`, then `flash stripped --wipe`.
+   - **Prerequisite: device PR #7.** The build-ID stamp
+     (`ro.river.build_id` and `ro.vendor.river.build_id`, with
+     `RIVER_BUILD_ID` from `scripts/build`) is in `device.mk` from
+     zrm625/android_device_motorola_river PR #7 (branch `qa-harness`,
+     `9851f11`). PR #7 and this harness PR (#10) merge together, in one
+     `change merge` set. Until then, build from a checkout with both
+     branches: `qa-harness` in `device/motorola/river` and in
+     `.repo/manifests`. A build without the stamp, or with device.mk's
+     default `unstamped` on either partition, counts as unstamped.
+   - **Why `--wipe`.** Builds from this tree are signed with its test keys.
+     Over a build signed with other keys (an official LineageOS nightly,
+     or any build not from this tree) the phone boot-loops unless userdata
+     is erased. Steps 1 and 2 need no data on the phone, and step 2 wipes
+     again. Only when the phone already runs a build from this tree may you
+     leave out `--wipe`.
+   - A dev flash needs no calibration: it times nothing. Steps 1 and 2 need
+     a stamped running build. `phone-qa boot-timing`, `phone-qa controls
+     --boot-timing` and the first `--baseline` flash refuse an unstamped
+     one (exit 1) before any calibration reboot or write: "running build
+     is unstamped; dev-flash a build from this tree first (`flash
+     stripped`)". adb answers in the setup wizard, so step 1 needs no
+     `phone-setup`.
+   - The dev flash also settles a leftover fb_mode obligation (including
+     one from before round 8) once it has verified the boot of the slot it
+     wrote. It refuses `--no-reboot` while one is pending, and refuses to
+     write the slot the obligation was armed on (see "fb_mode" below): run
+     `phone-qa recover` first.
 1. `phone-qa boot-timing`. It flashes nothing itself and writes
    `$BENCH_HOME/qa/boot-timing.json`. It sets A for the two gated reboot
    paths (amendment A2): the fastboot path and the immediate `sysrq`
@@ -296,16 +315,40 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   - A dev flash (also `device-bench --flash`) clears fb_mode and writes,
     but only after it has checked its images and that no slot pair is
     reserved: a refused flash never touches the phone. It reads the active
-    slot before it clears anything; before the first baseline an unreadable
-    slot halts (exit 3). It resolves the obligation once the slot it wrote
-    has booted with its build IDs, also an obligation armed before round 8
-    (no recorded identity). A failed clear or fastboot write with the
-    obligation pending halts (exit 3).
-  - `flash stripped --no-reboot` leaves the obligation pending and says so.
-    Until a flash that boots (without `--no-reboot`) or `flash --rollback`
-    verifies its slot, `phone-qa --quick` and `phone-qa recover` halt
-    (exit 3): the active slot or build is no longer the one the obligation
-    was armed on.
+    slot before it clears anything. Before the first baseline an unreadable
+    slot, a timeout on that read, or (with an obligation pending) a guard
+    failure halts (exit 3); a failed read otherwise exits 1 with an
+    `error:` line. It resolves the obligation once the slot it wrote has
+    booted with its build IDs, also an obligation armed before round 8 or
+    with the `unstamped` sentinel (neither has an identity generic
+    recovery can verify). A failed clear or fastboot write with the
+    obligation pending halts (exit 3). A failed `fastboot erase userdata`
+    after `--set-active` always halts (exit 3): the new slot is active and
+    unwiped.
+  - **Before the first baseline** (no `slot-state.json`), the slot the
+    obligation was armed on is the only slot known to boot. So, before it
+    touches the phone, a dev flash refuses:
+    - `--no-reboot` while an obligation is pending (exit 1): it would leave
+      the other slot active, and the next flash would write the armed slot;
+    - a write to the armed slot, which happens when the other slot is
+      active (exit 3).
+
+    Both say what to do: run `phone-qa recover`, which boots the armed
+    slot, verifies it and settles the obligation, then flash again. If
+    another slot is active, set the armed slot active by hand first
+    (`fastboot -s ZY225DPT7F --set-active=<armed slot>`). For an entry
+    with the `unstamped` sentinel, which generic recovery refuses, the
+    advice is `flash stripped` with the armed slot active. Halts of a
+    dev flash in this state never advise `flash --rollback` (it needs
+    `slot-state.json`) or another flash.
+  - With a known-good slot, `flash stripped --no-reboot` leaves the
+    obligation pending and says what settles it. If it wrote the slot and
+    build IDs the obligation was armed on, generic recovery (`phone-qa
+    recover`, or the preflight of `--quick`) boots, verifies and settles it.
+    Otherwise, until a flash that boots (without `--no-reboot`) or `flash
+    --rollback` verifies its slot, `phone-qa --quick` and `phone-qa
+    recover` halt (exit 3): the active slot or build is no longer the one
+    the obligation was armed on.
   - The clear is stamped with the host's boot clock (`CLOCK_BOOTTIME` and
     the host boot_id), so a wall-clock step can't make an old boot look
     newer. If the host reboots between the clear and the verified boot, the

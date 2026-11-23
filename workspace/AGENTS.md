@@ -85,6 +85,16 @@ change. Builds from this tree are signed with test keys, so moving from an
 official LineageOS nightly to this build, or the other way, needs `--wipe`.
 Without it the phone boot-loops.
 
+**First install for the QA harness.** Before the first baseline, `phone-qa`
+needs the phone to run a stamped build from this tree. So the first install
+(step 0 in `.repo/manifests/qa/README.md`, "Calibration and bootstrap") is
+`scripts/flash stripped --wipe` whenever the phone runs a build that is not
+from this tree (an official nightly, or any build with other signing keys):
+without the wipe it boot-loops. The stamp (`ro.river.build_id`) comes from
+device PR #7 (zrm625/android_device_motorola_river, `9851f11`), which merges
+together with harness PR #10. Until both are merged, build with branch
+`qa-harness` checked out in `device/motorola/river` and in the manifest.
+
 **Roll back** if the new build does not boot. Hold Power + Volume Down to get
 to the bootloader, then:
 

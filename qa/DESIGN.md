@@ -566,8 +566,9 @@ check requires Perch. The steps run in this order, and each one finishes
 before the next starts:
 
 1. **Boot-timing calibration, with no flash.** On the build running now (a
-   stamped build from this tree, dev-flashed first: see "Code review round
-   9", R9-3), do
+   stamped build from this tree, dev-flashed first with `flash stripped
+   --wipe` when the phone ran anything else: see "Code review round 9",
+   R9-3, and "Code review round 10", R10-2), do
    planned reboots on each path that matters: the immediate `sysrq` reboot
    and a reboot through fastboot with no writes ([amendment
    A2](#amendment-a2-drop-the-pstore-reset-anchor-and-add-an-immediate-reboot-bench-path);
@@ -2287,3 +2288,194 @@ stands).**
 The dev flash needs no `boot-timing.json`, and before the first baseline it
 writes the slot that isn't active. Its verified boot settles any leftover
 obligation, old ones included (R9-2).
+
+## Code review round 10: changes to R9
+
+Status: specified 2026-11-23 from the round-10 code review of `ceb1574`.
+Round 9 stands except as changed here. The round-8 structure is untouched:
+one proof type (`VerifiedBoot`, sealed by `verify_boot`), one settle
+(`fbmode.settle`) and the same five settle callers, which the AST test
+still pins. The three majors are on the bootstrap before the first
+baseline. They are closed by refusing the risky combinations before any
+phone write, not by new recovery paths. Where this section and an earlier
+one disagree, this one wins.
+
+**R10-1. The `unstamped` sentinel is no stamp.** `device.mk` sets
+`RIVER_BUILD_ID ?= unstamped`, so a build made without `scripts/build`
+says `unstamped` on both partitions. `fbmode.stamp()` maps that sentinel,
+and an empty value, to None, as `slots`, `stage` and `qa` already did. It
+applies in these places:
+- `partition_build_ids`, so `running_identity` raises `Unstamped` when
+  either partition has the sentinel. Calibration, the `sysrq` arm and the
+  first-baseline proof with nothing pending refuse such a build before
+  any reboot or write.
+- `product_want`: a product with the sentinel on either partition is
+  verified by its boot hash.
+- `known_good_want`.
+- `Want`, which rejects the sentinel as a build ID, so `arm` can't record
+  it.
+
+An entry already armed with the sentinel for either ID is treated like an
+entry from before round 8: `armed_want` raises, so generic recovery and
+the first-baseline flash refuse it (exit 3) before any phone call. A dev
+flash's own proof settles it, and so does a known-good proof (`flash
+--rollback`, or `flash --recover` with no pair on `known_good_slot`).
+
+**R10-2. Bootstrap step 0 wipes.** Step 0 is `flash stripped --wipe`
+whenever the running build is not from this tree (an official nightly, or
+any build signed with other keys): builds from this tree are signed with
+its test keys, and over other keys the phone boot-loops unless userdata is
+erased. Steps 1 and 2 need no data, and step 2 wipes again. The stamp comes
+from device PR #7 (`9851f11`). That PR and harness PR #10 merge together,
+in one `change merge` set; until then a checkout builds with both
+`qa-harness` branches. README and `workspace/AGENTS.md` say this. This
+corrects step 1 of round 9's "Bootstrap order".
+
+**R10-3. Before the first baseline, no flash leaves the armed slot as a
+target.** With no `slot-state.json`, the slot an obligation was armed on is
+the only slot known to boot, and a dev flash writes the slot that is not
+active. So `flash_dev` refuses, before any phone write:
+- `--no-reboot` while an obligation is pending. Exit 1, host-only: the
+  phone is untouched. It would leave the other slot active with the
+  obligation pending, and the next flash would write the armed slot.
+- A flash whose target is the armed slot (`fbmode.armed_slot`, recorded
+  even when the IDs are the sentinel). This happens when the other slot
+  is active, for example after a flash that stopped after `--set-active`.
+  HALT 3, after the slot read and before anything is cleared or written.
+
+The advice in this state (`flashing.armed_way_back`) never names `flash
+--rollback`, which needs `slot-state.json`, nor another flash, which could
+write the armed slot. If another slot is active, it first says to set the
+armed slot active by hand (`fastboot -s ZY225DPT7F
+--set-active=<slot>`). Then it says `phone-qa recover`, which boots the
+armed slot, verifies it against the armed identity and settles the
+obligation. For a sentinel entry, which generic recovery refuses, it says
+`flash stripped` with the armed slot active: that writes the other slot
+and settles the obligation with its verified boot. The halts after the
+write use the same advice: a boot timeout, a failed verify, a failed write
+and a failed erase. An entry from before round 8 records no slot, so
+nothing can protect its slot. Its advice is a dev flash that boots.
+
+**R10-4. Exit codes in the dev flash.**
+- The slot read before the clear is one `try`:
+  - an `Unreachable` goes to `main`, which halts (3);
+  - with an obligation pending, any failure, a guard failure included,
+    halts (3);
+  - with no `slot-state.json`, any failure but a guard failure halts (3),
+    as an unreadable slot does (R9-4);
+  - otherwise it exits 1 with an `error:` line, never a traceback.
+- `Unreachable` from `to_fastboot` or the writes is re-raised past
+  `write_failed`, so `main` halts (3) in `--no-reboot` too.
+- `device-bench --flash`, which calls `flash_dev` directly, halts (3) on
+  it as well. This was found in the self-review.
+
+**R10-5.** A failed `fastboot erase userdata` after `--set-active` in a
+dev flash raises `flashing.WipeFailed` and always halts (3): the new slot
+is active and unwiped. With nothing pending, the advice is to erase by hand
+and reboot, or to set the previous slot active. With an obligation
+pending, it is the R10-3 advice (before the first baseline) or "flash
+again, or `flash --rollback`".
+
+**R10-6.** `SlotUnreadable` names its read. With `getprop
+ro.boot.slot_suffix` in Android, the recheck command is `adb -s
+ZY225DPT7F shell getprop ro.boot.slot_suffix`. With fastboot, it is
+`fastboot -s ZY225DPT7F getvar current-slot`, as before. `settle` refuses a
+`bool` as the stamp's `boottime`.
+
+**R10-7.** After `flash ... --no-reboot` with an obligation pending (only
+possible with a `slot-state.json` now), the note depends on what was
+written:
+- If the slot written and its build IDs are the armed identity, it says
+  that generic recovery (`phone-qa recover`, or the preflight of
+  `--quick`) boots that slot, verifies it and settles the obligation. A
+  test runs that recovery.
+- Otherwise it keeps the R9-10 warning: `--quick` halts until a flash that
+  boots, or `flash --rollback`, verifies its slot.
+
+**Old entries (corrects round 9).** These are an entry from before round 8
+(no slot, no IDs) and an entry with the sentinel (a slot, but no usable
+IDs). Generic recovery and the first-baseline flash refuse both (exit 3).
+What settles them depends on the slot state:
+- **A dev flash** (`flash stripped`, without `--no-reboot` before the
+  first baseline) settles them with the verified boot of the slot it
+  writes, but only with no pair reserved, because a pair refuses every
+  flash. Before the first baseline, a dev flash of a sentinel entry runs
+  only with the armed slot active (R10-3).
+- **With a `slot-state.json`, `flash --rollback`** settles them. It
+  releases a pair if one is reserved (wiping userdata) and otherwise
+  returns to `known_good_slot`.
+- **With a `slot-state.json` and no pair:** a batch flash (from
+  `known_good_slot`) settles them. So does `flash --recover` when
+  `known_good_slot` is active.
+- **With a pair:** `flash --recover` decides first (promote, roll back or
+  halt). Only its rollback or promotion settles them.
+
+**Who settles, with what proof.** Unchanged from round 9:
+
+| Caller | Paths | Proof passed |
+| --- | --- | --- |
+| `fbmode.recover` | generic recovery, the batch preflight (first baseline included), `--promote` and `--recover`'s promote path | `verify_boot` after its own boot, against the caller's `want` or the armed identity (read only on a path that boots; the sentinel is no identity) |
+| `flashing.rollback` | `flash --rollback`, rescue, `--recover`'s rollback | `verify_boot` of `known_good_slot` |
+| `flashing.recover_fb_mode_to_known_good` | no-pair `flash --recover` | as for rollback |
+| `flashing.flash_dev` | dev flash, `device-bench --flash` | `verify_boot` of the slot it wrote |
+| `reboots.planned_reboot` | the `sysrq` extra pass | `verify_boot` against the armed identity |
+
+**State-change ordering (rows changed; the rest of rounds 8 and 9
+stand).**
+
+1. `fbmode.recover`, boot case, step 1: an entry whose IDs are the
+   sentinel has no armed identity, like one from before round 8. It raises
+   with nothing changed.
+3. `flash_dev`:
+   1. Images, product and pair checks. Then, with no `slot-state.json`,
+      an obligation pending and `--no-reboot`: exit 1 (R10-3). The phone
+      is untouched.
+   2. Read the active slot (R9-4). `Unreachable`: HALT 3 (from `main`).
+      Any other failure: HALT 3 with an obligation pending, or before the
+      first baseline (except a guard failure); otherwise exit 1. Nothing
+      changed (R10-4).
+   3. Pick the target. Before the first baseline: an unreadable slot is
+      HALT 3 (`SlotUnreadable`, naming its read), and a target that is the
+      armed slot is HALT 3 (R10-3). Nothing changed.
+   4. Row 2 (clear and stamp; an entry stays pending only if one existed).
+   5. `write_images`: guard, clear and stamp, flash, `--set-active`,
+      optional wipe.
+      - A failed clear with no obligation pending is logged and ignored,
+        and the flash goes on (`fbmode.clear`). With an obligation it is
+        `ClearFailed`, before any write: HALT 3, entry pending.
+      - Any other fastboot failure: HALT 3 with an entry pending, else
+        exit 1.
+      - A failed erase after `--set-active` (`WipeFailed`): HALT 3 always
+        (R10-5).
+      - `Unreachable`: HALT 3 (from `main`).
+      - `--no-reboot` ends here (only with a `slot-state.json` if an entry
+        is pending). The entry stays pending, with the R10-7 note.
+   6. Reboot. Timeout: HALT 3 with an entry pending, else exit 1.
+   7. `verify_boot` of the target, the version read, `settle`. Fail: HALT
+      3 with an entry pending, else exit 1.
+   8. History and log. Nothing is read from the phone.
+
+   Before the first baseline, every halt with an entry pending gives the
+   R10-3 advice.
+
+   States left:
+   - Die before the first write: entry pending, active slot unchanged.
+   - Die after `--set-active`, before the first baseline: entry pending,
+     the other slot active. Generic recovery halts on `WrongSlot`, and the
+     next dev flash refuses (R10-3). Set the armed slot active by hand,
+     then run `phone-qa recover`.
+   - Die after `--set-active`, with a `slot-state.json`: the next dev
+     flash or `flash --rollback` settles it, as in round 9.
+
+4a. `flash_batch`, first baseline:
+   - Step 2 is unchanged.
+   - Step 3: `running_identity` refuses the sentinel on either partition
+     (exit 1, nothing written).
+   - Step 4: any failure in steps 2 and 3 is HALT 3 with no
+     `slot-state.json`. An entry stays pending only if one existed. A
+     sentinel entry halts in step 2 before any phone call.
+8. `planned_reboot`, `sysrq` extra pass, step 1: the sentinel on either
+   partition is "cannot arm fb_mode: running build is unstamped", with
+   nothing changed.
+10. Calibration, step 2: the sentinel on either partition exits 1 before
+    any calibration reboot.
