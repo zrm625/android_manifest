@@ -232,9 +232,15 @@ BOOT_INPUT_FILES = {
     "device/motorola/sdm632-common": ("BoardConfigCommon.mk",),
     "vendor/lineage": ("config/BoardConfigKernel.mk", "build/tasks/kernel.mk"),
 }
-# The kernel toolchain: pinned projects in default.xml (R5-6).
-TOOLCHAIN_PREFIXES = ("prebuilts/clang/", "prebuilts/gcc/", "prebuilts/kernel-build-tools",
-                      "prebuilts/build-tools", "prebuilts/tools-lineage", "prebuilts/misc")
+# The kernel toolchain: pinned projects in default.xml (R5-6, R6-3). Besides
+# the compilers and build tools: prebuilts/tools-lineage, prebuilts/rust and
+# prebuilts/clang-tools are on the kernel build's PATH (TOOLS_PATH_OVERRIDE,
+# vendor/lineage config/BoardConfigKernel.mk), and external/dtc builds the
+# host dtc that compiles every DTB (DTC_EXT, build/tasks/kernel.mk, set
+# because BoardConfigCommon.mk has BOARD_KERNEL_SEPARATED_DTBO).
+TOOLCHAIN_PREFIXES = ("prebuilts/clang/", "prebuilts/clang-tools", "prebuilts/gcc/", "prebuilts/rust",
+                      "prebuilts/kernel-build-tools", "prebuilts/build-tools", "prebuilts/tools-lineage",
+                      "prebuilts/misc", "external/dtc")
 
 
 def git_out(repo: str, *args: str) -> str | None:
@@ -289,13 +295,23 @@ def boot_input_change(mine: dict, theirs: dict, git=None) -> tuple[bool, str]:
     return False, "no boot input or toolchain change"
 
 
+# A kernel part that was read completely and is not there (CONFIG_IKCONFIG
+# off, no appended DTB). It is distinct from None, "could not be parsed",
+# which always counts as a kernel batch (R6-3).
+ABSENT = "absent"
+FDT_MAGIC = b"\xd0\x0d\xfe\xed"
+FDT_HEADER = 40
+
+
 def boot_info(img: Path) -> dict | None:
     """From an Android boot image with header version 0-2: the header
     version, the kernel command line (512 bytes at 64, plus the 1024-byte
-    extra at 608) and the SHA-256 of the kernel's embedded config (IKCONFIG;
-    None if the kernel carries none). None if the file is missing, not a
-    boot image, or has a header version this parser doesn't know (R5-6,
-    R5-17: unknown fails safe to a kernel batch)."""
+    extra at 608), and from the kernel the SHA-256 of its embedded config
+    (IKCONFIG) and of the DTBs appended to it (Image.gz-dtb); each of those
+    is a hash, ABSENT, or None if it could not be parsed. None if the file
+    is missing, not a boot image, has a header version this parser doesn't
+    know, or a kernel that runs past the end of the file (R5-6, R5-17,
+    R6-6: unknown fails safe to a kernel batch)."""
     try:
         data = img.read_bytes()
     except OSError:
@@ -303,31 +319,67 @@ def boot_info(img: Path) -> dict | None:
     if len(data) < 1632 or data[:8] != b"ANDROID!":
         return None
     kernel_size, page_size, version = (struct.unpack_from("<I", data, off)[0] for off in (8, 36, 40))
-    if version > 2 or page_size not in (2048, 4096, 16384):
+    if version > 2 or page_size not in (2048, 4096, 16384) or page_size + kernel_size > len(data):
         return None
     cmdline = (data[64:576].split(b"\0", 1)[0] + data[608:1632].split(b"\0", 1)[0]).decode("latin-1")
+    image, tail = split_kernel(data[page_size:page_size + kernel_size])
     return {"header_version": version, "cmdline": cmdline,
-            "ikconfig_sha256": ikconfig_sha(data[page_size:page_size + kernel_size])}
+            "ikconfig_sha256": None if image is None else ikconfig_sha(image),
+            "dtb_sha256": None if tail is None else appended_dtb_sha(tail)}
 
 
-def ikconfig_sha(kernel: bytes) -> str | None:
+def split_kernel(kernel: bytes) -> tuple[bytes | None, bytes | None]:
+    """(kernel image, bytes appended after it). A gzip kernel
+    (Image.gz-dtb) is decompressed whole; what follows the gzip stream is
+    the appended DTBs. (None, None) if the gzip stream is corrupt or cut
+    short. A raw kernel is returned as is, with None for the tail: where a
+    raw Image ends can't be told reliably, so its DTBs can't be compared."""
+    if kernel[:2] != b"\x1f\x8b":
+        return kernel, None
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        img = d.decompress(kernel)
+    except zlib.error:
+        return None, None
+    if not d.eof:
+        return None, None
+    return img, d.unused_data
+
+
+def ikconfig_sha(img: bytes) -> str | None:
     """SHA-256 of the kernel's embedded .config (CONFIG_IKCONFIG: gzip data
-    between IKCFG_ST and IKCFG_ED), from a raw or gzip-compressed kernel
-    (Image.gz-dtb: the trailing dtbs are ignored). None if there is none."""
-    img = kernel
-    if kernel[:2] == b"\x1f\x8b":
-        try:
-            img = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(kernel)
-        except zlib.error:
-            return None
-    s, e = img.find(b"IKCFG_ST"), img.find(b"IKCFG_ED")
-    if s < 0 or e <= s:
+    between IKCFG_ST and the next IKCFG_ED, R6-6) in a decompressed kernel.
+    ABSENT if the kernel has no IKCFG_ST; None if the block is there but
+    can't be read (R6-3)."""
+    s = img.find(b"IKCFG_ST")
+    if s < 0:
+        return ABSENT
+    e = img.find(b"IKCFG_ED", s + 8)
+    if e < 0:
         return None
     try:
         cfg = zlib.decompress(img[s + 8:e], 16 + zlib.MAX_WBITS)
     except zlib.error:
         return None
     return hashlib.sha256(cfg).hexdigest()
+
+
+def appended_dtb_sha(tail: bytes) -> str | None:
+    """SHA-256 of the DTBs appended to a gzip kernel (R6-3). The tail must
+    be whole flattened device trees back to back (magic, then totalsize,
+    which ends exactly at the end): ABSENT if empty, None if it isn't
+    that."""
+    if not tail:
+        return ABSENT
+    off = 0
+    while off < len(tail):
+        if tail[off:off + 4] != FDT_MAGIC or off + 8 > len(tail):
+            return None
+        size = struct.unpack_from(">I", tail, off + 4)[0]
+        if size < FDT_HEADER or off + size > len(tail):
+            return None
+        off += size
+    return hashlib.sha256(tail).hexdigest()
 
 
 def boot_cmdline(img: Path) -> str | None:
@@ -342,9 +394,9 @@ def kernel_change(batch: dict, known_good: dict | None, load_batch=None, info=No
     compared with the latest known-good build? (True, why) if the kernel
     commit, a boot-affecting file outside the kernel repo or the kernel
     toolchain pins (boot_input_change), the dtbo image, the boot image
-    header version, its command line or the kernel's embedded config
-    differs, and also when any of them can't be compared (unknown counts as
-    changed; R5-6).
+    header version, its command line, the kernel's embedded config or the
+    DTB appended to the kernel differs, and also when any of them can't be
+    compared or parsed (unknown counts as changed; R5-6, R6-3).
 
     The boot image's own hash can't be used: it changes on every build (the
     ramdisk carries the build date and the kernel its build timestamp), as
@@ -379,11 +431,18 @@ def kernel_change(batch: dict, known_good: dict | None, load_batch=None, info=No
         return True, f"boot image header version {i_mine['header_version']} vs {i_theirs['header_version']}"
     if i_mine["cmdline"] != i_theirs["cmdline"]:
         return True, "the boot image command line differs from the known-good build's"
-    if i_mine["ikconfig_sha256"] != i_theirs["ikconfig_sha256"]:
-        return True, "the kernel's embedded config (IKCONFIG) differs from the known-good build's (or is missing)"
-    cfg = "IKCONFIG" if i_mine["ikconfig_sha256"] else "no IKCONFIG in either"
-    return False, (f"same kernel commit {mine[:12]}, boot inputs, toolchain, dtbo, header, command line and "
-                   f"kernel config ({cfg}) as known-good")
+    parts = (("ikconfig_sha256", "the kernel's embedded config (IKCONFIG)"),
+             ("dtb_sha256", "the DTB appended to the kernel"))
+    for key, what in parts:
+        # R6-3: "could not parse" is never "absent in both".
+        if i_mine.get(key) is None or i_theirs.get(key) is None:
+            return True, f"{what} could not be parsed in this build's or the known-good boot image"
+        if i_mine[key] != i_theirs[key]:
+            return True, f"{what} differs from the known-good build's (or is present in only one)"
+    cfg = "IKCONFIG" if i_mine["ikconfig_sha256"] != ABSENT else "IKCONFIG confirmed absent in both"
+    dtb = "appended DTB" if i_mine["dtb_sha256"] != ABSENT else "no appended DTB in either"
+    return False, (f"same kernel commit {mine[:12]}, boot inputs, toolchain, dtbo, header, command line, "
+                   f"kernel config ({cfg}) and {dtb} as known-good")
 
 
 def sysrq_boots_required(batch: dict, known_good: dict | None, **kw) -> tuple[int, str]:
