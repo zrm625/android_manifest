@@ -7,7 +7,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import evidence, journal, reboots, recovery, slots, stage
+from . import evidence, fbmode, journal, reboots, recovery, slots, stage
 from .core import (BENCH_HOME, CODENAME, SERIAL, Deadline, batch_dir, bench_path, log, new_id,
                    now_iso, read_json, sha256_file, write_json)
 from .device import Device, GuardError, Unreachable
@@ -80,10 +80,14 @@ def partition_build_ids(dev: Device) -> tuple[str | None, str | None]:
 
 def to_fastboot(dev: Device, seconds: float = 180) -> None:
     """Get to fastboot. If fastboot answers, use it. If adb answers (booted or
-    not), write a marker when possible and `adb reboot bootloader`."""
+    not), write a marker when possible and `adb reboot bootloader`. Once in
+    fastboot, clear fb_mode (harmless when it is not set) and resolve any
+    journaled fb_mode obligation (review round 4): rescue and rollback come
+    through here."""
     d = Deadline(seconds, "fastboot or adb to answer")
     while True:
         if dev.in_fastboot():
+            fbmode.disarm(dev)
             return
         if dev.state() in ("device", "recovery"):
             st = dev.boot_status()
@@ -91,6 +95,7 @@ def to_fastboot(dev: Device, seconds: float = 180) -> None:
                 reboots.leave_marker(dev)
             dev.reboot_adb("bootloader")
             dev.wait_fastboot(120)
+            fbmode.disarm(dev)
             return
         if d.expired():
             raise Unreachable(f"{dev.serial}: neither adb nor fastboot answers. Someone has to hold the power "
@@ -182,6 +187,7 @@ def check_images(images_dir: Path, expected: dict | None) -> dict:
 def write_images(dev: Device, images_dir: Path, target: str, wipe: bool, attempt: dict,
                  st: dict | None) -> None:
     dev.fastboot_guard()
+    fbmode.disarm(dev)    # in fastboot: clear any fb_mode, so the new build boots (review round 4)
     if st is not None:
         slots.mark_written(st, attempt["attempt_id"], now_iso())
         save_state(st)
@@ -596,6 +602,16 @@ def main(argv: list[str]) -> int:
         return show_status()
     try:
         with DeviceLock():
+            if not a.merge_started:
+                # Preflight (review round 4): a leftover fb_mode would stop
+                # every boot in fastboot. With an obligation pending this
+                # clears it and boots Android; with the phone merely found
+                # in fastboot it only clears it.
+                try:
+                    fbmode.recover(Device(SERIAL), BOOT_TIMEOUT)
+                except RuntimeError as e:
+                    log(f"HALT: fb_mode recovery failed: {e}")
+                    return EXIT_HALT
             if a.rollback:
                 st = load_state()
                 if not st:

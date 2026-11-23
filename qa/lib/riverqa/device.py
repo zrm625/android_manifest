@@ -347,12 +347,17 @@ class Device:
         if r.returncode != 0:
             raise RuntimeError(f"fastboot {' '.join(args)} failed: {(r.stderr or r.stdout).strip()[-400:]}")
 
-    def fb_mode(self, on: bool) -> None:
-        """Motorola's ``fastboot oem fb_mode_set`` / ``fb_mode_clear``. While
-        it is set, the bootloader stops in fastboot on every boot. Only the
-        sysrq extra-pass control uses it (reboots.planned_reboot)."""
+    def fb_mode_set(self) -> None:
+        """Motorola's ``fastboot oem fb_mode_set``: the bootloader stops in
+        fastboot on every boot until it is cleared. Only fbmode.arm may call
+        this, after it journals the obligation (review round 4)."""
         self.fastboot_guard()
-        self.fastboot_ok("oem", "fb_mode_set" if on else "fb_mode_clear", timeout=30)
+        self.fastboot_ok("oem", "fb_mode_set", timeout=30)
+
+    def fb_mode_clear(self) -> None:
+        """``fastboot oem fb_mode_clear``; harmless when nothing is set."""
+        self.fastboot_guard()
+        self.fastboot_ok("oem", "fb_mode_clear", timeout=30)
 
     def fastboot_continue(self) -> None:
         """``fastboot continue``: boot the current slot from the bootloader

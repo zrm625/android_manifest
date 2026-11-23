@@ -4,7 +4,8 @@ from unittest import mock
 
 import _path  # noqa: F401
 from riverqa import bootsig as b
-from riverqa import reboots
+from riverqa import fbmode, reboots
+from benchhome import bench_home
 from riverqa.device import Read, UsbEvent
 from riverqa.results import FAIL, INFO, PASS, UNVERIFIED
 
@@ -553,9 +554,13 @@ class Enumeration(unittest.TestCase):
             self.where = "fastboot" if target == "bootloader" or self.fb else "android"
             self.w.add("present", "18d1:d00d" if self.where == "fastboot" else "18d1:4ee7")
 
-        def fb_mode(self, on):
-            self.calls.append(("fb_mode", on))
-            self.fb = on
+        def fb_mode_set(self):
+            self.calls.append(("fb_mode", True))
+            self.fb = True
+
+        def fb_mode_clear(self):
+            self.calls.append(("fb_mode", False))
+            self.fb = False
 
         def fastboot_continue(self):
             self.calls.append(("continue",))
@@ -578,8 +583,10 @@ class Enumeration(unittest.TestCase):
         w = self.W()
         dev = dev or self.Dev(w, stray)
         dev.w = w
-        with mock.patch.dict("os.environ", {"RIVERQA_CONTROL": "x"} if kw else {}):
-            return reboots.planned_reboot(dev, path, boot_timeout=10, watcher=w, **kw), dev
+        with bench_home(), mock.patch.dict("os.environ", {"RIVERQA_CONTROL": "x"} if kw else {}):
+            rec = reboots.planned_reboot(dev, path, boot_timeout=10, watcher=w, **kw)
+            self.assertIsNone(fbmode.pending(), "the fb_mode obligation must be resolved")
+            return rec, dev
 
     def test_normal_paths(self):
         for path in reboots.PATHS:
@@ -622,7 +629,9 @@ class Enumeration(unittest.TestCase):
         w = self.W()
         dev = self.Dev(w, stop_fails=True)
         dev.reboot_sysrq = lambda: (dev.calls.append(("sysrq",)), dev.w.add("gone"), dev.w.add("present", "18d1:4ee7"))
-        with self.assertRaises(TimeoutError):
+        dev.state = lambda: "device"          # back in Android, with fb_mode still set
+        with self.assertRaises(TimeoutError), \
+                mock.patch.object(reboots, "leave_marker", return_value=(None, None)):
             self.reboot("sysrq", dev=dev, inject_extra_pass=True)
         self.assertFalse(dev.fb)
         self.assertEqual(dev.calls[-3:], [("reboot_adb", "bootloader"), ("fb_mode", False),

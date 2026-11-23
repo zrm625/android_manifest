@@ -81,6 +81,7 @@ with `flash --rollback`. Rollback wipes data, so run `phone-setup` after it.
 | `phone-qa controls --boot-timing` | The step-1 proofs again, under the current harness version | n/a |
 | `phone-qa stage ID` | Copy a build's images into `$BENCH_HOME/batches/ID` | n/a |
 | `phone-qa helper` | Build or verify the helper APK | n/a |
+| `phone-qa recover` | Clear a leftover `fastboot oem fb_mode` (a journaled obligation, or the phone sitting in fastboot) and boot Android | n/a |
 | `phone-qa journal` | Show anything the state journal still has to restore | n/a |
 | `phone-qa version` | The harness version (a content hash) | n/a |
 
@@ -247,10 +248,16 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   another kernel's and the chain is FAIL. No boot on the A1′ or A2 data had
   that; the raw pstore is kept in `$BENCH_HOME/qa/pstore-nopass/`.
 - **A stuck fb_mode.** The `sysrq` extra-pass control sets `fastboot oem
-  fb_mode_set` for one boot and clears it on success and on failure. If the
-  harness was killed in between, the phone stops in fastboot on every boot:
-  run `fastboot -s ZY225DPT7F oem fb_mode_clear` and `fastboot -s ZY225DPT7F
-  reboot`.
+  fb_mode_set` for one boot and clears it on success and on failure. It
+  journals the obligation (`$BENCH_HOME/qa/journal.json`, a host entry of
+  kind `fb_mode`) before it sets it. If the harness was killed in between,
+  the phone stops in fastboot on every boot until the obligation is
+  cleared. The next `phone-qa`, `flash` or `phone-qa boot-timing` run clears
+  it under the device lock and boots Android; `phone-qa recover` does only
+  that. A full `phone-qa` run that had to do this stops with
+  `preflight.journal` FAIL, because the phone rebooted outside the plan.
+  `flash`, rescue and rollback also run `fastboot oem fb_mode_clear` any
+  time they find the phone in fastboot.
 - **Bench rows from before A2** have no `reboot_path`, so
   `health.boot_signals` is UNVERIFIED for them; bench the batch again.
 - **Camera-set approvals and the gh account.** The approval must be a

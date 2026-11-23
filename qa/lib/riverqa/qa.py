@@ -425,11 +425,33 @@ def check_helper(run: Run) -> Result:
     return Result("preflight.helper", PASS, f"helper {apk.name} (cache key {key[:12]})")
 
 
+def fb_mode_preflight(run: Run) -> bool:
+    """A leftover fb_mode obligation (review round 4), before the guard: the
+    phone may be sitting in fastboot. Recovery clears it and boots Android.
+    That reboot is not one the batch planned, so the run stops with
+    preflight.journal FAIL; run it again (the boot signals will show the
+    extra boot). With nothing pending this does nothing; a phone merely
+    sitting in fastboot fails the guard as before."""
+    from . import fbmode
+    if fbmode.pending(run.journal) is None:
+        return True
+    try:
+        what = fbmode.recover(run.dev, 900, j=run.journal)
+    except Exception as e:  # noqa: BLE001 - any failure stops the run
+        run.add(Result("preflight.journal", FAIL, f"fb_mode recovery failed: {e}"))
+        return False
+    run.add(Result("preflight.journal", FAIL, f"fb_mode recovery: {what}; the phone rebooted outside the "
+                   "batch plan, so this run stops. Run phone-qa again.", {"fb_mode": what}))
+    return False
+
+
 def preflight(run: Run, lock_result: Result) -> bool:
     """False stops the run: nothing after preflight may run unless the
     guards, the controls check, the fixtures, journal recovery and the helper
     all passed (C5)."""
     run.add(lock_result)
+    if not fb_mode_preflight(run):
+        return False
     try:
         run.guard()
         run.add(Result("preflight.guards", PASS, f"{SERIAL} is {CODENAME} in adb device mode"))
@@ -925,6 +947,15 @@ def quick_presence(run: Run) -> list[Result]:
 
 def quick(run: Run, wait: bool) -> int:
     dev = run.dev
+    from . import fbmode
+    if fbmode.pending(run.journal) is not None:
+        # A leftover fb_mode obligation (review round 4): the dev loop just
+        # clears it and boots Android.
+        try:
+            fbmode.recover(dev, 900, j=run.journal)
+        except Exception as e:  # noqa: BLE001
+            log(f"error: fb_mode recovery failed: {e}")
+            return 1
     st = dev.state()
     if st != "device":
         log(f"error: {SERIAL} is not connected in adb device mode (state: {st or 'none'})")
@@ -1095,6 +1126,9 @@ Usage:
   phone-qa controls --boot-timing      Run the step-1 proofs again with the recorded A;
                                        records the boot-timing controls under the current
                                        harness version.
+  phone-qa recover                     Clear a leftover fastboot oem fb_mode (a pending
+                                       obligation, or the phone sitting in fastboot) and
+                                       boot Android.
   phone-qa journal                     Show leftovers in the state journal.
   phone-qa helper                      Build (or verify) the river-qa helper APK.
   phone-qa version                     Print the harness version.
@@ -1128,6 +1162,8 @@ def main(argv: list[str]) -> int:
             return 1
         from .controls import show_controls
         return show_controls(harness_version())
+    if sub == "recover":
+        return cmd_recover(argv[1:])
     if sub == "journal":
         j = jmod.Journal(QA_HOME / "journal.json", QA_HOME)
         print(json.dumps(j.entries, indent=2) if j.entries else "Journal is empty.")
@@ -1199,6 +1235,25 @@ def main(argv: list[str]) -> int:
         return full_run(run, lock_result)
     finally:
         lock.release()
+
+
+def cmd_recover(argv: list[str]) -> int:
+    """phone-qa recover: under the device lock, clear a leftover fb_mode
+    (a pending obligation, or the phone found in fastboot) and boot Android
+    (review round 4). The rest of the journal is restored by the next
+    phone-qa run's preflight."""
+    from . import fbmode
+    if argv:
+        print("usage: phone-qa recover")
+        return 1
+    try:
+        with DeviceLock():
+            what = fbmode.recover(Device(SERIAL), 900, boot=True)
+    except (LockError, GuardError, RuntimeError, TimeoutError) as e:
+        log(f"error: {e}")
+        return 1
+    log(what or "Nothing to recover: no fb_mode obligation and the phone is not in fastboot.")
+    return 0
 
 
 def cmd_stage(argv: list[str]) -> int:

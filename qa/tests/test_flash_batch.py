@@ -49,6 +49,12 @@ class FakePhone:
         self.events.append(("fastboot", args, None))
         return subprocess.CompletedProcess(args, 0, "", "")
 
+    def fb_mode_clear(self):
+        self.events.append(("fb_mode_clear",))
+
+    def in_fastboot(self):
+        return False
+
 
 def stage_batch(home, kind="calibration"):
     imgs = home / "batches/b1/images"
@@ -86,6 +92,9 @@ class FlashBatch(unittest.TestCase):
             rc = self.flash(h, phone, lambda dev, st, reason, attempt_id=None: calls.append(st) or {"ok": 1})
             writes = [e for e in phone.events if e[0] == "fastboot" and e[1][0] == "flash"]
             self.assertEqual(len(writes), 4)
+            # fb_mode is cleared in fastboot before the first write (R4-3).
+            first_write = phone.events.index(writes[0])
+            self.assertIn(("fb_mode_clear",), phone.events[:first_write])
             for _, args, pair in writes:
                 self.assertIsNotNone(pair, "an image was written before the pair was saved")
                 self.assertTrue(pair["written"])

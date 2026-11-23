@@ -295,11 +295,22 @@ def _gvfs(run, e):
     return not left, f"{e['key']} {'still mounted' if left else 'unmounted'}"
 
 
+def _fb_mode(run, e):
+    """A leftover fb_mode obligation (review round 4): clear it and boot
+    Android (fbmode.recover), then confirm the entry is gone. The entry is
+    resolved by fbmode itself, so this handler re-reads the journal."""
+    from . import fbmode
+    what = fbmode.recover(run.dev, 600, boot=True, j=run.journal)
+    left = fbmode.pending(jmod.Journal(run.journal.path, run.journal.qa_home))
+    return left is None, f"fb_mode: {what or 'nothing to clear'}"
+
+
 HANDLERS = {
     "setting": _setting, "location": _location, "bt_enabled": _bt_enabled, "bt_scan_mode": _bt_scan_mode,
     "usb_functions": _usb_functions, "user_rotation": _user_rotation, "volume_music": _volume, "ntp": _ntp,
     "sysfs": _sysfs, "wifi": _wifi, "package": _package, "alarm": _alarm, "marker_file": _marker, "watchdog": _watchdog,
     "bt_bond": _bond, "bt_discoverable": _bt_discoverable, "adb_reverse": _adb_reverse, "gvfs_mount": _gvfs,
+    "fb_mode": _fb_mode,
 }
 
 

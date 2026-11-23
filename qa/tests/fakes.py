@@ -62,6 +62,9 @@ class FakeShell:
     def state(self):
         return "device"
 
+    def in_fastboot(self):
+        return False
+
     def getprop(self, name):
         return self.sh(f"getprop {name}").strip()
 

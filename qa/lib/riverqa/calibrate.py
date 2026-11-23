@@ -44,9 +44,9 @@ import os
 import statistics
 import time
 
-from . import bootsig, reboots
+from . import bootsig, fbmode, reboots
 from .core import SERIAL, log, now_iso, write_json, bench_path
-from .device import Device, UsbWatcher
+from .device import Device, GuardError, UsbWatcher
 from .lock import DeviceLock, LockError
 from .results import FAIL, PASS
 
@@ -293,7 +293,7 @@ def boot_timing_main(argv: list[str]) -> int:
     try:
         with DeviceLock():
             return run(a.normal, a.reuse_normals)
-    except LockError as e:
+    except (LockError, GuardError) as e:
         log(f"error: {e}")
         return 1
 
@@ -311,6 +311,7 @@ def prove_main() -> int:
                 log("error: no boot-timing.json; run `phone-qa boot-timing` first")
                 return 2
             dev = Device(SERIAL)
+            fbmode.recover(dev, 600, boot=True)    # resume from fastboot or a leftover fb_mode (R4-3)
             dev.guard()
             dev.root()
             data.setdefault("controls", {})
@@ -320,7 +321,7 @@ def prove_main() -> int:
             finally:
                 w.stop()
             return finish(data)
-    except LockError as e:
+    except (LockError, GuardError) as e:
         log(f"error: {e}")
         return 1
 
@@ -338,6 +339,9 @@ def finish(data: dict) -> int:
 
 def run(n_normal: int, reuse: bool = False) -> int:
     dev = Device(SERIAL)
+    # Calibration resumes from a phone sitting in fastboot or left with
+    # fb_mode set by a killed run (review round 4).
+    fbmode.recover(dev, 600, boot=True)
     dev.guard()
     dev.root()
     old = reboots.load_timing()

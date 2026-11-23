@@ -1379,3 +1379,28 @@ Before this change, normal passes {10.00, 10.00, 14.20} with the 14.20 s
 sample a hidden extra pass gave A = 14.80, so a real 14.2 s extra pass
 passed. Normal reboots reused with `--reuse-normals` from before this change
 have no bracket and are all excluded.
+
+**R4-3. fb_mode is a durable obligation.** A2 rule 5 cleared fb_mode in a
+`finally` block, which does nothing if the host dies. Now (`fbmode.py`):
+- `fbmode.arm` writes a host entry of kind `fb_mode` to the state journal,
+  fsynced, **before** it sends `fastboot oem fb_mode_set`.
+  `Device.fb_mode_set` has no other caller. `fbmode.disarm` sends
+  `fb_mode_clear` and only then resolves the entry.
+- `fbmode.recover` runs under the device lock before the adb guard. With an
+  obligation pending it takes the phone to fastboot if needed (`adb reboot
+  bootloader`, guarded), clears fb_mode, resolves the entry and boots
+  Android. With nothing pending but the phone in fastboot, it clears fb_mode
+  and boots Android only when the caller asks. If it can't finish, the
+  entry stays pending.
+- Callers: `phone-qa boot-timing` and `phone-qa controls --boot-timing`
+  (always boot, so calibration resumes from a phone sitting in fastboot);
+  every device action of `flash` (clear; boot only if an obligation was
+  pending); the full `phone-qa` preflight and `--quick` (only with an
+  obligation pending; a full run then stops with `preflight.journal` FAIL,
+  since the phone rebooted outside the batch plan); journal recovery (a
+  handler for the `fb_mode` kind); and the new `phone-qa recover`.
+- `flash`, rescue and rollback also send `fastboot oem fb_mode_clear` any
+  time they are in fastboot (`flashing.to_fastboot`, `write_images`). It is
+  harmless when nothing is set.
+- Unit tests now run with `$BENCH_HOME` pointed at a throwaway directory
+  (`qa/tests/_path.py`), so no test can write the real journal.

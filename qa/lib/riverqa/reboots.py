@@ -39,7 +39,7 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 
-from . import bootsig
+from . import bootsig, fbmode
 from .core import bench_path, log, read_json, write_json
 from .device import Device, UsbWatcher, fastboot_ids_seen
 from .results import FAIL, INFO, PASS, UNVERIFIED, worst
@@ -180,7 +180,7 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             if inject_extra_pass:
                 dev.wait_fastboot(120)                       # fb_mode: the bootloader stops
                 planned += 1
-                dev.fb_mode(False)
+                fbmode.disarm(dev)
                 armed = False
                 mark2 = w.mark()
                 dev.reboot_fastboot()
@@ -264,7 +264,7 @@ def arm_bootloader_stop(dev: Device, boot_timeout: float) -> None:
     if dev.state() == "device":
         dev.reboot_adb("bootloader")
     dev.wait_fastboot(120)
-    dev.fb_mode(True)
+    fbmode.arm(dev)          # journaled before the set (review round 4)
     dev.fastboot_continue()
     dev.wait_for_device(boot_timeout)
     dev.wait_boot_completed(boot_timeout)
@@ -272,18 +272,15 @@ def arm_bootloader_stop(dev: Device, boot_timeout: float) -> None:
 
 def clear_fb_mode(dev: Device, boot_timeout: float) -> None:
     """Best effort after a sysrq extra-pass control failed with fb_mode set:
-    clear it and boot Android, so the phone stops in fastboot no more."""
+    clear it and boot Android (fbmode.recover). If that fails too, the
+    journaled obligation stays, and the next recovery under the device lock
+    clears it (review round 4)."""
     try:
-        if not dev.in_fastboot():
-            dev.reboot_adb("bootloader")
-            dev.wait_fastboot(120)
-        dev.fb_mode(False)
-        dev.reboot_fastboot()
-        dev.wait_boot_completed(boot_timeout)
+        fbmode.recover(dev, boot_timeout, boot=True)
     except Exception as e:  # noqa: BLE001 - say how to recover whatever went wrong
-        log(f"warning: could not clear fastboot oem fb_mode ({e}); until it is cleared the bootloader stops "
-            f"in fastboot on every boot: fastboot -s {dev.serial} oem fb_mode_clear && "
-            f"fastboot -s {dev.serial} reboot")
+        log(f"warning: could not clear fastboot oem fb_mode ({e}); the obligation stays in the journal and "
+            f"the next phone-qa, flash or boot-timing run clears it (or: phone-qa recover; by hand: fastboot "
+            f"-s {dev.serial} oem fb_mode_clear && fastboot -s {dev.serial} reboot)")
 
 
 def inject_reboot_before_completion(dev: Device, seconds: float, watcher: UsbWatcher | None = None) -> str:
