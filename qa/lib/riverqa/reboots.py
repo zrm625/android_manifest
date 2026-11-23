@@ -380,16 +380,27 @@ def combined_verdict(signals: dict, path: str, timing: dict | None = None) -> tu
 
 def read_boot_count(dev: Device, expected: int, settle_s: float = 60) -> tuple[str, str]:
     """Count SYSTEM_BOOT entries once the count has settled (it is written
-    after BOOT_COMPLETED)."""
+    after BOOT_COMPLETED). Every read is the checked dropbox read (review
+    round 4): a failed read never counts as a dump with no entries, and if
+    the last read before the deadline failed the verdict is UNVERIFIED."""
+    from .evidence import checked_read
     end = time.monotonic() + settle_s
     last = None
     stable = 0
     while True:
-        tags = bootsig.dropbox_tags(dev.sh("dumpsys dropbox", timeout=60))
-        n = tags.count("SYSTEM_BOOT")
-        stable = stable + 1 if n == last else 0
-        last = n
-        if (n >= expected and stable >= 2) or time.monotonic() > end:
+        ok, dump, why = checked_read(dev, "dropbox", "dumpsys dropbox")
+        if ok:
+            tags = bootsig.dropbox_tags(dump)
+            n = tags.count("SYSTEM_BOOT")
+            stable = stable + 1 if n == last else 0
+            last = n
+            if n >= expected and stable >= 2:
+                return bootsig.boot_count_verdict(tags, expected)
+        else:
+            stable, last = 0, None
+        if time.monotonic() > end:
+            if not ok:
+                return UNVERIFIED, f"dumpsys dropbox unreadable: {why}"
             return bootsig.boot_count_verdict(tags, expected)
         time.sleep(3)
 

@@ -409,10 +409,40 @@ class Calibration(unittest.TestCase):
         dumps = iter([DROPBOX0, DROPBOX0, DROPBOX1, DROPBOX1])
 
         class Dev:
-            def sh(self, cmd, timeout=30):
-                return next(dumps)
+            def sh_rc(self, cmd, timeout=30):
+                return 0, next(dumps), ""
         with mock.patch.object(calibrate.time, "sleep", lambda s: None):
             self.assertEqual(calibrate.boot_count_now(Dev()), 1)
+
+    def test_boot_counts_use_the_checked_dropbox_read(self):
+        """Review round 4: a failed dumpsys dropbox (exit 0 with no header,
+        or an error) is never a dump with no SYSTEM_BOOT entries."""
+        from riverqa import calibrate
+
+        class Dev:
+            def __init__(self, replies):
+                self.replies = iter(replies)
+
+            def sh_rc(self, cmd, timeout=30):
+                return next(self.replies)
+        bad = [(0, "Can't find service: dropbox\n", ""), (1, "", "error: closed")]
+        # Unreadable to the deadline: UNVERIFIED, never a count of 0.
+        clock = itertools.count(0, 50)
+        with mock.patch.object(reboots.time, "sleep", lambda s: None), \
+                mock.patch.object(reboots.time, "monotonic", lambda: next(clock)):
+            st, why = reboots.read_boot_count(Dev(bad * 3), expected=2, settle_s=60)
+        self.assertEqual(st, UNVERIFIED)
+        self.assertIn("unreadable", why)
+        # A failed read between two good ones doesn't count as settled.
+        two = "Drop box contents: 2 entries\n\n" + "2026-11-22 18:44:04 SYSTEM_BOOT (text, 4 bytes)\n" * 2
+        dev = Dev([(0, two, ""), bad[0], (0, two, ""), (0, two, ""), (0, two, "")])
+        with mock.patch.object(reboots.time, "sleep", lambda s: None):
+            self.assertEqual(reboots.read_boot_count(dev, expected=2)[0], PASS)
+        self.assertEqual(len(list(dev.replies)), 0)    # needed 3 good reads in a row after the bad one
+        clock = itertools.count(0, 50)
+        with mock.patch.object(calibrate.time, "sleep", lambda s: None), \
+                mock.patch.object(calibrate.time, "monotonic", lambda: next(clock)):
+            self.assertIsNone(calibrate.boot_count_now(Dev(bad * 3)))
 
     def test_controls_boot_timing_command(self):
         from riverqa import calibrate, qa
