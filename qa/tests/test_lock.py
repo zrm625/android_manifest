@@ -112,9 +112,46 @@ class BuildLock(unittest.TestCase):
             finally:
                 child.kill()
                 child.wait()
+                child.stdout.close()                            # R6-7
                 os.environ.pop("BENCH_LOCK_TOKEN", None)
             self.assertFalse(lock.build_running())
             DeviceLock().acquire().release()                    # the build finished
+
+    def test_concurrent_probes_are_not_a_build(self):
+        """R6-5: another job probing the build lock (a shared hold) is not a
+        build; an exclusive hold is."""
+        import fcntl
+        from riverqa import lock
+        with bench_home() as h:
+            fd = os.open(h / ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                self.assertFalse(lock.build_running())
+                DeviceLock().acquire().release()
+            finally:
+                os.close(fd)
+
+    def test_merge_started_and_promote_run_during_a_build(self):
+        """R6-5: host-only flash steps skip the build-lock probe; a dev
+        flash still refuses."""
+        import fcntl
+        import io
+        from contextlib import redirect_stderr
+        from riverqa import flashing
+        with bench_home() as h:
+            fd = os.open(h / ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                for argv in (["--merge-started", "nope"], ["--promote", "nope"], ["stripped"]):
+                    with self.subTest(argv=argv), redirect_stderr(io.StringIO()) as err:
+                        flashing.main(argv)
+                    if argv[0] == "stripped":
+                        self.assertIn("a build holds", err.getvalue())
+                    else:
+                        self.assertNotIn("a build holds", err.getvalue())
+                        self.assertIn("nope", err.getvalue())
+            finally:
+                os.close(fd)
 
 
 if __name__ == "__main__":

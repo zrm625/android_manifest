@@ -10,7 +10,9 @@ tool takes the lock itself for its own run.
 Either way, no device job starts while a build holds the build lock,
 $BENCH_HOME/.lock (scripts/bench/lib.sh): a build loads the host enough to
 eat the timing brackets' headroom (review round 5, R5-13). The runner builds
-first and then runs the device jobs, in sequence.
+first and then runs the device jobs, in sequence. The probe takes the lock
+shared, so concurrent probes don't block each other; flash --merge-started
+and --promote, which time nothing, skip it (R6-5).
 """
 
 from __future__ import annotations
@@ -41,7 +43,10 @@ def build_running() -> bool | None:
     except OSError:
         return None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Shared (R6-5): the build takes it exclusive (flock -n in
+        # scripts/bench/lib.sh), so a shared probe still sees a build, but
+        # two device jobs probing at once don't see each other as one.
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     except BlockingIOError:
         return True
     else:
@@ -74,15 +79,20 @@ def _held_by_someone() -> bool:
 
 
 class DeviceLock:
-    def __init__(self):
+    """``check_build=False`` skips the build-lock probe, for host-side
+    steps that measure no timing (flash --merge-started, --promote; R6-5)."""
+
+    def __init__(self, check_build: bool = True):
         self.fd: int | None = None
         self.token: str | None = None
         self.owned = False
+        self.check_build = check_build
 
     def acquire(self) -> "DeviceLock":
         path = _path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        _refuse_during_build()
+        if self.check_build:
+            _refuse_during_build()
         env_token = os.environ.get("BENCH_LOCK_TOKEN")
         if env_token:
             try:

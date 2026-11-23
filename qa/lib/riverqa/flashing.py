@@ -726,7 +726,9 @@ def main(argv: list[str]) -> int:
     if a.status:
         return show_status()
     try:
-        with DeviceLock():
+        # --merge-started and --promote time nothing, so they may run while a
+        # build holds the build lock (R6-5).
+        with DeviceLock(check_build=not (a.merge_started or a.promote)):
             # Slot recovery dispatches first (R5-1): --rollback and --recover
             # handle fb_mode themselves, in fastboot, on the way to the slot
             # they pick, and never boot the active slot (it may be the failed
