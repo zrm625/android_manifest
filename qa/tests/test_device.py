@@ -71,6 +71,39 @@ class RebootGuard(unittest.TestCase):
                     dev.fastboot(*args)
         self.assertEqual(fake.reboots(), [])
 
+    def test_raw_sysrq_is_refused(self):
+        fake = FakeRun()
+        with mock.patch.object(device, "run", fake):
+            for cmd in ("echo b > /proc/sysrq-trigger", device.SYSRQ_REBOOT):
+                with self.assertRaises(GuardError):
+                    Device().adb("shell", cmd)
+                with self.assertRaises(GuardError):
+                    Device().sh(cmd)
+        self.assertFalse(any("sysrq" in " ".join(c) for c in fake.cmds))
+
+    def test_sysrq_reboot_after_the_guard_and_as_root(self):
+        class Root(FakeRun):
+            def __call__(self, cmd, timeout, input=None, text=True, env=None):
+                if cmd[3:5] == ["shell", "id -u"]:
+                    self.cmds.append(cmd)
+                    return subprocess.CompletedProcess(cmd, 0, self.uid, "")
+                return super().__call__(cmd, timeout, input, text, env)
+        fake = Root()
+        fake.uid = "0\n"
+        with mock.patch.object(device, "run", fake):
+            Device().reboot_sysrq()
+        sysrq = [c for c in fake.cmds if "sysrq" in " ".join(c)]
+        self.assertEqual(sysrq, [["adb", "-s", SERIAL, "shell", "sync; echo b > /proc/sysrq-trigger"]])
+        idx = fake.cmds.index(sysrq[0])
+        self.assertTrue(any("ro.product.device" in " ".join(c) for c in fake.cmds[:idx]))
+        self.assertTrue(any("ro.serialno" in " ".join(c) for c in fake.cmds[:idx]))
+        for bad in (Root(props={"ro.product.device": "lynx"}), Root()):
+            bad.uid = "0\n" if bad.props["ro.product.device"] != "river" else "2000\n"
+            with mock.patch.object(device, "run", bad):
+                with self.assertRaises(GuardError):
+                    Device().reboot_sysrq()
+            self.assertFalse(any("sysrq" in " ".join(c) for c in bad.cmds))
+
     def test_adb_reboot_checks_the_product_first(self):
         fake = FakeRun(props={"ro.product.device": "lynx"})
         with mock.patch.object(device, "run", fake):

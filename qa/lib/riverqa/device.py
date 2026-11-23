@@ -146,6 +146,13 @@ def _is_reboot(args: tuple) -> bool:
     return bool(args) and str(args[0]).startswith("reboot")
 
 
+SYSRQ_REBOOT = "sync; echo b > /proc/sysrq-trigger"
+
+
+def _is_sysrq(args: tuple) -> bool:
+    return any("sysrq" in str(a) for a in args)
+
+
 class Device:
     def __init__(self, serial: str = SERIAL):
         if not serial:
@@ -154,8 +161,8 @@ class Device:
 
     # --- adb -------------------------------------------------------------
     def adb(self, *args: str, timeout: float = 30, input=None, text=True):
-        if _is_reboot(args):
-            raise GuardError("reboot only through Device.reboot_adb(), which guards first")
+        if _is_reboot(args) or _is_sysrq(args):
+            raise GuardError("reboot only through Device.reboot_adb() or reboot_sysrq(), which guard first")
         return self._adb(*args, timeout=timeout, input=input, text=text)
 
     def _adb(self, *args: str, timeout: float = 30, input=None, text=True):
@@ -193,6 +200,20 @@ class Device:
         device or recovery mode, ro.product.device and ro.serialno)."""
         self.reboot_guard()
         return self._adb(*(["reboot", target] if target else ["reboot"]), timeout=timeout)
+
+    def reboot_sysrq(self, timeout: float = 15) -> None:
+        """The immediate kernel reboot (amendment A2): ``sync``, then ``echo b
+        > /proc/sysrq-trigger`` as root, only after the river guard. The
+        kernel resets at once, with no Android shutdown, and USB drops about
+        1.2 s later. The proc trigger works even with kernel.sysrq=0. The
+        shell never returns cleanly, so its exit status is not checked."""
+        self.guard()
+        if self.sh("id -u").strip() != "0":
+            raise GuardError("the sysrq reboot needs adb root")
+        try:
+            self._adb("shell", SYSRQ_REBOOT, timeout=timeout)
+        except TimeoutError:
+            pass
 
     def reboot_guard(self) -> None:
         st = self.state()
@@ -313,6 +334,19 @@ class Device:
         r = self._fastboot(*args, timeout=timeout)
         if r.returncode != 0:
             raise RuntimeError(f"fastboot {' '.join(args)} failed: {(r.stderr or r.stdout).strip()[-400:]}")
+
+    def fb_mode(self, on: bool) -> None:
+        """Motorola's ``fastboot oem fb_mode_set`` / ``fb_mode_clear``. While
+        it is set, the bootloader stops in fastboot on every boot. Only the
+        sysrq extra-pass control uses it (reboots.planned_reboot)."""
+        self.fastboot_guard()
+        self.fastboot_ok("oem", "fb_mode_set" if on else "fb_mode_clear", timeout=30)
+
+    def fastboot_continue(self) -> None:
+        """``fastboot continue``: boot the current slot from the bootloader
+        with no reset."""
+        self.fastboot_guard()
+        self.fastboot_ok("continue", timeout=30)
 
     def in_fastboot(self) -> bool:
         try:
