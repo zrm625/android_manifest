@@ -128,7 +128,8 @@ Building and testing are the bottleneck, so changes are tested in batches.
      out why. If the change caused it, the tester marks it as tried and
      records how it failed; it is queued again once it is fixed and the
      council has approved the fix. If the phone, the desk or the workstation
-     caused it, the change goes back into the queue.
+     caused it, the change goes back into the queue. After a change's third
+     failure, only Zak can put it back in the queue.
    - If several different changes fail the same way in a row, the tester
      stops and reports a likely problem with the desk or the workstation.
 
