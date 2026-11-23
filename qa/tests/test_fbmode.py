@@ -181,6 +181,23 @@ class Callers(unittest.TestCase):
             self.assertIsNone(fbmode.pending())
             self.assertEqual(p.where, "android")
 
+    def test_device_bench_recovers_and_stops_a_batch(self):
+        from riverqa import bench
+        for batch, want in (("b1", 1), (None, "guarded")):
+            with bench_home():
+                p = Phone("android")
+                fbmode.arm(p)
+                p.guard = mock.Mock(side_effect=RuntimeError("guarded"))
+                a = mock.Mock(batch=batch, flash=False)
+                with mock.patch.object(bench, "Device", lambda *x: p):
+                    try:
+                        got = bench.run(a)
+                    except RuntimeError as e:
+                        got = str(e)
+                self.assertEqual(got, want)
+                self.assertIsNone(fbmode.pending())
+                self.assertFalse(p.fb)
+
     def test_restore_handler(self):
         from riverqa import restore
         with bench_home():

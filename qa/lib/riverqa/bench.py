@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import evidence, flashing, reboots, stage
+from . import evidence, fbmode, flashing, reboots, stage
 from .core import BENCH_HOME, SERIAL, batch_dir, bench_path, log, now_iso, read_json, write_json
 from .device import Device, GuardError
 from .lock import DeviceLock, LockError
@@ -198,6 +198,15 @@ def main(argv: list[str]) -> int:
 
 def run(a) -> int:
     dev = Device(SERIAL)
+    # A leftover fb_mode would stop every sysrq bench boot in fastboot
+    # (review round 4): clear it first. For a batch, that reboot is outside
+    # the plan, so the batch's boot counts no longer hold: stop.
+    if fbmode.pending() is not None:
+        what = fbmode.recover(dev, flashing.BOOT_TIMEOUT)
+        if a.batch:
+            log(f"error: fb_mode recovery: {what}; the phone rebooted outside the batch plan. Flash the batch "
+                "again.")
+            return 1
     dev.guard()
     if a.flash:
         product = BENCH_HOME / f"out-{a.env}" / "target/product/river"

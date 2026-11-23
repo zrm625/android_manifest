@@ -1405,8 +1405,10 @@ have no bracket and are all excluded.
   every device action of `flash` (clear; boot only if an obligation was
   pending); the full `phone-qa` preflight and `--quick` (only with an
   obligation pending; a full run then stops with `preflight.journal` FAIL,
-  since the phone rebooted outside the batch plan); journal recovery (a
-  handler for the `fb_mode` kind); and the new `phone-qa recover`.
+  since the phone rebooted outside the batch plan); `device-bench` (only
+  with an obligation pending; with `--batch` it then stops, for the same
+  reason); journal recovery (a handler for the `fb_mode` kind); and the new
+  `phone-qa recover`.
 - `flash`, rescue and rollback also send `fastboot oem fb_mode_clear` any
   time they are in fastboot (`flashing.to_fastboot`, `write_images`). It is
   harmless when nothing is set.
