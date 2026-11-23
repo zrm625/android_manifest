@@ -1,6 +1,6 @@
 # Design: `phone-qa`, the QA harness for river batches (revision 11)
 
-Status: **approved by the council in round 11** (Opus 9, Sol 9, Gemini 9). This is revision 11. The implementation notes from each round are at the end and must be applied during the build.
+Status: **approved by the council in round 11** (Opus 9, Sol 9, Gemini 9). This is revision 11, plus [amendment A1](#amendment-a1-the-adb-path-uptime-clock), which the council approved with conditions in code review round 1. The implementation notes from each round are at the end and must be applied during the build.
 
 ## Council review
 
@@ -242,7 +242,10 @@ owns the whole sequence and holds one lock across all of it.
      rely on the other two signals.
    - **Uptime.** The clock starts at the first USB disconnect after the
      harness's reboot command, which leaves Android's variable shutdown time
-     out of it. Any fastboot enumeration the harness didn't plan counts as an
+     out of it. On the `adb reboot` path, [amendment
+     A1](#amendment-a1-the-adb-path-uptime-clock) replaces this with the old
+     kernel's reset, because river's USB gadget drops seconds before the
+     reset. Any fastboot enumeration the harness didn't plan counts as an
      extra boot. At boot completion, `/proc/uptime` must be at least the time
      since that disconnect, minus a bootloader allowance A set by calibration:
      - A must be at least the longest normal bootloader pass calibration
@@ -821,3 +824,66 @@ Round-10 notes from Opus, to apply during implementation:
   branches.
 - The "tag pushed, then host killed" control uses stubbed `gh` and
   `git ls-remote`, never real tags.
+
+## Amendment A1: the adb-path uptime clock
+
+Status: approved with conditions in council code review round 1 (Opus and
+Gemini approved; Sol objected to the first wording, and the conditions below
+answer that objection). It changes only the uptime signal on the `adb reboot`
+path. The fastboot path, the kernel-log chain and the boot count are
+unchanged.
+
+**Why.** The first baseline (`baseline-1`, 2026-11-23) showed that river's
+USB gadget drops several seconds before the kernel resets. A clock that
+starts at the USB disconnect still contains a variable shutdown tail:
+16.4-16.7 s for the measured "bootloader pass" during step 1, 20.6 s for the
+first reboot after a wipe, and 14.8 s later on the baseline build. An injected
+extra bootloader pass adds only 2.3-4.3 s, so no allowance A separates a
+normal boot from one with an extra pass. Anchored at the old kernel's reset
+instead, three adb reboots measured 10.003-10.012 s, and an injected pass
+13.80 s.
+
+**The rule.** On the adb path the uptime clock starts at the old kernel's
+reset, mapped onto host time:
+
+1. **One clock on both sides.** When the harness writes the leaving marker to
+   `/dev/kmsg`, it brackets the write with host monotonic time and reads the
+   marker's own printk timestamp back from `dmesg` straight away. That pairs
+   host time with printk time. `/proc/uptime` (`CLOCK_BOOTTIME`) is not used
+   for the pairing, because printk uses `local_clock`. A write that takes
+   longer than 0.3 s is retried; if it can't be bracketed or read back, the
+   boot has no pairing and its uptime signal is UNVERIFIED.
+2. **Bit flips can't move the anchor later.** At the next boot completion,
+   the previous kernel's log in pstore gives the reset time: the last
+   timestamp after the marker that ends 3 consecutive non-decreasing stamps
+   spanning at most 1 s. A flipped stamp that still parses (120 → 128,
+   41.1 → 45.1) breaks the run, so it is ignored, and the anchor can only
+   move earlier. The anchor must not precede the marker. Its host time must
+   fall between the USB disconnect and the disconnect plus the largest
+   shutdown tail calibration measured, allowing for the pairing's
+   uncertainty. Of the possible host times, the earliest is used. Anything
+   ambiguous or out of bounds is UNVERIFIED.
+3. **Only with a passing chain.** The anchor is used only when that boot's
+   chain verdict is PASS, so the matching leaving marker is in that same log.
+   The adb path never falls back to the disconnect clock: without an anchor,
+   its uptime signal is UNVERIFIED (an unplanned fastboot enumeration is still
+   a FAIL).
+4. **Enumeration window.** The unplanned-enumeration window starts at the
+   recorded disconnect event itself, not at an event-list index sampled after
+   the wait for the disconnect returns.
+5. **Fastboot path.** Unchanged: its clock starts at the disconnect after the
+   final `fastboot reboot`, which is stable (10.01-10.08 s).
+
+**Calibration.** Step 1 (`phone-qa boot-timing`) sets A on the adb path only
+from reboots that got an anchor, and records their shutdown tails
+(disconnect to reset); the largest is the bound in rule 2. The proofs are as
+before: a normal boot must pass and an injected extra pass must be rejected
+by the uptime check itself, both on the anchored clock.
+
+**Cost.** The adb-path uptime signal now depends on a readable pstore log,
+so it is less independent of the kernel-log chain than before. The boot count
+is still independent of both.
+
+**Phone runs still needed.** Re-run step 1 on the phone: a normal first boot
+after a wipe, later adb boots, and both injected controls on each path.
+

@@ -32,6 +32,7 @@ wrap the commands in `scripts/device-lock`:
 
 ```sh
 S=.repo/manifests/scripts
+$S/build --batch <id>                   # build ID "<id>-<commit set hash>"; refuses a dirty tree
 $S/phone-qa stage <id> [--kind batch|baseline|calibration|experiment] [--experiment]
 $S/flash --batch <id> --wipe            # hash checks, slot pair, first-boot evidence
 $S/bench/device-bench current --boots 1 --batch <id>
@@ -41,11 +42,26 @@ $S/phone-setup --wifi SSID_FILE PSK_FILE
 $S/phone-qa --batch <id>
 ```
 
+For `--kind batch`, `stage` refuses a build that isn't tied to the batch: the
+build ID must be `<id>-<commit set hash>` in both `build.prop` files, never
+`unstamped`, and the commit set must cover every zrm625 fork and the manifest
+at clean commits. A new `flash --batch` starts a new flash attempt:
+`device-bench` and `phone-qa` then use only that attempt's bench rows.
+
 `phone-qa --batch` exits 0 only if every required check passed. It writes
 `$BENCH_HOME/qa/runs/<run-id>/results.json` and `report.html`. The tester
 merges only when the exit code is 0, `eligible` is `true`, the mode is
 `batch`, and the batch ID matches. Exit 1 means a check FAILed. Exit 2 means
 at least one check is UNVERIFIED.
+
+`eligible` is `true` only if all of these hold: batch mode with the full
+check set; `batch.json` kind `batch` with `experiment: false`;
+`ro.config.low_ram` read successfully and not enabled (Android's boolean
+values: `1`, `y`, `yes`, `on`, `true`); every required check PASS, and every
+helper check reports a terminal helper result; `thresholds.json` says
+`calibrated: true`; 5 clean `--calibrate` runs and every control qualified,
+both for the current harness version (`phone-qa version`). Any failed or
+incomplete diagnostic read is UNVERIFIED, never PASS.
 
 After a FAIL or UNVERIFIED result, roll the phone back to the known-good slot
 with `flash --rollback`. Rollback wipes data, so run `phone-setup` after it.
@@ -56,7 +72,7 @@ with `flash --rollback`. Rollback wipes data, so run `phone-setup` after it.
 | --- | --- | --- |
 | `phone-qa --quick [--wait]` | Health group on the live phone | never |
 | `phone-qa --batch ID` | Every check | if all pass and the controls qualified |
-| `phone-qa --batch ID --only X,Y` / `--skip X,Y` | A subset (check IDs or groups) | never |
+| `phone-qa --batch ID --only X,Y` / `--skip X,Y` | A subset (check IDs or groups). Preflight always runs and can't be skipped. | never |
 | `phone-qa --calibrate --batch ID` | Every check; regression only records | never |
 | `phone-qa --baseline --batch ID` | Identity and health only; on a clean run writes `known-good.json` and closes the baseline pair | never |
 | `phone-qa --control NAME --batch ID` | One deliberately broken run from the control set | never |
@@ -77,7 +93,11 @@ The steps run in this order (DESIGN.md, "Calibration and bootstrap"):
 
 1. `phone-qa boot-timing` on the running build, with no flash. It writes
    `$BENCH_HOME/qa/boot-timing.json`. Until both proofs pass for a reboot
-   path, the uptime signal on that path is UNVERIFIED.
+   path, the uptime signal on that path is UNVERIFIED. On the adb path the
+   clock starts at the old kernel's reset ([amendment
+   A1](DESIGN.md#amendment-a1-the-adb-path-uptime-clock)); only reboots that
+   got a reset anchor set A, and their largest shutdown tail becomes the bound
+   for every later anchor. Changing this file changes the harness version.
 2. The baseline: build `river-22.2` HEAD with `scripts/build`, then:
 
    ```sh
@@ -96,36 +116,76 @@ The steps run in this order (DESIGN.md, "Calibration and bootstrap"):
    with `flash --rollback`, then run the baseline again.
 3. Perch calibration: `phone-qa --calibrate` five times on one flash of the
    Perch candidate. Not done in stage 1.
-4. Thresholds: write the calibrated values into `thresholds.json`. They never
-   go below the hard floors in `features.FLOORS`.
+4. Thresholds: write the calibrated values into `thresholds.json` and set
+   `"calibrated": true`. They never go below the hard floors in
+   `features.FLOORS`. This changes the harness version, so run
+   `phone-qa --calibrate` five more times: the gate needs `calibrated: true`
+   and 5 clean (exit 0, full set) `--calibrate` runs recorded for the current
+   harness version in `$BENCH_HOME/qa/calibration.json`.
 5. Controls: run every control in `phone-qa controls`. Until all of them
    qualify for the current harness version, every run reports
-   `eligible: false` with "controls not qualified".
+   `eligible: false` with "controls not qualified". A control qualifies only
+   if its fault was really injected (the run's injection marker names it) and
+   a target check reached the expected state; `controls.json` stores both,
+   with each target's summary. Most controls are one command,
+   `phone-qa --control NAME --batch ID`, on a calibration batch. The rest:
 
-## Known issue: the uptime clock on the adb reboot path
+   - `extra-reboot-first-boot`: `RIVERQA_CONTROL=extra-reboot-first-boot
+     flash --batch ID --wipe`, then `device-bench current --boots 1 --batch
+     ID`, then `phone-qa --control extra-reboot-first-boot --batch ID`.
+   - `extra-reboot-bench`: a normal `flash --batch ID --wipe`, then
+     `RIVERQA_CONTROL=extra-reboot-bench device-bench current --boots 1
+     --batch ID`, then `phone-qa --control extra-reboot-bench --batch ID`.
+     Both reboot the phone with adb before boot completes and record that in
+     `batch.json` (`control_injections`). `flash` and `device-bench` refuse
+     `RIVERQA_CONTROL` on a kind `batch`.
+   - `killed-mid-check`: start `phone-qa --calibrate --batch ID`, kill it
+     during a feature check, then run `phone-qa --control killed-mid-check
+     --batch ID`. It qualifies only if journal recovery restored the killed
+     run's leftovers and the second run is clean.
+   - `tag-pushed-host-killed`: `phone-qa --control tag-pushed-host-killed
+     --batch ID` runs `flash --recover` against a scratch `$BENCH_HOME` with
+     stubbed `gh` and `git ls-remote`; no phone.
+   - The four `boot-timing-*` controls come from step 1.
 
-Found during the first baseline (`baseline-1`, 2026-11-23); it needs a
-council decision before the baseline can close.
+## The uptime clock on the adb reboot path (amendment A1)
 
-The design starts the uptime clock at the first USB disconnect after the
-reboot command, assuming that leaves Android's shutdown out. On river the USB
-gadget drops several seconds before the kernel resets, so the measured
-"bootloader pass" on the `adb reboot` path still includes a variable shutdown
-tail: 16.4-16.7 s during step 1 on the Perch build, but 20.6 s for the first
-reboot after a wipe and 14.8 s later on the baseline build. An injected extra
-bootloader pass adds only 2.3-4.3 s, so no allowance A separates them, and
-bench boot 1 of `baseline-1` FAILed `health.boot_signals` on uptime alone
-(its kernel-log chain and boot count were clean). The `fastboot` path is
-stable (10.01-10.08 s), because its clock starts at the bootloader's own
-reboot.
+The first baseline (`baseline-1`, 2026-11-23) showed that the USB gadget
+drops several seconds before the kernel resets, so a clock that starts at the
+USB disconnect includes a variable shutdown tail, and no allowance A could
+separate a normal boot from one with an extra bootloader pass. Amendment A1
+(DESIGN.md) starts the adb-path clock at the old kernel's reset instead:
 
-Measured alternative (`$BENCH_HOME/qa/anchor-experiment.json`): anchor the
-clock at the old kernel's reset instead. Read a (host time, uptime) pair when
-the leaving marker is written, take the last timestamp in the previous
-kernel's pstore log, and map it to host time. That pass was 10.003-10.012 s
-on three adb reboots, and an injected pass measured 13.80 s. The cost: the
-uptime signal then depends on a readable pstore log, which makes it less
-independent of the kernel-log chain.
+- the leaving marker's host write time is paired with its own printk
+  timestamp, read back from `dmesg`;
+- the reset is the last pstore timestamp after the marker that three
+  consecutive non-decreasing stamps within 1 s corroborate, so a bit flip
+  can't move it later;
+- it must fall between the USB disconnect and the disconnect plus the largest
+  calibrated shutdown tail;
+- it is used only when that boot's chain is PASS. Otherwise the adb-path
+  uptime signal is UNVERIFIED; it never falls back to the disconnect.
+
+The fastboot path keeps the disconnect clock (10.01-10.08 s, stable). The
+measurements behind the change are in `$BENCH_HOME/qa/anchor-experiment.json`.
+`boot-timing` has to be re-run on the phone before the new clock is usable.
+
+## Known issues
+
+- **The shutdown-tail bound comes from step 1 only.** The bound is the
+  largest tail among step 1's normal adb reboots. A later build with a longer
+  shutdown would make its anchors out of bounds, and its bench boots
+  UNVERIFIED (never PASS). If that happens, re-run `boot-timing` with more
+  normal reboots (`--normal N`).
+- **Camera-set approvals and the gh account.** The approval must be a
+  comment or review by `zrm625` on one of the batch's own PRs, naming the new
+  set on a line `approve camera set: 0,1,2`. `gh` on forge is logged in as
+  `zrm625`, so the check proves the account, not that Zak typed it.
+- **The test page changed.** The page script now writes a string only it can
+  produce (the token reversed) for the Brave check, so `qa/fixtures.json`
+  pins a new `page.html`. Copy it into `$BENCH_HOME/qa/fixtures/` (run
+  `qa/fixtures/make-fixtures`) before the first run of this version, or
+  preflight is UNVERIFIED.
 
 ## One-time host setup
 
@@ -163,7 +223,7 @@ independent of the kernel-log chain.
 | `qa/tests/` | Host-side unit tests (`unittest`) |
 | `$BENCH_HOME/batches/<id>/` | `batch.json`, staged images, `flash.json`, per-boot evidence under `boots/` |
 | `$BENCH_HOME/slot-state.json` | The slot pair and `known_good_slot` |
-| `$BENCH_HOME/qa/` | `known-good.json`, `boot-timing.json`, `controls.json`, `journal.json`, `wipes.jsonl`, `history.jsonl`, `runs/` |
+| `$BENCH_HOME/qa/` | `known-good.json`, `boot-timing.json`, `controls.json`, `calibration.json`, `journal.json`, `wipes.jsonl`, `history.jsonl`, `runs/` |
 
 ## Interfaces for the batch runner
 
@@ -173,16 +233,30 @@ independent of the kernel-log chain.
 - **`batch.json`.** `phone-qa stage` writes it. The schema is in the docstring
   of `lib/riverqa/stage.py`. The runner adds `prs`, `tag` and `tag_repos`
   when it opens PRs, so recovery can look them up. It also adds
-  `camera_set_change` when Zak approves a camera change. `flash` adds `pair`
-  and `first_boot_seconds`. `device-bench` appends to `bench_runs`.
+  `camera_set_change` (`url` of Zak's comment or review on one of the
+  batch's PRs, and the new `set`) when Zak approves a camera change. `flash`
+  adds `pair`, `first_boot_seconds` and `flash_attempt`, and moves the old
+  `bench_runs` to `prior_bench_runs` at every new attempt. `device-bench`
+  appends to `bench_runs`. Control runs add `control_injections`.
 - **`slot-state.json`.** `flash` owns it (schema in `lib/riverqa/slots.py`).
   The runner uses `flash --recover` at the start of every batch, then
   `flash --rollback` after a FAIL, UNVERIFIED, experiment or calibration run,
   and `flash --promote <id>` after it has durably merged and tagged a batch.
-  `flash` exits 3 when the pipeline must halt for Zak, and 4 when a boot
-  failed and the phone was rescued back to the known-good slot.
-- **`known-good.json`.** `phone-qa --baseline` seeds it. After a clean tag,
-  the tester updates it with `regression.update_on_tag()`.
+  `--promote` itself looks the batch up the way `--recover` does and releases
+  the fallback only if every PR is merged and every repo has the tag at the
+  merge commit; a baseline pair is never promoted (`phone-qa --baseline`
+  closes it). A closed baseline's seed is saved in `slot-state.json` in the
+  same write as the slot change; if `known-good.json` didn't follow, no batch
+  may flash until `flash --recover` finishes it. `flash` exits 3 when the
+  pipeline must halt for Zak (including a guard failure during rescue or
+  rollback), and 4 when a boot failed and the phone was rescued back to the
+  known-good slot.
+- **`known-good.json`.** `phone-qa --baseline` seeds it, including the
+  immutable `calibration_seed` that the harness version hashes. After a
+  clean tag, the tester updates it with `regression.update_on_tag()`.
+- **The target phone.** The serial `ZY225DPT7F` is fixed in the code;
+  `BENCH_DEVICE` may only repeat it. Every reboot command checks the phone
+  (adb) or bootloader (fastboot) reports `river` first.
 - **Rerun once.** A spurious extra-boot FAIL (this phone has reset on its
   own) is settled by rerunning the batch once. That rule belongs to
   `change batch`.
