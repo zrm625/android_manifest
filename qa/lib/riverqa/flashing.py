@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -19,7 +21,7 @@ STATE_FILE = "slot-state.json"
 FIRST_BOOT_TIMEOUT = 900
 BOOT_TIMEOUT = 600
 
-EXIT_OK, EXIT_ERROR, EXIT_HALT, EXIT_RESCUED = 0, 1, 3, 4
+EXIT_OK, EXIT_ERROR, EXIT_HALT, EXIT_RESCUED, EXIT_RESUMABLE = 0, 1, 3, 4, 75
 
 
 class Halt(RuntimeError):
@@ -723,7 +725,12 @@ def flash_batch(batch_id: str, images_dir: Path | None, wipe: bool) -> int:
         attempt["result"] = f"bootloader fell back to slot {slot_now}; batch failed"
         save_attempt()
         try:
-            attempt["rescue"] = rollback(dev, st, f"bootloader fell back to slot {slot_now}", attempt["attempt_id"])
+            # I3: the same rescue path as a failed boot, so both exit-4 paths
+            # leave the same evidence (a "rescue:" rolled-back event whose wipe
+            # carries this attempt ID).
+            attempt["rescue"] = rescue(dev, st, f"batch {batch_id}: bootloader fell back to slot {slot_now}",
+                                       attempt["attempt_id"])
+            attempt["result"] = "rescued; batch failed"
             save_attempt()
             return EXIT_RESCUED
         except (Halt, Unreachable, GuardError) as h:
@@ -791,8 +798,26 @@ def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
         return EXIT_ERROR
     slugs = stage.repo_slugs()
     look = recovery.lookup(batch, runner, slugs)
-    decision, why = slots.decide_recovery(pair, look, batch, slugs)
+    # H11: a lookup that could not finish never touches the phone.
+    if look.outcome == recovery.TRANSPORT:
+        log(f"error: lookup failed in transport ({look.evidence}); nothing touched the phone. Run flash --promote "
+            f"{batch_id} again.")
+        return EXIT_RESUMABLE
+    if look.outcome != recovery.OK:
+        log(f"error: lookup {look.outcome} ({look.evidence}); nothing touched the phone.")
+        print(json.dumps({"lookup": look.outcome, "repo": (look.evidence or {}).get("repo"),
+                          "evidence": look.evidence}), flush=True)
+        return EXIT_ERROR
+    decision, why = slots.decide_recovery(pair, look.data, batch, slugs)
     if decision != slots.PROMOTE:
+        lag = slots.landed_but_open(batch, look.data, slugs)
+        if lag:
+            # I4, Sol B2: GitHub still reports a PR open although river-22.2
+            # is at its merge ([base, tested head], tested tree): a lagging
+            # read, retried later, never a halt, tag or no tag.
+            log(f"error: {batch_id}: GitHub still reports {', '.join(lag)} open although its merge is on "
+                "river-22.2; not proven yet. Nothing touched the phone; run flash --promote again later.")
+            return EXIT_RESUMABLE
         log(f"error: {batch_id} is not proven merged and tagged ({why}). The fallback slot stays reserved.")
         return EXIT_HALT if decision == slots.HALT else EXIT_ERROR
     dev = dev or Device(SERIAL)
@@ -812,6 +837,14 @@ def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
                                want=fbmode.Want(target, (bid, bid), hash_boot=True)).proof
     except (RuntimeError, TimeoutError) as e:
         return promote_halt(e, batch_id, target, pair["fallback"])
+    # I11: the merge commits this proof read go into batch.json first, so
+    # known-good.json can be written later from local files alone.
+    rec = read_json(batch_dir(batch_id) / "batch.json") or {}
+    rec["promotion"] = {"at": now_iso(), "merge_commits": {
+        path: p["merge_commit"] for path, e in sorted((slots.frozen_pr_set(batch) or {}).items())
+        if e.get("number") is not None
+        for p in look.data["prs"] if (p["repo"], p["number"]) == (e["repo"], e["number"])}}
+    write_json(batch_dir(batch_id) / "batch.json", rec)
     slots.promote(st, batch_id, proof.build_ids[0], proof.boot_sha, now_iso())
     save_state(st)
     log(f"Promoted {batch_id} ({why}): known_good_slot is now {target}")
@@ -845,9 +878,9 @@ def merge_started(batch_id: str) -> int:
         if not frozen:
             log(f"error: {batch_id}'s merge_started has no expected PR set; recovery will halt")
             return EXIT_ERROR
-        if expected != frozen:
+        if expected != frozen or (batch.get("base") and ms.get("base") != batch["base"]):
             log(f"error: {batch_id}'s PR record changed after merge_started: "
-                + ("; ".join(errs) if errs else "a different PR set"))
+                + ("; ".join(errs) if errs else "a different PR set or base"))
             return EXIT_ERROR
     else:
         if expected is None:
@@ -855,6 +888,9 @@ def merge_started(batch_id: str) -> int:
                 "or no_pr before merging: " + "; ".join(errs[:8]))
             return EXIT_ERROR
         batch["merge_started"] = {"at": now_iso(), "expected_prs": expected}
+        if batch.get("base"):
+            # Sol B2: the base each merge commit's first parent must be.
+            batch["merge_started"]["base"] = dict(batch["base"])
         write_json(path, batch)
     n = sum(1 for e in batch["merge_started"]["expected_prs"].values() if e["number"] is not None)
     log(f"merge_started for {batch_id} at {batch['merge_started'].get('at')} ({n} PRs expected)")
@@ -940,8 +976,19 @@ def recover(runner=None, dev: Device | None = None) -> int:
     pair = st["pair"]
     batch = read_json(batch_dir(pair["batch"]) / "batch.json", {}) or {}
     slugs = stage.repo_slugs() if pair["kind"] == "batch" else {}
-    look = None if pair["kind"] != "batch" else recovery.lookup(batch, runner, slugs)
+    look = None
+    if pair["kind"] == "batch":
+        typed = recovery.lookup(batch, runner, slugs)
+        # Any outcome but ok is today's failed lookup (H11): it halts.
+        look = typed.data if typed.outcome == recovery.OK else None
     decision, why = slots.decide_recovery(pair, look, batch, slugs)
+    if decision == slots.HALT and look is not None:
+        lag = slots.landed_but_open(batch, look, slugs)
+        if lag:
+            # Sol B2: the same lag rule as flash --promote: retry later, never halt.
+            log(f"Recovery for {pair['batch']}: GitHub still reports {', '.join(lag)} open although its merge "
+                "is on river-22.2; nothing touched the phone. Run flash --recover again later.")
+            return EXIT_RESUMABLE
     log(f"Recovery for {pair['batch']} ({pair['kind']}): {decision}: {why}")
     st.setdefault("history", []).append({"event": "recovery-decision", "at": now_iso(),
                                          "batch": pair["batch"], "decision": decision, "why": why})
@@ -962,6 +1009,32 @@ def recover(runner=None, dev: Device | None = None) -> int:
         return EXIT_OK
     except (RuntimeError, TimeoutError) as e:    # R6-1: every failure halts, obligation intact
         return recovery_halt(e)
+
+
+def runner_owned_pair(lock: DeviceLock, zak: bool) -> str | None:
+    """H12: why flash --rollback or --recover must refuse, or None. While
+    slot-state.json holds a pair whose batch is the batch runner's
+    running.id, only the runner may resolve it: RIVER_BATCH_ID names that
+    batch and the device lock was reused through a matching token (the
+    runner's holder holds it, so ``not lock.owned``). ``--zak`` overrides.
+    An unreadable runner state file refuses (fail closed)."""
+    if zak:
+        return None
+    st = load_state()
+    pair = (st or {}).get("pair")
+    if not pair:
+        return None
+    from . import runnerstate
+    try:
+        rid = runnerstate.running_id(bench_path())
+    except runnerstate.Unreadable as e:
+        return f"{e}; the slot pair of {pair['batch']} may belong to a running batch (pass --zak to override)"
+    if rid != pair["batch"]:
+        return None
+    if os.environ.get("RIVER_BATCH_ID") == rid and not lock.owned:
+        return None
+    return (f"the slot pair of {rid} belongs to the running batch {rid}; the batch runner resolves it "
+            "(batch tick), or Zak with --zak")
 
 
 def show_status() -> int:
@@ -1002,6 +1075,10 @@ Usage:
                           The runner runs this before any merge or tag action.
   flash --status          Show slot-state.json.
 
+  --rollback and --recover refuse while the slot pair belongs to the batch the
+  runner is running ($BENCH_HOME/runner/state.json running.id), unless the
+  runner itself calls them (RIVER_BATCH_ID and its lock token), or --zak.
+
   baseline|stripped  Use $BENCH_HOME/out-<env>/target/product/river.
   PRODUCT_DIR        Any directory with boot.img, dtbo.img, system.img and vendor.img.
   --wipe       Factory reset (fastboot erase userdata; river's bootloader rejects -w).
@@ -1041,6 +1118,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--promote")
     ap.add_argument("--merge-started")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--zak", action="store_true")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args(argv)
     if a.help:
@@ -1051,7 +1129,7 @@ def main(argv: list[str]) -> int:
     try:
         # --merge-started and --promote time nothing, so they may run while a
         # build holds the build lock (R6-5).
-        with DeviceLock(check_build=not (a.merge_started or a.promote)):
+        with DeviceLock(check_build=not (a.merge_started or a.promote)) as lock:
             # Slot recovery dispatches first (R5-1): --rollback and --recover
             # handle fb_mode themselves, in fastboot, on the way to the slot
             # they pick, and never boot the active slot (it may be the failed
@@ -1065,6 +1143,11 @@ def main(argv: list[str]) -> int:
                 if st and st.get("pair"):
                     log(f"error: batch {st['pair']['batch']} holds an unresolved slot pair; resolve it first "
                         "(flash --recover)")
+                    return EXIT_ERROR
+            if a.rollback or a.recover:
+                why = runner_owned_pair(lock, a.zak)
+                if why:
+                    log(f"error: {why}")
                     return EXIT_ERROR
             if a.rollback:
                 st = load_state()

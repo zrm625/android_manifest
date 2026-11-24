@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
-# Merge each fork's upstream branch into river-22.2.
+# Merge each fork's upstream branch into a topic branch for the queue.
 #
-# Usage: merge-upstream [--push] [PROJECT_PATH...]
+# Usage: merge-upstream [PROJECT_PATH...]
 #
-# With no paths, merges every project in the zrm625-fork group. The upstream repo
-# and branch come from the UPSTREAM_REPO and UPSTREAM_BRANCH annotations in
-# default.xml. Without --push, results stay local so you can build and test first;
-# push later with `git push zrm625 river-22.2` in each project, or rerun with --push.
-# A project with uncommitted changes or a merge conflict is skipped and reported.
+# First run `change start upstream-YYYYMM`: this merges upstream into that
+# topic branch, never into river-22.2 (it refuses on river-22.2). Then build
+# and test, `change pr`, the council, and `batch enqueue`: upstream merges go
+# through the same queue as every change (qa/RUNNER.md H4). With no paths, it
+# merges every project in the zrm625-fork group. The upstream repo and branch
+# come from the UPSTREAM_REPO and UPSTREAM_BRANCH annotations in default.xml.
+# A project with uncommitted changes or a merge conflict is skipped and
+# reported. It takes the build lock for its whole run and refuses while the
+# batch runner has a batch running or a tree lease.
 set -euo pipefail
 source "$(dirname "$(realpath "$0")")/common.sh"
 
 if [[ "${1:-}" == "--one" ]]; then
-  push=$2
   : "${REPO__UPSTREAM_REPO:?project has no UPSTREAM_REPO annotation; run setup-forks}"
   : "${REPO__UPSTREAM_BRANCH:?project has no UPSTREAM_BRANCH annotation}"
   if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
@@ -20,10 +23,13 @@ if [[ "${1:-}" == "--one" ]]; then
     exit 1
   fi
   git remote get-url lineage >/dev/null 2>&1 || { echo "$REPO_PATH: no lineage remote; run setup-forks"; exit 1; }
+  topic=$(git symbolic-ref --short -q HEAD || true)
+  if [[ -z "$topic" || "$topic" == "$FORK_BRANCH" || "$topic" != upstream-* ]]; then
+    echo "$REPO_PATH: REFUSED, on '${topic:-detached}': run \`change start upstream-YYYYMM\` first; upstream never merges into $FORK_BRANCH directly"
+    exit 1
+  fi
   git fetch --quiet "$FORK_REMOTE" "$FORK_BRANCH"
   git fetch --quiet lineage "$REPO__UPSTREAM_BRANCH"
-  git checkout --quiet "$FORK_BRANCH"
-  git merge --quiet --ff-only "$FORK_REMOTE/$FORK_BRANCH"
   upstream_ref="lineage/$REPO__UPSTREAM_BRANCH"
   # Checkouts made with `repo init --depth=1` lack the history a merge needs.
   # Deepen until the fork and upstream share a commit.
@@ -42,26 +48,24 @@ if [[ "${1:-}" == "--one" ]]; then
   count=$(git rev-list --count "HEAD..$upstream_ref")
   if [[ "$count" == 0 ]]; then
     echo "$REPO_PATH: up to date with $REPO__UPSTREAM_REPO $REPO__UPSTREAM_BRANCH"
-  elif git merge --quiet --no-edit -m "Merge $REPO__UPSTREAM_REPO $REPO__UPSTREAM_BRANCH into $FORK_BRANCH" "$upstream_ref"; then
+  elif git merge --quiet --no-edit -m "Merge $REPO__UPSTREAM_REPO $REPO__UPSTREAM_BRANCH into $topic" "$upstream_ref"; then
     echo "$REPO_PATH: merged $count upstream commits"
   else
     git merge --abort 2>/dev/null || true
     echo "$REPO_PATH: CONFLICT, merge aborted. Resolve by hand: git merge $upstream_ref"
     exit 1
   fi
-  if [[ "$push" == 1 ]]; then
-    git push --quiet "$FORK_REMOTE" "$FORK_BRANCH"
-    echo "$REPO_PATH: pushed to $FORK_REMOTE/$FORK_BRANCH"
-  fi
   exit 0
 fi
 
-push=0
-if [[ "${1:-}" == "--push" ]]; then push=1; shift; fi
-
+if [[ "${1:-}" == "--push" ]]; then
+  echo "error: --push is gone: upstream merges go through change pr, the council and the batch queue" >&2; exit 1
+fi
+acquire_build_lock
+refuse_while_batch
 cd "$TOP"
 if [[ $# -gt 0 ]]; then
-  "$REPO" forall "$@" -c "$(realpath "$0")" --one "$push"
+  "$REPO" forall "$@" -c "$(realpath "$0")" --one
 else
-  "$REPO" forall -g "$FORK_GROUP" -c "$(realpath "$0")" --one "$push"
+  "$REPO" forall -g "$FORK_GROUP" -c "$(realpath "$0")" --one
 fi

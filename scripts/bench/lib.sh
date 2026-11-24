@@ -18,21 +18,30 @@ tree_for() {
   esac
 }
 
-# One build at a time, whether a dev build or a benchmark. Two at once would
-# overload the machine and make any timing meaningless.
-acquire_build_lock() {
-  mkdir -p "$BENCH_HOME"
-  exec 9>"$BENCH_HOME/.lock"
-  flock -n 9 || { echo "error: another build is running" >&2; exit 1; }
-}
+# acquire_build_lock (one build at a time) is in common.sh (H1).
 
-# Build the pinned image if needed and set IMAGE.
+# The image tag for the pinned Containerfile.
+image_tag() { echo "lineageos-bench:$(sha256sum "$BENCH_DIR/Containerfile" | cut -c1-12)"; }
+
+# Build the pinned image if needed, then resolve the tag to an image ID once
+# (H1): IMAGE is that ID, so every container of this build runs exactly the
+# image that was checked. With RIVER_IMAGE_ID set (the batch runner's pin),
+# the tag must already resolve to it: nothing is built, and a different or
+# missing image is refused.
 ensure_image() {
-  IMAGE="lineageos-bench:$(sha256sum "$BENCH_DIR/Containerfile" | cut -c1-12)"
-  if ! podman image exists "$IMAGE"; then
-    echo "Building $IMAGE"
-    podman build -t "$IMAGE" -f "$BENCH_DIR/Containerfile" "$BENCH_DIR"
+  IMAGE_TAG=$(image_tag)
+  if [[ -n "${RIVER_IMAGE_ID:-}" ]]; then
+    IMAGE=$(podman image inspect --format '{{.Id}}' "$IMAGE_TAG" 2>/dev/null || true)
+    [[ "$IMAGE" == "$RIVER_IMAGE_ID" ]] \
+      || { echo "error: build image $IMAGE_TAG is ${IMAGE:-missing}, not the pinned $RIVER_IMAGE_ID" >&2; exit 1; }
+    return 0
   fi
+  if ! podman image exists "$IMAGE_TAG"; then
+    echo "Building $IMAGE_TAG"
+    podman build -t "$IMAGE_TAG" -f "$BENCH_DIR/Containerfile" "$BENCH_DIR"
+  fi
+  IMAGE=$(podman image inspect --format '{{.Id}}' "$IMAGE_TAG")
+  [[ -n "$IMAGE" ]] || { echo "error: cannot resolve $IMAGE_TAG to an image ID" >&2; exit 1; }
 }
 
 # run_build TREE OUT TARGET JOBS CCACHE(0|1) LOG [INSTALLCLEAN(0|1)]

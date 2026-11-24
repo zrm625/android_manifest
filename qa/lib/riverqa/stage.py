@@ -72,12 +72,20 @@ def bootimage_prop_file(product: Path) -> Path:
     return product / "obj/ETC/ramdisk-build.prop_intermediates/ramdisk-build.prop"
 
 
+def parse_camera_set(text: str | None) -> list[int]:
+    """The enabled camera IDs in the switch file's text (H13). None (no
+    file) is the bootstrap set. Pure, so the batch runner applies the same
+    rule to a file read from GitHub."""
+    if text is None:
+        return list(BOOTSTRAP_CAMERAS)
+    return sorted(int(x) for x in text.split() if x.strip().isdigit())
+
+
 def camera_set(tree: Path = TOP) -> dict:
     f = tree / CAMERA_SWITCH_FILE
     if f.exists():
-        ids = sorted(int(x) for x in f.read_text().split() if x.strip().isdigit())
-        return {"set": ids, "source": CAMERA_SWITCH_FILE}
-    return {"set": list(BOOTSTRAP_CAMERAS), "source": "bootstrap"}
+        return {"set": parse_camera_set(f.read_text()), "source": CAMERA_SWITCH_FILE}
+    return {"set": parse_camera_set(None), "source": "bootstrap"}
 
 
 UNSTAMPED = "unstamped"

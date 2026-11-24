@@ -1,0 +1,17 @@
+{
+  "comment": "build.prop keys (regexes, full match from the line start) that differ between identical builds (R14.2). A runner_build input.",
+  "props": [
+    "ro\\.([a-z_]+\\.)?build\\.date(\\.utc)?",
+    "ro\\.([a-z_]+\\.)?build\\.fingerprint",
+    "ro\\.([a-z_]+\\.)?build\\.version\\.incremental",
+    "ro\\.([a-z_]+\\.)?build\\.id",
+    "ro\\.([a-z_]+\\.)?build\\.display\\.id",
+    "ro\\.([a-z_]+\\.)?build\\.description",
+    "ro\\.build\\.host",
+    "ro\\.build\\.user",
+    "ro\\.river\\.build_id",
+    "ro\\.vendor\\.river\\.build_id",
+    "ro\\.lineage\\.(version|display\\.version|build\\.version)",
+    "ro\\.modversion"
+  ]
+}

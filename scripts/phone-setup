@@ -42,7 +42,10 @@ while (($#)); do
 done
 
 device_lock
-a() { adb -s "$SERIAL" "$@"; }
+# Every adb call has a deadline (Sol M9): a hung adb never holds the device
+# and build locks. The runner's holder also bounds the whole run.
+ADB_CALL_TIMEOUT=${ADB_CALL_TIMEOUT:-120}
+a() { timeout -k 10 "$ADB_CALL_TIMEOUT" adb -s "$SERIAL" "$@"; }
 # Read the whole output before filtering: closing a dumpsys pipe early sends
 # SIGPIPE to the service being dumped.
 sh_() { a shell "$@" 2>/dev/null | tr -d '\r'; }
@@ -59,19 +62,26 @@ until [[ "$(sh_ getprop sys.boot_completed)" == 1 ]]; do
   sleep 2
 done
 
-wifi_connected() { sh_ cmd wifi status | grep -q 'Wifi is connected to'; }
+# The SSID the phone is connected to, or nothing (H16).
+connected_ssid() { sh_ cmd wifi status | sed -n 's/^Wifi is connected to "\(.*\)".*$/\1/p' | head -1; }
+wifi_connected() { [[ -n "$(connected_ssid)" ]]; }
+want_ssid=''
+[[ -n "$ssid_file" ]] && want_ssid=$(<"$ssid_file")
+# With --wifi, Wi-Fi counts as set up only on the requested network (H16).
+wifi_ok() { if [[ -n "$want_ssid" ]]; then [[ "$(connected_ssid)" == "$want_ssid" ]]; else wifi_connected; fi; }
 
 # --- Wi-Fi ---------------------------------------------------------------
-if wifi_connected; then
-  echo "Wi-Fi: already connected"
+if wifi_ok; then
+  echo "Wi-Fi: already connected to \"$(connected_ssid)\""
 elif [[ -n "$ssid_file" ]]; then
+  [[ -n "$(connected_ssid)" ]] && echo "Wi-Fi: connected to \"$(connected_ssid)\", not the requested network; switching"
   # Quote each value for the phone's shell; keep the password out of output.
   q() { printf "'%s'" "$(sed "s/'/'\\\\''/g" <<<"$1")"; }
-  ssid=$(<"$ssid_file") psk=$(<"$psk_file")
-  a shell "cmd wifi connect-network $(q "$ssid") wpa2 $(q "$psk")" >/dev/null 2>&1 || true
+  psk=$(<"$psk_file")
+  a shell "cmd wifi connect-network $(q "$want_ssid") wpa2 $(q "$psk")" >/dev/null 2>&1 || true
   unset psk
-  for _ in $(seq 20); do wifi_connected && break; sleep 2; done
-  wifi_connected && echo "Wi-Fi: connected" || echo "Wi-Fi: not connected yet (the wizard page will offer it)"
+  for _ in $(seq 20); do wifi_ok && break; sleep 2; done
+  wifi_ok && echo "Wi-Fi: connected to \"$want_ssid\"" || echo "Wi-Fi: not connected to the requested network yet (the wizard page will offer it)"
 else
   echo "Wi-Fi: not connected (pass --wifi SSID_FILE PSK_FILE to connect)"
 fi
@@ -202,4 +212,8 @@ echo "  extra dim       $([[ "$dim" == 1 ]] && echo on || echo off)"
 echo "  location        $([[ "$(sh_ cmd location is-location-enabled)" == true ]] && echo on || echo off)"
 echo "  usage stats     $(sh_ 'content query --uri content://lineagesettings/secure --where "name=\"stats_collection\""' | grep -q 'value=0' && echo off || echo ON)"
 echo "  touch sounds    $([[ "$(sh_ settings get system sound_effects_enabled)" == 0 ]] && echo off || echo on)"
-echo "  wifi            $(wifi_connected && echo connected || echo 'not connected')"
+ssid_now=$(connected_ssid)
+echo "  wifi            ${ssid_now:+connected to \"$ssid_now\"}${ssid_now:-not connected}"
+if [[ -n "$want_ssid" && "$ssid_now" != "$want_ssid" ]]; then
+  echo "error: Wi-Fi is not connected to the requested network" >&2; exit 1
+fi

@@ -261,7 +261,8 @@ def run(a) -> int:
             if batch:
                 st = flashing.load_state()
                 try:
-                    flashing.rescue(dev, st, f"bench boot of {a.batch}: {e}")
+                    # H17: the rescue's wipe carries the flash attempt ID.
+                    flashing.rescue(dev, st, f"bench boot of {a.batch}: {e}", attempt["attempt_id"])
                     return flashing.EXIT_RESCUED
                 except (flashing.Halt, Exception) as h:  # noqa: BLE001 - halt on anything here
                     return flashing.recovery_halt(h)     # R7-5: the error: line and the obligation note

@@ -1,0 +1,31 @@
+{
+  "comment": "Runner qualification part 1 (qa/RUNNER.md R14.2). Same-size edits only where the design says same-size. A runner_build input.",
+  "B1": {
+    "edits": [
+      {"path": "device/motorola/river/audio/audio_ext_spkr.conf", "old": "name River", "new": "name Rivfr"},
+      {"path": "kernel/motorola/sdm632/drivers/misc/dropbox.c", "old": "forcing event [", "new": "forcing EVENT ["}
+    ],
+    "new_files": [
+      {"path": "device/motorola/river/configs/abtest-marker.txt", "content": "river batch runner A/B test\n"}
+    ],
+    "appends": [
+      {"path": "device/motorola/river/device.mk", "text": "\n# abtest (never pushed)\nPRODUCT_COPY_FILES += $(LOCAL_PATH)/configs/abtest-marker.txt:$(TARGET_COPY_OUT_VENDOR)/etc/abtest-marker.txt\n"}
+    ],
+    "expect_changed": ["vendor/etc/audio_ext_spkr.conf"],
+    "expect_new": ["vendor/etc/abtest-marker.txt"],
+    "kernel": {"old": "forcing event [", "new": "forcing EVENT ["}
+  },
+  "B2": {
+    "edits": [
+      {"path": "kernel/motorola/sdm632/arch/arm64/boot/dts/qcom/sdm632-river-common-overlay.dtsi",
+       "old": "haptic-context-gpio = <&tlmm 9 0>;", "new": "haptic-context-gpio = <&tlmm 9 1>;"}
+    ]
+  },
+  "B3": {
+    "edits": [
+      {"path": "kernel/motorola/sdm632/arch/arm64/configs/river_defconfig",
+       "old": "CONFIG_LOCALVERSION=\"-perf\"", "new": "CONFIG_LOCALVERSION=\"-perg\""}
+    ]
+  },
+  "B4": {"object": "drivers/misc/dropbox.o", "string": "forcing EVENT ["}
+}

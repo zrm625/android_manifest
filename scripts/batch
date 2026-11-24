@@ -1,0 +1,10 @@
+#!/usr/bin/env -S python3 -I
+# The river batch runner (qa/RUNNER.md). Standard library only; the code is in
+# qa/lib/riverbatch/. Run `batch --help` for the commands.
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "qa", "lib"))
+from riverbatch.cli import entry  # noqa: E402
+
+sys.exit(entry())

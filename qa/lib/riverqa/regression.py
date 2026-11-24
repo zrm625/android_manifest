@@ -149,14 +149,25 @@ def evaluate(boot_rows: list[dict], known_good: dict | None) -> Verdict:
 
 
 def baseline_record(tag: str | None, batch_id: str, commit_set: dict, run_ids: list[str],
-                    boot_rows: list[dict], cameras: list[int]) -> dict:
-    """known-good.json from the --baseline run: latest plus the seeded reference."""
+                    boot_rows: list[dict], cameras: list[int], existing: dict | None = None) -> dict:
+    """known-good.json from the --baseline run: latest plus the seeded reference.
+
+    H14: with an ``existing`` known-good.json (a re-baseline), its
+    ram_reference (value, tag, batch, run IDs) is kept when its median is
+    lower than this baseline's, with ``seed`` cleared, so a re-baseline never
+    raises the historical minimum. The new calibration_seed is written as
+    before."""
     rams = [mb(r["used_ram_kb"]) for r in boot_rows[:3]]
     med = median3(rams)
     if med is None:
         raise ValueError("the baseline needs exactly 3 measured boots")
     b1 = boot_rows[0]
     seed = {"batch": batch_id, "run_ids": run_ids, "median_mb": round(med, 3)}
+    ref = {"tag": tag, "batch": batch_id, "run_ids": run_ids, "median_mb": round(med, 3), "seed": "calibration"}
+    old = (existing or {}).get("ram_reference") or {}
+    if old.get("median_mb") is not None and float(old["median_mb"]) < med:
+        ref = {"tag": old.get("tag"), "batch": old.get("batch"), "run_ids": old.get("run_ids"),
+               "median_mb": old["median_mb"], "seed": None}
     return {
         # Immutable: the harness version hashes this, never ram_reference,
         # so retiring the seed at the first tag doesn't change the version.
@@ -167,8 +178,7 @@ def baseline_record(tag: str | None, batch_id: str, commit_set: dict, run_ids: l
             "system_used_kb": int(b1["system_used_kb"]), "vendor_used_kb": int(b1["vendor_used_kb"]),
             "cameras": sorted(cameras),
         },
-        "ram_reference": {"tag": tag, "batch": batch_id, "run_ids": run_ids,
-                          "median_mb": round(med, 3), "seed": "calibration"},
+        "ram_reference": ref,
     }
 
 

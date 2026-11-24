@@ -11,16 +11,24 @@
 #                                Push NAME in every repo that has commits on it,
 #                                open or update a PR there (base river-22.2),
 #                                and list all the PRs of the change in each one.
-#   change merge [NAME]          Check every PR of the change is open and
-#                                mergeable, merge them all (merge commits),
-#                                delete the branches, and fast-forward the local
-#                                river-22.2 in every repo.
+#   change merge NAME --record FILE
+#                                Merge a council-reviewed, tooling-only manifest
+#                                PR at its reviewed head (qa/RUNNER.md R5.8, H4).
+#                                Refused without --record, for any fork PR, and
+#                                for any path outside qa/, scripts/, workspace/
+#                                and *.md other than CHARTER.md. Image changes
+#                                never merge here: they end at `batch enqueue`.
 #   change tag TAG [-m MESSAGE]  Tag river-22.2 in every repo as TAG and push it.
 #
 # NAME defaults to the topic branch checked out in the repos, if there is
 # exactly one. Repos are the forks in the zrm625-fork group plus the manifest
 # (.repo/manifests). Commit in each repo as usual; this script only handles
 # branches, pull requests and merges. It never pushes to river-22.2 directly.
+#
+# start, pr, merge and tag take the build lock for their whole run (busy: exit
+# 1, "a build or batch is running") and refuse while the batch runner has a
+# batch running or a tree lease (qa/RUNNER.md R6.5). So `change pr` never
+# pushes to a branch while a batch runs.
 set -euo pipefail
 source "$(dirname "$(realpath "$0")")/common.sh"
 
@@ -154,45 +162,29 @@ ${set//$url/$url (this PR)}"
 }
 
 cmd_merge() {
-  local name; name=$(resolve_name "${1:-}")
-  local plan; plan=$(mktemp); trap 'rm -f "$plan"' RETURN
-  local bad=0
-  while read -r path remote base slug; do
-    has_branch "$path" "$name" || continue
-    local n url state mergeable
-    n=$(ahead "$path" "$remote" "$name")
-    git -C "$path" fetch -q "$remote" "$name" 2>/dev/null || true
-    url="" state="" mergeable=""
-    read -r url state mergeable < <(pr_json "$slug" "$name" '[.[] | select(.state == "OPEN")][0] | select(.) | "\(.url) \(.state) \(.mergeable)"') || true
-    if [[ "$n" == 0 && -z "${url:-}" ]]; then echo "$path $remote $base -" >> "$plan"; continue; fi
-    if [[ -z "${url:-}" ]]; then echo "  $(short "$path"): $n commits but no open PR (run change pr)" >&2; bad=1; continue; fi
-    if [[ "$(git -C "$path" rev-parse "$name")" != "$(git -C "$path" rev-parse "$remote/$name" 2>/dev/null)" ]]; then
-      echo "  $(short "$path"): local $name differs from the pushed branch (run change pr)" >&2; bad=1; continue
-    fi
-    # GitHub computes mergeability lazily; ask again for a few seconds.
-    for _ in 1 2 3 4 5; do
-      [[ "$mergeable" != UNKNOWN ]] && break
-      sleep 2; mergeable=$(ghq pr view "$url" --json mergeable --jq .mergeable)
-    done
-    if [[ "$mergeable" != MERGEABLE ]]; then echo "  $url is $mergeable" >&2; bad=1; continue; fi
-    echo "$path $remote $base $url" >> "$plan"
-  done < <(repos)
-  [[ "$bad" == 0 ]] || die "nothing merged. Fix the above and run change merge $name again."
-  grep -q 'https://' "$plan" || die "no open PRs for $name"
-
-  while read -r path remote base url; do
-    if [[ "$url" != - ]]; then
-      ghq pr merge "$url" --merge >/dev/null
-      git -C "$path" push -q "$remote" --delete "$name" 2>/dev/null || true
-      echo "  merged  $url"
-    fi
-    git -C "$path" fetch -q "$remote" "$FORK_BRANCH"
-    [[ "$(git -C "$path" symbolic-ref --short -q HEAD || true)" == "$name" ]] && git -C "$path" checkout -q "$base"
-    git -C "$path" merge -q --ff-only "$remote/$FORK_BRANCH" 2>/dev/null \
-      || git -C "$path" branch -q -f "$base" "$remote/$FORK_BRANCH" 2>/dev/null || true
-    git -C "$path" branch -q -D "$name"
-  done < "$plan"
-  echo "Done. Every repo is back on river-22.2 with the change merged."
+  local name="" record=""
+  [[ $# -gt 0 && "$1" != -* ]] && { name=$1; shift; }
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --record) [[ $# -ge 2 && -n "$2" ]] || die "--record needs a FILE"; record=$2; shift ;;
+      *) usage 1 ;;
+    esac
+    shift
+  done
+  # G-C2: without a council record nothing merges here, in any repo.
+  [[ -n "$record" ]] || die "change merge needs --record FILE: it merges only a council-reviewed, tooling-only manifest PR. Image changes go through the council and \`batch enqueue\`."
+  [[ -n "$name" ]] || die "change merge NAME --record FILE: pass NAME"
+  python3 -I "$QA_LIB/riverbatch/tooling.py" "$name" "$record" || die "nothing merged."
+  local m="$TOP/.repo/manifests"
+  git -C "$m" fetch -q origin "$FORK_BRANCH"
+  if [[ "$(git -C "$m" symbolic-ref --short -q HEAD || true)" == "$name" ]]; then
+    git -C "$m" checkout -q default
+  fi
+  if [[ "$(git -C "$m" symbolic-ref --short -q HEAD || true)" == default && -z "$(git -C "$m" status --porcelain)" ]]; then
+    git -C "$m" merge -q --ff-only "origin/$FORK_BRANCH" || true
+  fi
+  git -C "$m" branch -q -D "$name" 2>/dev/null || true
+  echo "Done. The tooling PR is merged; qualify the harness or the runner again as qa/RUNNER.md R14.4 says."
 }
 
 cmd_tag() {
@@ -208,6 +200,13 @@ cmd_tag() {
 }
 
 sub=${1:-}; shift || true
+case "$sub" in
+  start|pr|merge|tag)
+    # H4: one build lock for the whole run, around every repo forall; and
+    # nothing while a batch runs or holds the tree.
+    acquire_build_lock
+    refuse_while_batch ;;
+esac
 case "$sub" in
   start) cmd_start "$@" ;;
   status) cmd_status "$@" ;;

@@ -399,7 +399,7 @@ PROMOTE = (slots.PROMOTE, "proved (test)")
 def promote_mocks():
     """The host side of a PROMOTE decision, proved by fiat."""
     from riverqa import recovery, stage
-    return (mock.patch.object(recovery, "lookup", return_value={"prs": [], "tags": []}),
+    return (mock.patch.object(recovery, "lookup", return_value=recovery.Lookup(recovery.OK, {"prs": [], "tags": []}, None)),
             mock.patch.object(slots, "decide_recovery", return_value=PROMOTE),
             mock.patch.object(stage, "repo_slugs", return_value={}),
             mock.patch.object(stage, "load", return_value={"batch": "cand", "build_id": "river-cand"}),

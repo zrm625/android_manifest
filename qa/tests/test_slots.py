@@ -1,8 +1,8 @@
-import json
 import subprocess
 import unittest
 
 import _path  # noqa: F401
+from ghworld import GHWorld
 from riverqa import recovery, slots
 
 
@@ -109,35 +109,43 @@ SLUGS = {k: f"zrm625/{k}" for k in COMMITS}
 TREE, TREE2 = "1" * 40, "2" * 40
 
 
-def stub_runner(merged, tags, fail=None, tag_commit=None, annotated=True, heads=None, base=None, trees=None):
-    """gh and git ls-remote stand-ins. Merge commits are m0, m1...; PR heads
-    are the tested commits unless ``heads`` says otherwise; PR bases are
-    river-22.2 unless ``base`` says otherwise. A tag in repo zrm625/<x>
-    points at tag_commit[x] or, by default, its PR's merge commit (or, for
-    c, the tested commit). Every commit's tree is TREE (the merges went into
-    an unmoved branch) unless ``trees`` maps a commit to another tree."""
-    def run(cmd):
-        if fail and cmd[0] == fail:
-            return subprocess.CompletedProcess(cmd, 1, "", "network down")
-        if cmd[:2] == ["gh", "api"]:
-            commit = cmd[2].rsplit("/", 1)[1]
-            return subprocess.CompletedProcess(cmd, 0, (trees or {}).get(commit, TREE) + "\n", "")
-        if cmd[0] == "gh":
-            n = int(cmd[3])
-            repo = "ab"[n]
-            return subprocess.CompletedProcess(cmd, 0, json.dumps({
-                "number": n, "state": "MERGED" if merged[n] else "OPEN", "url": f"u{n}",
-                "headRefOid": (heads or {}).get(repo, COMMITS[repo]),
-                "baseRefName": (base or {}).get(repo, "river-22.2"),
-                "mergeCommit": {"oid": f"m{n}"} if merged[n] else None}), "")
-        repo = cmd[3].rsplit("/", 1)[1]
-        if not tags[repo]:
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        commit = (tag_commit or {}).get(repo, COMMITS["c"] if repo == "c" else "m" + str("ab".index(repo)))
-        out = (f"t{repo}\trefs/tags/kg-1\n{commit}\trefs/tags/kg-1^{{}}\n" if annotated
-               else f"{commit}\trefs/tags/kg-1\n")
-        return subprocess.CompletedProcess(cmd, 0, out, "")
-    return run
+MERGE = {"m0": "5" * 40, "m1": "6" * 40}
+BASES = {"a": "7" * 40, "b": "8" * 40}
+
+
+def stub_runner(merged, tags, fail=None, tag_commit=None, annotated=True, heads=None, base=None, trees=None,
+                cross=None):
+    """A recorded GitHub (ghworld.GHWorld). PR n of repo "ab"[n] lands as
+    merge commit MERGE["m<n>"] = [BASES[repo], head] on river-22.2; an
+    unmerged PR's river-22.2 is still at BASES[repo]; c (no PR) is at its
+    tested commit. PR heads are the tested commits unless ``heads`` says
+    otherwise; PR bases are river-22.2 unless ``base`` says otherwise. A tag
+    in repo zrm625/<x> points at tag_commit[x] or, by default, its PR's
+    merge commit (or, for c, the tested commit). Every commit's tree is
+    TREE unless ``trees`` maps a commit (or "m0"/"m1") to another tree."""
+    w = GHWorld(annotated=annotated)
+    trees = {MERGE.get(k, k): v for k, v in (trees or {}).items()}
+    for repo in "abc":
+        slug = f"zrm625/{repo}"
+        w.repo(slug, tip=COMMITS[repo] if repo == "c" else BASES[repo])
+        w.commits[(slug, COMMITS[repo])] = {"tree": trees.get(COMMITS[repo], TREE), "parents": ["0" * 40]}
+        if repo in BASES:
+            w.commits[(slug, BASES[repo])] = {"tree": "4" * 40, "parents": ["0" * 40]}
+    for n, repo in enumerate("ab"):
+        slug = f"zrm625/{repo}"
+        w.pr(slug, n, (heads or {}).get(repo, COMMITS[repo]), base=(base or {}).get(repo, "river-22.2"),
+             cross=(cross or {}).get(repo, False))
+        if merged[n]:
+            m = MERGE[f"m{n}"]
+            w.merge(slug, n, BASES[repo], m, trees.get(m, TREE))
+    for repo in "abc":
+        if tags[repo]:
+            at = (tag_commit or {}).get(repo, COMMITS["c"] if repo == "c" else MERGE["m" + str("ab".index(repo))])
+            w.repos[f"zrm625/{repo}"]["tags"]["kg-1"] = at
+            w.commits.setdefault((f"zrm625/{repo}", at), {"tree": trees.get(at, TREE), "parents": ["0" * 40]})
+    if fail:
+        w.fail = lambda cmd: subprocess.CompletedProcess(cmd, 1, "", "network down") if cmd[0] == fail else None
+    return w
 
 
 EXPECTED = {"a": {"repo": "zrm625/a", "number": 0}, "b": {"repo": "zrm625/b", "number": 1},
@@ -155,7 +163,7 @@ NONE = {"a": False, "b": False, "c": False}
 class Recovery(unittest.TestCase):
     def decide(self, merged, tags, kind="batch", fail=None, batch=None, **kw):
         batch = batch or BATCH
-        look = recovery.lookup(batch, stub_runner(merged, tags, fail, **kw), SLUGS)
+        look = recovery.lookup(batch, stub_runner(merged, tags, fail, **kw), SLUGS).data
         return slots.decide_recovery({"kind": kind, "batch": "b"}, look, batch, SLUGS)[0]
 
     def test_all_merged_and_tagged_promotes(self):
@@ -209,7 +217,7 @@ class Recovery(unittest.TestCase):
         # changed record halts.
         dropped = dict(BATCH, prs=[{"repo": "zrm625/a", "number": 0}], no_pr=["b", "c"])
         self.assertEqual(self.decide([True, True], ALL, batch=dropped), slots.HALT)
-        look = recovery.lookup(dropped, stub_runner([True, True], ALL), SLUGS)
+        look = recovery.lookup(dropped, stub_runner([True, True], ALL), SLUGS).data
         self.assertEqual(sorted(p["repo"] for p in look["prs"]), ["zrm625/a", "zrm625/b"])
         errs = slots.commit_set_proof(dropped, look, SLUGS)
         self.assertTrue(any("changed after merge_started" in e for e in errs), errs)
@@ -222,17 +230,19 @@ class Recovery(unittest.TestCase):
         hash is a failed lookup, never a tree."""
         for out in ("T\n", "", "<html>rate limited</html>\n", "1" * 39 + "\n", "1" * 40 + "x\n"):
             r = lambda cmd, out=out: subprocess.CompletedProcess(cmd, 0, out, "")
-            self.assertIsNone(recovery.tree_of(r, "zrm625/a", "a" * 40), out)
+            with self.assertRaises(recovery._Failed) as cm:
+                recovery.tree_of(r, "zrm625/a", "a" * 40)
+            self.assertEqual(cm.exception.outcome, recovery.MALFORMED, out)
         ok = lambda cmd: subprocess.CompletedProcess(cmd, 0, "1" * 40 + "\n", "")
         self.assertEqual(recovery.tree_of(ok, "zrm625/a", "a" * 40), "1" * 40)
         look = recovery.lookup(BATCH, stub_runner([True, True], ALL, trees={"m1": "T"}), SLUGS)
-        self.assertIsNone(look)
+        self.assertEqual((look.outcome, look.data), (recovery.MALFORMED, None))
 
     def test_tagged_tree_must_be_the_tested_tree(self):
         # b's PR was merged into a river-22.2 that had moved on: the merge
         # commit's tree holds content that was never tested.
         self.assertEqual(self.decide([True, True], ALL, trees={"m1": TREE2}), slots.HALT)
-        look = recovery.lookup(BATCH, stub_runner([True, True], ALL, trees={"m1": TREE2}), SLUGS)
+        look = recovery.lookup(BATCH, stub_runner([True, True], ALL, trees={"m1": TREE2}), SLUGS).data
         errs = slots.commit_set_proof(BATCH, look, SLUGS)
         self.assertTrue(any("tested tree" in e for e in errs), errs)
 
@@ -241,7 +251,7 @@ class Recovery(unittest.TestCase):
             if cmd[:2] == ["gh", "api"]:
                 return subprocess.CompletedProcess(cmd, 1, "", "rate limited")
             return inner(cmd)
-        self.assertIsNone(recovery.lookup(BATCH, run, SLUGS))
+        self.assertEqual(recovery.lookup(BATCH, run, SLUGS).outcome, recovery.TRANSPORT)
 
     def test_expected_pr_set(self):
         exp, errs = slots.expected_pr_set(UNSTARTED, SLUGS)
@@ -274,16 +284,16 @@ class MergeStarted(unittest.TestCase):
         self.assertEqual(self.decide(self.EMPTY, merge_started={"at": "t"}), slots.HALT)
 
     def test_nothing_merged_with_marker_halts(self):
-        look = recovery.lookup(UNSTARTED, stub_runner([False, False], NONE), SLUGS)
+        look = recovery.lookup(UNSTARTED, stub_runner([False, False], NONE), SLUGS).data
         self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, UNSTARTED, SLUGS)[0], slots.ROLLBACK)
         self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, BATCH, SLUGS)[0], slots.HALT)
 
     def test_partial_with_marker_halts(self):
-        look = recovery.lookup(BATCH, stub_runner([True, False], NONE), SLUGS)
+        look = recovery.lookup(BATCH, stub_runner([True, False], NONE), SLUGS).data
         self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, BATCH, SLUGS)[0], slots.HALT)
 
     def test_complete_with_marker_promotes(self):
-        look = recovery.lookup(BATCH, stub_runner([True, True], ALL), SLUGS)
+        look = recovery.lookup(BATCH, stub_runner([True, True], ALL), SLUGS).data
         self.assertEqual(slots.decide_recovery({"kind": "batch"}, look, BATCH, SLUGS)[0], slots.PROMOTE)
 
 

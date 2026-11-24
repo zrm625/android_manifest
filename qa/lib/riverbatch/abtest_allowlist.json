@@ -1,0 +1,5 @@
+{
+  "comment": "Files under product/system and product/vendor that differ between identical builds, each with its reason (R14.2). build-manifest.xml is not listed: I8 checks its revisions instead. A runner_build input.",
+  "files": [],
+  "reasons": {}
+}

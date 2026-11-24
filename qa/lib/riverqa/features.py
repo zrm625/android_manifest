@@ -1898,6 +1898,18 @@ def final_health_parts(snap: dict, reads: dict, logcat_path: Path, logcat_dead: 
     return parts
 
 
+# H18: phone-setup's choices that final.settings compares, as (read command,
+# expected value). The batch runner's setup readback uses the same table, so
+# the two cannot drift. Every read works without root.
+SETUP_SETTINGS = {
+    "navigation_mode": ("settings get secure navigation_mode", "2"),
+    "location": ("cmd location is-location-enabled", "false"),
+    "extra_dim": ("settings get secure reduce_bright_colors_activated", "1"),
+    "sound_effects": ("settings get system sound_effects_enabled", "0"),
+    "lock_disabled": ("cmd lock_settings get-disabled", "true"),
+}
+
+
 def final_checks(run) -> None:
     from .qa import check_dropbox, check_services, diagnostic_reads, hal_deaths, logcat_check, proc_info, stop_logcat
     dev = run.dev
@@ -1944,13 +1956,7 @@ def final_checks(run) -> None:
         injected(run, "boot-id-changed")
     run.add(Result("final.boot_id", PASS if bid == want else FAIL,
                    "boot_id unchanged" if bid == want else f"boot_id changed: {want[:8]} -> {bid[:8]}"))
-    s = {"navigation_mode": dev.sh("settings get secure navigation_mode").strip(),
-         "location": dev.sh("cmd location is-location-enabled").strip(),
-         "extra_dim": dev.sh("settings get secure reduce_bright_colors_activated").strip(),
-         "sound_effects": dev.sh("settings get system sound_effects_enabled").strip(),
-         "lock_disabled": dev.sh("cmd lock_settings get-disabled").strip()}
-    want_s = {"navigation_mode": "2", "location": "false", "extra_dim": "1", "sound_effects": "0",
-              "lock_disabled": "true"}
-    diff = {k: s[k] for k in want_s if s[k] != want_s[k]}
+    s = {k: dev.sh(cmd).strip() for k, (cmd, _want) in SETUP_SETTINGS.items()}
+    diff = {k: s[k] for k, (_cmd, want) in SETUP_SETTINGS.items() if s[k] != want}
     run.add(Result("final.settings", FAIL if diff else PASS,
                    f"differs from phone-setup: {diff}" if diff else "matches phone-setup's choices", s))

@@ -7,7 +7,8 @@
 #   - makes `gh` default to the zrm625 fork, so `gh pr create` targets it,
 #   - lets git push to github.com with the `gh` login,
 #   - checks out a local river-22.2 branch that tracks zrm625/river-22.2.
-# It also links AGENTS.md and CLAUDE.md at the top of the tree.
+# It also links AGENTS.md and CLAUDE.md at the top of the tree. It takes the
+# build lock and refuses while the batch runner has a batch or a tree lease.
 set -euo pipefail
 source "$(dirname "$(realpath "$0")")/common.sh"
 
@@ -44,6 +45,9 @@ if [[ "${1:-}" == "--one" ]]; then
   exit 0
 fi
 
+# H4: one build lock for the whole run; nothing while a batch runs.
+acquire_build_lock
+refuse_while_batch
 "$REPO" forall -g "$FORK_GROUP" -c "$(realpath "$0")" --one
 
 for f in AGENTS.md CLAUDE.md; do

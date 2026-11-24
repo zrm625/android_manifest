@@ -1000,7 +1000,8 @@ def baseline_close(run: Run) -> None:
         return
     rows = batch_rows(run)
     kg = regression.baseline_record(None, run.batch_id, run.batch.get("commit_set") or {},
-                                    [r["run_id"] for r in rows], rows[:3], run.batch["cameras"]["set"])
+                                    [r["run_id"] for r in rows], rows[:3], run.batch["cameras"]["set"],
+                                    existing=read_json(KNOWN_GOOD))      # H14
     st = flashing.load_state()
     target = run.flash_attempt["target"]
     if flashing.running_slot(run.dev) != target:
@@ -1018,7 +1019,7 @@ def baseline_close(run: Run) -> None:
     flashing.finish_checkpoint(st)
     log(f"Baseline closed: known_good_slot {st['known_good_slot']} ("
         f"{'build ID ' + bid if stamped else 'unstamped: dates, slot and boot hash'}), RAM reference "
-        f"{kg['ram_reference']['median_mb']:.1f} MB (seed), known-good.json written.")
+        f"{kg['ram_reference']['median_mb']:.1f} MB ({'seed' if kg['ram_reference'].get('seed') else 'kept from ' + str(kg['ram_reference'].get('batch'))}), known-good.json written.")
     run.add(Result("baseline.closed", INFO, f"known-good.json written; slot {st['known_good_slot']} is known-good"))
 
 
@@ -1058,6 +1059,10 @@ def finish(run: Run, required: list[str], gate: GateInputs | None = None) -> int
     if not eligible and run.mode in ("batch", "calibrate", "control"):
         print("Not eligible: " + "; ".join(reasons[:8]) + (" ..." if len(reasons) > 8 else ""))
     print(f"Report: {run.dir / 'report.html'}")
+    # H6: the last stdout line is this JSON object; the batch runner binds
+    # the run by it (run_id) and reads the verdict from results.json.
+    print(json.dumps({"run_id": run.run_id, "results": str(run.dir / "results.json"), "exit_code": code,
+                      "eligible": eligible, "halted": run.halted}), flush=True)
     return code
 
 
@@ -1140,6 +1145,12 @@ Usage:
                                        build IDs (unstamped): its slot is booted, exit 0,
                                        and it stays pending until a dev flash settles it.
   phone-qa journal                     Show leftovers in the state journal.
+  phone-qa journal --restore           Restore the journal's leftovers (preflight's journal
+                                       recovery only). Exit 0 if the journal is then empty, 3
+                                       on a guard failure or an fb_mode obligation still
+                                       pending, else 1.
+  phone-qa qualified                   Host-only: is the gate qualified for this harness
+                                       version? One JSON line; exit 0 only if it is.
   phone-qa helper                      Build (or verify) the river-qa helper APK.
   phone-qa version                     Print the harness version.
 
@@ -1175,9 +1186,19 @@ def main(argv: list[str]) -> int:
     if sub == "recover":
         return cmd_recover(argv[1:])
     if sub == "journal":
+        if argv[1:] == ["--restore"]:
+            return cmd_journal_restore()
+        if argv[1:]:
+            print("usage: phone-qa journal [--restore]")
+            return 1
         j = jmod.Journal(QA_HOME / "journal.json", QA_HOME)
         print(json.dumps(j.entries, indent=2) if j.entries else "Journal is empty.")
         return 0
+    if sub == "qualified":
+        if argv[1:]:
+            print("usage: phone-qa qualified")
+            return 1
+        return cmd_qualified()
     if sub == "helper":
         from .helperapk import ensure_helper
         apk, key = ensure_helper(verbose=True)
@@ -1247,6 +1268,97 @@ def main(argv: list[str]) -> int:
         lock.release()
 
 
+def qualification_missing(version: str) -> list[str]:
+    """H3: what the gate still lacks for this harness version, from the
+    host's files only (README "Order of qualification")."""
+    missing = []
+    thr = read_json(THRESHOLDS_JSON, {}) or {}
+    if thr.get("calibrated") is not True:
+        missing.append("thresholds.json: calibrated is not true")
+    n = calibration_runs(version)
+    if n < 5:
+        missing.append(f"{n}/5 clean --calibrate runs for harness {version}")
+    ok, why = controls_status(version)
+    if not ok:
+        missing.append(why)
+    kg = read_json(KNOWN_GOOD)
+    if not isinstance(kg, dict):
+        missing.append("no known-good.json")
+    else:
+        for k in ("latest", "ram_reference", "calibration_seed"):
+            if not kg.get(k):
+                missing.append(f"known-good.json has no {k}")
+    st = flashing.load_state()
+    if not st or not st.get("baseline_closed"):
+        missing.append("slot-state.json has no closed baseline")
+    elif flashing.slots.checkpoint_pending(st) is not None:
+        missing.append("an interrupted baseline checkpoint is pending (flash --recover)")
+    return missing
+
+
+def cmd_qualified() -> int:
+    """phone-qa qualified (H3): host-only. One JSON line; exit 0 only if the
+    gate is qualified for the current harness version."""
+    version = harness_version()
+    missing = qualification_missing(version)
+    print(json.dumps({"qualified": not missing, "harness_version": version, "missing": missing}))
+    return 0 if not missing else 1
+
+
+def cmd_journal_restore() -> int:
+    """phone-qa journal --restore (H10): under the device lock, only the
+    preflight's journal recovery (fb_mode included), with dev.guard() before
+    any dev.root(). Exit 0 if the journal is then empty; 3 on a guard
+    failure, a halting failure or an fb_mode obligation still pending; 1
+    otherwise."""
+    from . import fbmode
+    from .device import Unreachable
+    from .restore import recover_journal
+    try:
+        lock = DeviceLock().acquire()
+    except LockError as e:
+        log(f"error: {e}")
+        return 1
+    try:
+        run = Run("restore", None, [], [])
+        if fbmode.pending(run.journal) is not None:
+            try:
+                fbmode.recover(run.dev, 900, boot=True, j=run.journal)
+            except (RuntimeError, TimeoutError) as e:
+                log(f"HALT: fb_mode recovery failed: {e}")
+                return 3
+        if fbmode.pending(jmod.Journal(run.journal.path, run.journal.qa_home)) is not None:
+            log("HALT: the fb_mode obligation stays pending (phone-qa journal); notify Zak.")
+            return 3
+        try:
+            run.dev.guard()
+        except GuardError as e:
+            log(f"HALT: {e}")
+            return 3
+        run.dev.root()
+        try:
+            done, dropped, failed = recover_journal(run)
+        except Unreachable as e:
+            log(f"HALT: {e}")
+            return 3
+        for m in done:
+            log(f"restored: {m}")
+        if dropped:
+            log(f"dropped {len(dropped)} entries older than the last wipe")
+        for m in failed:
+            log(f"error: {m}")
+        j = jmod.Journal(run.journal.path, run.journal.qa_home)
+        if fbmode.pending(j) is not None:
+            log("HALT: the fb_mode obligation stays pending (phone-qa journal); notify Zak.")
+            return 3
+        return 0 if not j.entries else 1
+    except (RuntimeError, TimeoutError) as e:
+        log(f"error: {e}")
+        return 1
+    finally:
+        lock.release()
+
+
 def cmd_recover(argv: list[str]) -> int:
     """phone-qa recover: under the device lock, clear a leftover fb_mode
     (a pending obligation, or the phone found in fastboot) and boot Android
@@ -1283,15 +1395,43 @@ def cmd_recover(argv: list[str]) -> int:
     return 0
 
 
+RUNNER_ID_RE = re.compile(r"^[bq][0-9]{4,}$")
+
+
+def stage_refusal(batch_id: str, lock) -> str | None:
+    """I16: the runner's IDs (bNNNN, qNNNN) are staged only by the runner:
+    RIVER_BATCH_ID names the ID and the build lock is reused through the
+    runner's token (``not lock.owned``)."""
+    if RUNNER_ID_RE.match(batch_id) and not (os.environ.get("RIVER_BATCH_ID") == batch_id and not lock.owned):
+        return (f"{batch_id} is a batch-runner ID (bNNNN, qNNNN); only the runner stages it. Pick another ID "
+                "(batch stage --kind calibration|baseline --id ID builds and stages one for you)")
+    return None
+
+
 def cmd_stage(argv: list[str]) -> int:
     import argparse
+    from .lock import BuildLock
     ap = argparse.ArgumentParser(prog="phone-qa stage")
     ap.add_argument("batch_id")
     ap.add_argument("--product", type=Path, default=BENCH_HOME / "out-stripped/target/product/river")
     ap.add_argument("--kind", default="batch")
     ap.add_argument("--experiment", action="store_true")
     a = ap.parse_args(argv)
-    b = stage.stage(a.batch_id, a.product, a.kind, a.experiment or a.kind == "experiment")
+    # I16: no build may replace the images while they are copied: take the
+    # build lock (or reuse the runner's) across staging.
+    try:
+        lock = BuildLock().acquire()
+    except LockError as e:
+        log(f"error: {e}")
+        return 1
+    try:
+        why = stage_refusal(a.batch_id, lock)
+        if why:
+            log(f"error: {why}")
+            return 1
+        b = stage.stage(a.batch_id, a.product, a.kind, a.experiment or a.kind == "experiment")
+    finally:
+        lock.release()
     print(json.dumps({k: b[k] for k in ("batch", "kind", "build_id", "dates", "cameras")}, indent=2))
     print(f"Staged in {batch_dir(a.batch_id)}")
     return 0
