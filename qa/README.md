@@ -511,10 +511,15 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   `--promote` itself looks the batch up the way `--recover` does and releases
   the fallback only with proof, against the PR set `--merge-started` froze,
   for every repo of the tested commit set: for a repo with a PR, the PR's
-  head is the tested commit, the PR is merged into `river-22.2` of its own
-  zrm625 repo and the tag is at its merge commit; for a repo without a PR,
-  the tag is at the tested commit; in every repo the tagged tree is the
-  tested commit's tree. A stale or incomplete `prs`/`tag_repos` record halts. With
+  head is the tested commit, it is a same-repository PR (`isCrossRepository`
+  false) merged into `river-22.2` of its own zrm625 repo, `river-22.2` is at
+  its merge commit, whose parents are `[base, tested head]` (the base
+  `--merge-started` froze) and whose tree is the tested tree, and the tag is
+  at that merge commit; for a repo without a PR, `river-22.2` and the tag
+  are at the tested commit; in every repo the tagged tree is the tested
+  commit's tree. This is the batch runner's own landed proof (R10.4a), read
+  again. On success `--promote` records the proven merge commits in
+  batch.json `promotion` before it updates `slot-state.json`. A stale or incomplete `prs`/`tag_repos` record halts. With
   nothing merged or tagged, recovery rolls back only if `merge_started` is
   absent; with it, recovery halts. A baseline pair is never promoted (`phone-qa --baseline`
   closes it). A closed baseline's seed is saved in `slot-state.json` in the
@@ -559,8 +564,11 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   baseline checkpoint or an fb_mode obligation).
 - **`flash --promote`** (H11): the lookup is typed (`transport`, `refused`,
   `malformed`, `ok`). A transport failure exits **75** before the phone is
-  touched; so does a PR that GitHub still reports open although its tagged
-  merge commit already holds the tested head (I4: a lagging read, retried).
+  touched; so does a PR that GitHub still reports open although
+  `river-22.2` is already its merge (`[base, tested head]`, tested tree),
+  tagged or not, when nothing else is wrong (I4: a lagging read, retried).
+  `flash --recover` applies the same lag rule (75) to a pair it would
+  otherwise halt on.
   A refused or malformed lookup exits 1 with a last stdout line
   `{"lookup": "refused"|"malformed", "repo", "evidence"}`. Exit 3 stays for a
   proof that is not PROMOTE and for phone failures.

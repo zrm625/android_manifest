@@ -27,11 +27,28 @@ qualify` and builds calibration and baseline candidates with `batch stage`.
 ### Approval record format (I14)
 
 A council record is `record.json` (R5.2) with its briefs and replies next to
-it, named by **basename** only. Every brief and every reply carries a line
-`Scope: full` or `Scope: delta` equal to the round's scope; every reply
-carries a line `Verdict: APPROVE <score>` equal to the provider's recorded
-verdict; briefs list, and replies cite, every head of the round (a full
-round's heads; a delta round's `from` and `to`) in full 40-hex form.
+it, named by **basename** only. Every brief and every reply carries the
+round's **scope block** (I14, Sol B3):
+
+```text
+Scope: full
+Head: zrm625/android_device_motorola_river#6 <40-hex head>
+Head: zrm625/android_vendor_lineage#5 <40-hex head>
+```
+
+or, for a delta round, one line per PR the round names:
+
+```text
+Scope: delta
+Delta: zrm625/android_device_motorola_river#6 <40-hex from> -> <40-hex to>
+```
+
+The `Head:` or `Delta:` lines must bind exactly the round's PRs to exactly
+its heads: every PR once, with its own head (or its own `from` and `to`, in
+that order), and no other PR. A SHA that merely appears in the text binds
+nothing, so a reversed delta, swapped PRs or an extra PR is refused. Every
+reply also carries a line `Verdict: APPROVE <score>` equal to the provider's
+recorded verdict.
 `batch enqueue` copies the record and its files into the immutable bundle
 `$BENCH_HOME/runner/council/<name>/<sha256 of record.json>/` before the
 state transaction. The briefs and replies of the 2026-11-23 GNSS and Perch
@@ -66,7 +83,9 @@ FILE...` needs new council rounds for them (I14 accepts this).
 | `riverqa/children.py`, `riverqa/runnerstate.py` | Live child records (H15); the shared, fail-closed reader of the state file (H4, H12) |
 
 Tests: `qa/tests/test_batch_*.py` (runner) and `qa/tests/test_runner_harness.py`
-(harness changes), with `qa/tests/batchfakes.py`. They use a throwaway
+(harness changes), with `qa/tests/batchfakes.py` (its TC fakes keep the real
+`tc.check` contract: a fork missing from `expected` fails) and
+`qa/tests/ghworld.py` (one recorded GitHub for the harness lookup). They use a throwaway
 `$BENCH_HOME` and never touch a phone, GitHub or the real tree.
 
 ## How each implementation requirement is met
@@ -74,26 +93,57 @@ Tests: `qa/tests/test_batch_*.py` (runner) and `qa/tests/test_runner_harness.py`
 | Req | Code | Tests |
 | --- | --- | --- |
 | I1 | `kb.check`, `kb.READ_CMD`: `ro.river.build_id` plus `ro.vendor.build.date.utc` against `batches/<known-good batch>/batch.json` `dates.vendor`; never `ro.vendor.river.build_id` or `/vendor/build.prop`. Live check on ZY225DPT7F with non-root adbd (2026-11-23): `getprop ro.vendor.river.build_id` is empty and `/vendor/build.prop` is denied, also from `/vendor/bin/sh` (vendor_shell); `ro.river.build_id` and `ro.vendor.build.date.utc` read correctly | `test_batch_kb.KB.test_holds_with_one_non_elevating_read`, `test_vendor_matched_by_staged_vendor_date`, `test_missing_staged_date_blocks` |
-| I2 | `kb.read_props`: one `sh_rc`, no `guard()`/`root()`; HALT only on rc 0 with a non-empty mismatched product or serial; otherwise `usb_state` again | `test_batch_kb.KB.test_halt_only_on_rc0_identity_mismatch`, `test_empty_values_recheck_state`, `test_usb_states` (FakeDev fails the test on `root()` or `guard()`) |
+| I2 | `kb.read_props`: one `sh_rc`, no `guard()`/`root()`; HALT only on rc 0 with a non-empty mismatched product or serial; a failed read or an empty product, serial or slot re-checks USB (pause or blocked); an empty or `0` `sys.boot_completed` and empty stamps also re-check USB, then are "phone still booting" or "unstamped" (blocked) | `test_batch_kb.KB.test_halt_only_on_rc0_identity_mismatch`, `test_empty_values_recheck_state`, `test_empty_boot_completed_is_booting_not_a_pause`, `test_empty_stamps_recheck_the_usb_state`, `test_usb_states` (FakeDev fails the test on `root()` or `guard()`) |
 | I3 | `flashing.flash_batch` sends the bootloader-fallback path through `rescue()`; `outcomes.rescue_evidence`, `outcomes.adopt_flash`, `phases._bench` | `test_runner_harness.RescueAttemptIDs.*`, `test_batch_outcomes.Rescue.*`, `test_batch_flow.Crash.test_rescue_evidence_first` |
-| I4 | `merge.classify` (`lag` is never landed), `merge.reconcile_one`; `flashing.github_lag` makes `flash --promote` exit 75; `merge_all` reconciles before acting on a MERGED PR | `test_batch_merge.Classify.test_i4_open_after_landed_tip_is_not_landed`, `Reconcile.test_i4_lag_is_unknown_even_when_reads_agree`, `MergeAll.test_unexpected_merged_goes_through_reconciliation`, `test_runner_harness.PromoteTyped.test_pr_still_open_with_its_merge_tagged_is_75` |
-| I5 | `merge.reconcile_one` (agreeing non-fitting observations: mismatch; disagreeing or failed reads: unknown); `reconcile_unknown_since`; `settle.preconditions` (unknown > 24 h) | `test_batch_merge.Reconcile.test_i5_*`, `test_batch_recover.Settle.test_i5_preconditions` |
-| I6 | `qualify.stage_cmd` ends with the `staged` transaction clearing `running` and `lease` | `test_batch_qualify.StageFinish.test_running_and_lease_cleared_after_staging` |
-| I7 | `merge.kw_commit_set`, `merge.write_known_good` | `test_batch_merge.KW.*` |
-| I8 | `abtest.normalize_build_manifest`, `abtest.hash_tree`, `abtest.compare` | `test_batch_qualify.ABTest.test_i8_build_manifest_revisions_checked_and_blanked`, `test_hash_tree`, `test_compare_passes_and_each_criterion_fails` |
-| I9 | `settle.drift`, `settle.settle` (re-baseline owed on landed content or drift); the settle advice names both repairs | `test_batch_recover.Settle.test_i9_drift_owes_a_rebaseline_even_if_nothing_landed`, `test_not_promoted_landed_owes_a_rebaseline` |
+| I4 | `merge.classify` (`lag` is never landed), `merge.reconcile_one`; `slots.landed_but_open`: `flash --promote` and `flash --recover` exit 75 for a PR still OPEN while its merge is river-22.2's tip, before or after the tag, and only if that lag is the sole gap; `merge_all` sends any non-OPEN PR through R10.4a | `test_batch_merge.Classify.test_i4_open_after_landed_tip_is_not_landed`, `Reconcile.test_i4_lag_is_unknown_even_when_reads_agree`, `MergeAll.test_unexpected_merged_goes_through_reconciliation`, `MergeAll.test_merged_after_the_pending_read_is_reconciled_not_halted`, `test_runner_harness.PromoteTyped.test_pr_still_open_with_its_merge_tagged_is_75`, `test_open_at_landed_tip_before_any_tag_is_75`, `test_lag_next_to_another_mismatch_halts` |
+| I5 | `merge.reconcile_one` (agreeing non-fitting observations: mismatch; disagreeing or failed reads: unknown); `merge.unknown_started` (failed reads too, from the state file); `settle.preconditions` (unknown > 24 h) | `test_batch_merge.Reconcile.test_i5_*`, `ReconcileClock.test_a_failed_read_starts_the_i5_clock`, `test_batch_recover.Settle.test_i5_preconditions` |
+| I6 | `qualify.stage_cmd` ends with the `staged` transaction clearing `running` and `lease`; `recover.owns_pair`: a pair is the runner's only for a batch, experiment or qualify run at its own attempt, so a pair with a stage run's ID is foreign | `test_batch_qualify.StageFinish.test_running_and_lease_cleared_after_staging`, `test_batch_restore.StageRunOwnership.*` |
+| I7 | `merge.kw_commit_set` (running.merge, then batch.json `promotion`, then GitHub), `merge.write_known_good` | `test_batch_merge.KW.*` (incl. `test_i7_transport_at_the_known_good_write_is_75_then_written`) |
+| I8 | `abtest.normalize_build_manifest`, `abtest.producer_excluded` (the producer's `grep -Ev proprietary_`), `abtest.hash_tree` (missing XML fails), `abtest.measure` (filtered forks checked in the trial checkout), `abtest.compare` | `test_batch_qualify.ABTest.*`, `BuildManifestProducer.*` |
+| I9 | `settle.drift`, `settle.settle` (re-baseline owed on landed content or drift; a partial merge's open PRs held for Zak's repair); the settle advice names both repairs | `test_batch_recover.Settle.test_i9_drift_owes_a_rebaseline_even_if_nothing_landed`, `test_not_promoted_landed_owes_a_rebaseline`, `test_batch_settle.PartialSettle.*` |
 | I10 | `phases.stage_run(kg=None)` for calibration and baseline; the requalification sequence below | `test_batch_qualify.StageFinish.test_camera_backstop_for_production_only` |
-| I11 | `settle.settle` writes `known-good.json` from the local proof before any GitHub call | `test_batch_recover.Settle.test_i11_known_good_written_before_any_github_call` |
-| I12 | `recover.cleanup_items`: PRs by exact head branch in every touched repo; repo, branch, base and tested-head checks before closing | `test_batch_merge.Cleanup.*` |
-| I13 | `state.failures`, `state.alias_conflicts`, `commands._admissible` | `test_batch_outcomes.Transactions.test_failure_history_follows_identity_and_name`, `test_batch_commands.Enqueue.test_i13_alias_refused`, `test_third_failure_needs_zak_across_withdraw_and_reenqueue` |
-| I14 | `records.validate`, `records.check_reply` | `test_batch_records.Validate.test_i14_*`, `test_delta_reply_cites_from_and_to` |
+| I11 | `settle.settle` writes `known-good.json` from the local proof before any GitHub call; `flash --promote` writes the proven merge commits into batch.json `promotion` before slot-state | `test_batch_recover.Settle.test_i11_known_good_written_before_any_github_call`, `test_i11_promotion_record_is_the_local_proof`, `test_runner_harness.PromoteProof.test_clean_merge_promotes_and_records_the_merge_commits` |
+| I12 | `recover.cleanup_items`: PRs by exact head branch in every touched repo; repo, branch, base and the item's `tested` head (every touched repo, Sol M5) before closing; `expected_merged` and held items (Sol M4) | `test_batch_merge.Cleanup.*`, `test_batch_settle.PartialSettle.*` |
+| I13 | `state.failures`, `state.alias_conflicts`, `commands._admissible`, `commands._migrate_admission` | `test_batch_outcomes.Transactions.test_failure_history_follows_identity_and_name`, `test_batch_commands.Enqueue.test_i13_alias_refused`, `test_third_failure_needs_zak_across_withdraw_and_reenqueue`, `Migrate.*` |
+| I14 | `records.validate`, `records.check_reply`, `records.check_binding` (the scope block) | `test_batch_records.Validate.test_i14_*`, `test_b3_*`, `test_delta_reply_binds_from_and_to` |
 | I15 | `tick.tick` passes `local_only` to the end-of-tick pass after an unknown; `recover.forward(local_only)` stops after KW; no cleanup items | `test_batch_recover.LocalOnly.*` |
 | I16 | `qa.cmd_stage` with `lock.BuildLock`, `qa.stage_refusal` | `test_runner_harness.StageLock.*` |
-| I17 | `tick.preflight` runs `recover.retention` before the free-space check, under the tick's locks | `test_batch_recover.Retention.*` |
+| I17 | `tick.preflight` runs `recover.retention` before the free-space check, under the tick's locks; a failed change's newest evidence by time is kept | `test_batch_recover.Retention.*` |
 | I18 | `recover.entry_point` step 5: fastboot without an fb_mode obligation is blocked | `test_batch_recover.EntryPoint.test_i18_*` |
-| I19 | `recover.paused_pass`, `recover.strike(quiet_pause)`, `tick.tick` flushes reports when paused or blocked | `test_batch_recover.PausedPass.*` |
-| I20 | `qualify.refusals` | `test_batch_qualify.Refusals.test_i20_live_blockers_refuse_even_under_a_pause` and the other `Refusals` tests |
-| I21 | R2.4/R2.3 split (below); R14.1 runs only R13.2 steps 2 and 3 (`qualify.stage_cmd`); qualify's record transaction (`qualify.qualify_cmd`, event `qualified`); the solo-B pause (R9.5, `outcomes.desk_suspect`); settle advice (m8); `state.add_report` is idempotent (m9); basenames (`records._basename`); H4 fetches first (`tooling.check`); `previous_filename` (`eligibility.manifest_outcome`); GraphQL classes (`recovery.classify`); `bench.run` (H17); full SHAs (I14) | `test_batch_outcomes.Transactions.test_reports_pending_is_idempotent`, `test_batch_records.Validate.test_sha_mismatch_and_basenames`, `test_batch_commands.Eligibility.test_manifest_prs_i21_renames`, `test_runner_harness.TypedLookup.test_classes`, `test_batch_tools.Tooling.*` |
+| I19 | `recover.paused_pass`, `recover.strike(quiet_pause)`, `tick.commit_stop` (never replaces a pause; a blocker is persisted with a report), `tick.tick` flushes reports when paused or blocked | `test_batch_recover.PausedPass.*`, `BlockedTick.*` |
+| I20 | `qualify.refusals`; `qualify.qualify_cmd` checks the tree (`local_base`) before the entry point's phone recovery | `test_batch_qualify.Refusals.*`, `TreeBeforePhone.test_qualify_and_stage_refuse_a_dirty_tree_before_the_phone` |
+| I21 | R2.4/R2.3 split (below); R14.1 runs only R13.2 steps 2 and 3 (`qualify.stage_cmd`); qualify's record transaction (`qualify.qualify_cmd`, event `qualified`); the solo-B pause (R9.5, `outcomes.desk_suspect`); settle advice (m8); `state.add_report` is idempotent (m9); basenames (`records._basename`); H4 fetches first (`tooling.check`); `previous_filename` (`eligibility.manifest_outcome`); GraphQL classes, explicit refusals included (`recovery.classify`); `bench.run` (H17); full SHAs (I14); §19 E3 row | `test_batch_outcomes.Transactions.test_reports_pending_is_idempotent`, `test_batch_records.Validate.test_sha_mismatch_and_basenames`, `test_batch_commands.Eligibility.test_manifest_prs_i21_renames`, `test_runner_harness.TypedLookup.test_classes`, `test_batch_github.GraphQLRefusals.*`, `test_batch_tools.Tooling.*` |
+
+### Code review round 1: findings, code and tests
+
+Each row names the finding (Sol S-, Gemini G-, Opus O-), the code that
+closes it and the tests that fail when the fix is reverted (the mutation
+check is in the round-1 report).
+
+| Finding | Code | Tests |
+| --- | --- | --- |
+| Sol B1 | `abtest.producer_excluded`, `normalize_build_manifest(excluded)`, `hash_tree` (missing XML), `measure(checkout_heads)`, `one_build` reads the filtered forks' HEADs | `test_batch_qualify.BuildManifestProducer.*` |
+| Sol B2 | `recovery.lookup` (tips, tip commits, `isCrossRepository`), `slots.commit_set_proof`, `slots.landed_but_open`, `flashing.promote_batch`, `flashing.recover`, `flashing.merge_started` (freezes `base`), `merge.record_prs` | `test_runner_harness.PromoteProof.*`, `PromoteTyped.*`, `test_promote.MergeStartedCommand.test_base_is_frozen_with_the_pr_set` |
+| Sol B3 | `records.scope_block`, `records.check_binding` | `test_batch_records.Validate.test_b3_*` |
+| Sol B4 | `github.GitHub.merge_pr` (REST merge with `sha`) | `test_batch_github.SynchronousMerge.*` |
+| Sol M1, Gemini GB1, Opus OM2 | `tick.run_batch` catches an `Abort` from `merge_path` | `test_batch_flow.MergePathAbort.*` |
+| Sol M2, Gemini GM3 | `merge.merge_all` step 3, `merge.reconcile`, `merge.unknown_started` | `test_batch_merge.MergeAll.test_merged_after_the_pending_read_is_reconciled_not_halted`, `ReconcileClock.*` |
+| Sol M3 | `recover.forward`: the pair before the first tag | `test_batch_mergepath.MergePath.test_pair_lost_after_the_final_merge_halts_before_any_tag` |
+| Sol M4, Gemini GM6, Opus OM3 | `settle.settle` (hold, `expected_merged`, a camera mismatch is waiting-zak), `recover.cleanup_items`, `recover.finish_merged` | `test_batch_settle.PartialSettle.*`, `test_batch_merge.Cleanup.test_expected_merged_batch_pr_is_not_a_pause` |
+| Sol M5, Gemini GM4 | `state.cleanup_item` (`tested` for every touched repo), `recover.cleanup_items` | `test_batch_merge.Cleanup.test_pr_only_item_still_checks_the_tested_head`, `test_no_tested_head_never_closes` |
+| Sol M6 | `merge.change_prs` (close intent in `running.closing`) | `test_batch_merge.ChangePRs.test_interrupted_close_is_checked_again`, `test_closed_at_the_approved_head_clears_the_intent` |
+| Sol M7, Gemini GM5 | `merge.promote` (`step="lookup"`), `commands.resume` (every strike) | `test_batch_mergepath.MergePath.test_lookup_pause_has_its_strike_key_and_resume_clears_it`, `test_batch_commands.Enqueue.test_resume` |
+| Sol M8, Gemini GB3, Opus OB1 | `abtest.one_build` (abort through `recover.abort`), `abtest.run` (no cleanup on interrupt), `ports.Tools.run`/`stop`, `cli.main` (SIGINT) | `test_batch_qualify.OneBuild.*`, `test_batch_deadlines.Interrupt.*` |
+| Sol M9 | `ctx.TOOL_TIMEOUTS`, `ctx.Ctx.tool`, `ports.Tools.run` (timeout), `phases.setup_candidate`, `scripts/phone-setup` (`ADB_CALL_TIMEOUT`) | `test_batch_deadlines.Deadline.*` |
+| Sol M10 | `scripts/build` (lock, then commit set) | `test_build_script.LockBeforeProvenance.*` |
+| Sol M11, Gemini GM1 | `github.GitHub.pages` (`--paginate --slurp`) | `test_batch_github.Pagination.*` |
+| Sol M12 | `tick.commit_stop` (`blocker`), `report.render`, `commands.status` | `test_batch_recover.BlockedTick.*` |
+| Sol M13 | `commands.migrate`, `commands._migrate_admission` | `test_batch_commands.Migrate.*` |
+| Gemini GB2, Opus OB1 | `phases.new_lease` (`restore_to`), `phases.restore` | `test_batch_restore.*` (with `batchfakes.FakeTree`/`tc_contract`, which fail a fork missing from `expected` as `tc.check` does) |
+| Gemini GM2, Opus OM4 | `kb.read_props`, `kb.check` | `test_batch_kb.KB.test_empty_boot_completed_is_booting_not_a_pause` |
+| Gemini GM7 | `tc.status_problems` | `test_batch_tools.TreeCheck.test_allowlist_covers_untracked_and_ignored_only` |
+| Gemini GM8, Opus OM1 | `phases.test` (an experiment's clean run), `recover.abort` (pass to void only for a batch) | `test_batch_flow.RealQA.*` |
+| Minors | `phases.gate_reasons`; `abtest.mask_prop` (full match); `recover.abort` (own cause names the pause); `qualify.run_part2` (QA result); `cli` (last_error only on 0, RecordError a refusal); `merge.reconcile_one` (lag that clears); `phases.checkout` (`git lfs pull` through `remote_git`); `tc.lfs_problems`; `records.files_of`, `store_bundle`, `load_bundle`; `commands.enqueue` (upstream flag); `scripts/change` (`--record` FILE); `qualify.stage_cmd`, `paths.batch_dir` (IDs); `merge.pr_body`; `state.add_failure` (`record_sha256`, `ref`) | `test_batch_flow.RealQA.test_gate_reasons_are_whole_reasons`, `test_batch_qualify.BuildManifestProducer.test_mask_is_a_full_match`, `test_batch_flow.Flow.test_auth_names_the_pause_over_the_transport_strike`, `test_batch_qualify.Part2.*`, `test_batch_deadlines.LastError.*`, `test_batch_commands.CLI.test_a_bad_record_is_a_refusal_not_a_runner_error`, `test_batch_merge.ReconcileClock.test_lag_that_clears_on_the_second_read_is_landed`, `test_batch_flow.Checkout.test_lfs_pull_without_network_is_a_transport_abort`, `test_batch_tools.TreeCheck.test_lfs_pointer_is_the_dash_token`, `test_batch_records.Bundles.*`, `test_batch_commands.Enqueue.test_replacement_refreshes_the_upstream_flag`, `test_batch_tools.Tooling.test_change_merge_record_needs_a_file`, `test_batch_tools.Tooling.test_fetches_before_it_reads`, `test_batch_qualify.Refusals.test_stage_id_rules`, `test_batch_mergepath.MergePath.test_clean_batch_merges_tags_promotes_and_finishes`, `test_batch_flow.Flow.test_single_fail_rolls_back_and_records`, `test_batch_merge.Cleanup.test_third_same_refusal_pauses_and_stops` |
 
 ### Requalification after a camera re-baseline (I10)
 
@@ -110,7 +160,7 @@ When a settle leaves part of a batch landed (for example, river's Perch PR
 merged and vendor/lineage's not), the authorized repair, before any
 qualification, is one of: Zak completes the missing merges of the same batch
 at the exact tested heads (`gh pr merge --merge --match-head-commit
-<tested head>`), or reverts the landed ones through reviewed PRs. Then the
+<tested head>`, never `--auto`), or reverts the landed ones through reviewed PRs. Then the
 re-baseline sequence. A re-baseline is also owed whenever a fork's
 `river-22.2` tree has drifted from `known-good.json`, even if none of the
 batch's heads landed.
@@ -143,6 +193,31 @@ batch's heads landed.
   `external/chromium-webview/prebuilt/x86` and `x86_64`. Preflight stays
   blocked until they are pulled (`git lfs pull` in those projects) or the
   rule is changed.
+- **Synchronous merges.** The runner and `change merge` merge through the
+  REST endpoint with the tested `sha`; a merge queue or auto-merge is never
+  used, so a merge either happened when the call returned or did not.
+- **Promotion proof.** `flash --promote` and `flash --recover` require the
+  runner's own landed proof (R10.4a) besides the tags: a same-repository
+  PR, river-22.2 at its merge commit, parents `[base, tested head]` (the
+  base frozen at `merge_started`) and the tested tree; an untouched repo is
+  still at its tested commit. A PR still reported OPEN while its merge is
+  the tip is 75, before or after the tag, but only if nothing else is
+  wrong. `flash --promote` writes the proven merge commits into batch.json
+  `promotion` (I11).
+- **The lease names the whole tree.** `lease.restore_to` holds every fork
+  and the manifest at the base, so the restore can run TC from the lease
+  alone, with or without `running`.
+- **Held cleanup after a partial settle.** The open batch PRs and their
+  tested branches stay untouched until the re-baseline closes (Zak's repair
+  may merge them); then cleanup accepts the PRs that merged and closes the
+  rest at their tested heads. `batch cleanup drop ID --zak` ends an item by
+  hand.
+- **Deadlines.** Every tool runs with a deadline (`ctx.TOOL_TIMEOUTS`,
+  `tool_timeouts` in `runner/config.json`); past it, or on SIGTERM, SIGHUP
+  or SIGINT, the holder is stopped and reaped before the runner releases
+  its locks. `phone-setup` bounds each adb call (`ADB_CALL_TIMEOUT`).
+- **Blockers.** A blocked or not-qualified tick records `blocker` in the
+  state file and writes a report when it changes; `batch status` shows it.
 - **Not exercised on hardware.** The runner has not built, flashed or run a
   batch; every path is covered by unit tests with fakes. Qualification
   (R14) is the first real run.
@@ -423,12 +498,13 @@ spells it. A record is valid only if:
 3. Every round has APPROVE from each of `opus`, `gemini` and `sol`. An
    objected round goes in `prior`; the chain restarts with a full round.
 4. Every brief and reply file exists with its recorded SHA-256.
-5. **The evidence covers the round's heads** (S-M8). For each round, the
-   brief contains every head the round names in full 40-hex form (a full
-   round's heads; a delta round's `from` and `to`), and each cited reply
-   contains each head the round approves (a full round's heads, a delta's
-   `to`), at least as a 12-hex prefix. A valid reply from another round, or
-   about other heads, does not count.
+5. **The evidence binds the round's heads** (S-M8, I14, Sol B3). For each
+   round, the brief and each cited reply carry the round's scope block: the
+   `Scope:` line and one `Head: <key> <40-hex>` line per PR (full) or one
+   `Delta: <key> <40-hex from> -> <40-hex to>` line per PR (delta), equal
+   to the round's `heads` exactly; each reply also has the provider's
+   recorded `Verdict:`. A reply from another round, about other heads, with
+   a reversed delta or swapped PRs, does not count.
 
 R5.3. **PR set check:** the open PRs in every fork and the manifest with head
 branch `branch` and base `river-22.2` are exactly the record's PRs, each at
@@ -597,7 +673,7 @@ finish, `change pr` can never push to a member's branch while the runner
 finalizes it (S-M9; R10.7 also re-reads the head after closing). A hand-run
 `repo sync`, `git` or `git push` command is not interlocked: TC (R7.4) and R8.2 step 2 catch it, and H7 forbids it while
 `batch status` shows a batch or a lease. A web-UI merge is caught by CS
-(R10.4); the seconds before `gh pr merge` are the known residual (Z6).
+(R10.4); the seconds before the merge call are the known residual (Z6).
 
 ## 7. Composing and building
 
@@ -991,9 +1067,14 @@ false check: HALT before anything more is merged), and only on a
    CS again, and go to the next PR. State `OPEN`: go on. Anything else: HALT.
 4. `slot-state.json` still reserves this batch's pair.
 
-Then `gh pr merge <n> --repo <repo> --merge --match-head-commit <tested sha>`
-and commit the merge commit. A confirmed refusal: HALT. An unknown outcome:
-R11.6. Never roll back.
+Then the synchronous REST merge, `PUT repos/<repo>/pulls/<n>/merge` with
+`sha=<tested sha>` and `merge_method=merge` (Sol B4): it merges at exactly
+that head now or refuses, and never adds the PR to a merge queue or turns
+on auto-merge (as `gh pr merge` can), so nothing lands after the runner
+stopped looking. Commit the merge commit. A confirmed refusal (or an answer
+without `merged: true`): HALT. An unknown outcome: R11.6. Never roll back.
+In step 3, a PR found in any state but `OPEN` goes through R10.4a again
+(recorded if it landed) before anything halts (Sol M2).
 
 R10.4a. **Merge reconciliation** (S-B2), before CS on every resume and after
 every unknown merge outcome. For each frozen PR with no recorded merge, one
@@ -1502,7 +1583,7 @@ qualified after this PR, in README order.
 | H1 | `scripts/common.sh`, `scripts/bench/lib.sh` (`ensure_image`, `run_build`), `scripts/build` | Move `acquire_build_lock` to `common.sh` (so `change`, `merge-upstream` and `setup-forks` use it). It opens `.lock` with `exec 9<>`, takes `flock -n`, then runs the H15 check (S-M5), and only then writes the token. With `BENCH_BUILD_LOCK_TOKEN` set, it opens no fd and reuses the lock only if the file holds that token and the lock is held. Right after taking the lock, `scripts/build` deletes `river-build.json` and `.bench-result`. `ensure_image` resolves the tag to an image ID once (`podman image inspect --format '{{.Id}}'`); `run_build` runs that ID; `river-build.json` gains `image_id`. | no (`runner_build`) |
 | H2 | `qa/lib/riverqa/lock.py` (`build_running`, `_refuse_during_build`), `scripts/common.sh` (`device_lock`) | A build lock whose file token equals `BENCH_BUILD_LOCK_TOKEN` and which is held counts as "no build". `device_lock` (used by `phone-setup`) gets the same build-lock probe and the H15 check. | yes |
 | H3 | `qa/lib/riverqa/qa.py`, `scripts/phone-qa` | `phone-qa qualified`, host-only: `thresholds` `calibrated`, `calibration_runs(version) >= 5`, `controls_status(version)`, `known-good.json` with `latest`, `ram_reference`, `calibration_seed`, `slot-state.json` `baseline_closed`, `slots.checkpoint_pending()` None. One JSON line `{"qualified", "harness_version", "missing"}`; exit 0 only if qualified. | yes |
-| H4 | `scripts/change`, `scripts/merge-upstream`, `scripts/setup-forks` | `change start\|pr\|merge\|tag`, `merge-upstream` and `setup-forks` take the build lock once at the start (H1) for the whole run, around every `repo forall` (busy: exit 1, "a build or batch is running"); so `change pr` never pushes while a batch runs (S-M9); refuse while the state file has `running` or `lease`, or exists and does not parse. `change merge NAME --record FILE` (E7): the record is a valid unanimous `tooling` record (R5.2); every PR it names is in `zrm625/android_manifest` with base `river-22.2` and `isCrossRepository` false; the PRs are found on GitHub by head branch, whether or not a local branch exists, and must be exactly the record's; the path allowlist (`qa/`, `scripts/`, `workspace/`, `*.md` other than `CHARTER.md`) is checked on `git diff --no-renames --name-only -z <merge-base> <reviewed head>` at the reviewed head, so a rename lists both its old and its new path and both must pass (S-B3: moving `CHARTER.md` or `default.xml` into `qa/` is refused); then `gh pr merge --merge --match-head-commit <reviewed head>`. Any fork PR, manifest XML or other path is refused with the offending paths. Without `--record`, `change merge` refuses in every repo (G-C2), so it merges nothing but a council-reviewed tooling-only manifest PR. `merge-upstream` loses `--push`, refuses on `river-22.2`, and merges into the topic branch from `change start upstream-YYYYMM`, which goes through `change pr`, the council and the queue. | no (`runner_tools`) |
+| H4 | `scripts/change`, `scripts/merge-upstream`, `scripts/setup-forks` | `change start\|pr\|merge\|tag`, `merge-upstream` and `setup-forks` take the build lock once at the start (H1) for the whole run, around every `repo forall` (busy: exit 1, "a build or batch is running"); so `change pr` never pushes while a batch runs (S-M9); refuse while the state file has `running` or `lease`, or exists and does not parse. `change merge NAME --record FILE` (E7): the record is a valid unanimous `tooling` record (R5.2); every PR it names is in `zrm625/android_manifest` with base `river-22.2` and `isCrossRepository` false; the PRs are found on GitHub by head branch, whether or not a local branch exists, and must be exactly the record's; the path allowlist (`qa/`, `scripts/`, `workspace/`, `*.md` other than `CHARTER.md`) is checked on `git diff --no-renames --name-only -z <merge-base> <reviewed head>` at the reviewed head, so a rename lists both its old and its new path and both must pass (S-B3: moving `CHARTER.md` or `default.xml` into `qa/` is refused); then the synchronous REST merge at the reviewed head (`PUT repos/zrm625/android_manifest/pulls/<n>/merge` with `sha`; never a merge queue or auto-merge). Any fork PR, manifest XML or other path is refused with the offending paths. Without `--record`, `change merge` refuses in every repo (G-C2), so it merges nothing but a council-reviewed tooling-only manifest PR. `merge-upstream` loses `--push`, refuses on `river-22.2`, and merges into the topic branch from `change start upstream-YYYYMM`, which goes through `change pr`, the council and the queue. | no (`runner_tools`) |
 | H6 | `qa/lib/riverqa/qa.py` (`finish`) | Last stdout line: `{"run_id", "results", "exit_code", "eligible", "halted"}`. | yes |
 | H7 | `.repo/manifests/AGENTS.md` (`CLAUDE.md` links to it), `workspace/AGENTS.md` | Image changes end at `batch enqueue`; `change merge` always needs `--record` and is for council-reviewed tooling PRs only, and only after PR #11; `change pr` waits (exit 1) while a build or batch holds the build lock; never push `batch/*`; while `batch status` shows a batch or a lease, never `repo sync`, check out in a fork, or merge into `river-22.2` (CLI or web); return forks to `river-22.2`; **when dev work on the phone ends, return it to known-good with `flash --rollback`** (E3); agents never pass `--zak`; the tester thread decides `failed` entries with `requeue` or `tried` and a reason; upstream merges via `change start upstream-YYYYMM` and the queue; never `podman image prune` the `lineageos-bench` images. | no |
 | H9 | `qa/README.md` "Interfaces for the batch runner" | The runner in `qa/lib/riverbatch/`; the H6 line; `qualified`; `journal --restore`; `flash --recover` only with no pair; `--promote` exit 75 (lookup transport) and exit 1 with the lookup line (refused or malformed, H11); `device-bench` rescue wipes carry the flash attempt ID (H17); `features.SETUP_SETTINGS` (H18); the refusals of H12 and H15; failures are decided by the tester thread, not the harness. | no |
@@ -1513,7 +1594,7 @@ qualified after this PR, in README order.
 | H14 | `qa/lib/riverqa/regression.py` (`baseline_record`), `qa.py` (`baseline_close`) | `baseline_close` passes the existing `known-good.json`, if any; `baseline_record` then keeps its `ram_reference` (value, tag, batch, run IDs) when its median is lower than the new baseline's, with `seed` cleared, so a re-baseline never raises the historical minimum. The new `calibration_seed` is written as before. Unit tests pin both cases. | yes |
 | H15 | `qa/lib/riverqa/children.py` (new, standalone stdlib, also runnable as `python3 -I …/children.py`), `lock.py` (`DeviceLock.acquire`), `scripts/common.sh` (`acquire_build_lock`, `device_lock`) | `live_children()` reads the files in `$BENCH_HOME/runner/children/` whose names match `^[0-9]+\.json$` (never the holder's `.<pid>.tmp` files) with the R6.2 rule (current host boot, matching start time or a live pgid); unreadable files count as live. Every lock acquisition, and so `scripts/build`, `flash`, `device-bench`, `phone-qa`, `phone-setup`, `change`, `merge-upstream` and `setup-forks`, refuses (exit 1, naming the record) while a live record's pgid differs from the caller's session ID. **The check runs after `flock` succeeds and before the token is written** (S-M5; R6.3), in `DeviceLock.acquire`, `acquire_build_lock` and `device_lock` alike; on a live orphan the lock is released and nothing is written. The runner's R6.2 check uses the same function, again after each lock. | yes |
 | H16 | `scripts/phone-setup` | **Requested SSID** (G-C5): with `--wifi`, Wi-Fi counts as set up only if `cmd wifi status` says `Wifi is connected to "<SSID>"` for the SSID in the file; connected to any other network, it connects to the requested one. The final report prints the connected SSID. | no (`runner_tools`) |
-| H17 | `qa/lib/riverqa/bench.py` (`main`) | **Rescue attempt ID** (G-C6): the bench-boot failure path calls `flashing.rescue(dev, st, reason, attempt["attempt_id"])`, so the rescue's `wipes.jsonl` record carries the flash attempt ID, as `flash`'s rescue already does. A unit test pins it. | yes |
+| H17 | `qa/lib/riverqa/bench.py` (`bench.run`) | **Rescue attempt ID** (G-C6): the bench-boot failure path calls `flashing.rescue(dev, st, reason, attempt["attempt_id"])`, so the rescue's `wipes.jsonl` record carries the flash attempt ID, as `flash`'s rescue already does. A unit test pins it. | yes |
 | H18 | `qa/lib/riverqa/features.py` | **Setup settings** (minor): the `want_s` dict of `final.settings` becomes the module constant `SETUP_SETTINGS` (same keys, values and read commands), used by `final.settings` and by the runner's setup readback (R13.2 step 7), so the two cannot drift. | yes |
 
 H5 and H8 stay dropped (D1, S2). KB needs no harness change: its
@@ -1630,7 +1711,7 @@ Round 4 (`batch-runner-r4-findings.md`):
 | --- | --- |
 | E1 always clear kernel and DT intermediates; DTS test | R7.5 (list from `kernel.mk`/`BoardConfigKernel.mk`, every build incl. rebuild, qualify, calibration); R7.6; R14.2 B2; §12 row 8; provenance rule removed |
 | E2 qualification bootstrap | R14.3 (`--change`, first run gnss + perch, then zero members); R14.4 (image pin, before/after checks, `qualified.json` only after all parts); R14.1 (calibration own entry point) |
-| E3 preflight phone check | §1 KB (read-only `running_identity`); R8.2 step 7; H7 (`flash --rollback` after dev work) |
+| E3 preflight phone check | §1 KB (non-elevating reads only, never `running_identity`: I1, I2); R8.2 step 7; H7 (`flash --rollback` after dev work) |
 | E4 manifest XML = baseline | §1 baseline XML; R8.2 step 2; R14.3; §18 Z7 (PR #11 sequence) |
 | E5 runnable entries are fork-only | R5.4 step 3 (refused / `waiting-zak`, never ok); R5.5; R7.3 (manifest never composed); R10.2 step 4 |
 | E6 full commit-set check before every merge | R10.4 step 1 (CS); R10.3; R10.5; R11.2 step 3 |
