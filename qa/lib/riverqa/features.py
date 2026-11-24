@@ -1735,7 +1735,11 @@ def check_brave(run) -> Result:
     dev.sh(f"am force-stop {f['package']}; input keyevent KEYCODE_HOME")
     d = {"first_run_taps": steps, "gets": len(gets), "beacons": len(beacons), "script_text_on_screen": seen_token,
          "top": top, "ua": gets[0]["ua"] if gets else None}
-    ok = seen_token and gets and beacons
+    # Chromium exposes page text to the UI dump only while an accessibility
+    # service runs, so the on-screen token is often missing although the
+    # page rendered. The beacon needs the page's script to run, so a GET and
+    # a beacon from Brave, with Brave's window seen, pass.
+    ok = bool(gets and beacons and seen_app)
     return Result(cid, PASS if ok else FAIL, f"page GET {'seen' if gets else 'missing'}, beacon "
                   f"{'seen' if beacons else 'missing'}, page-script text on screen {seen_token} (first-run taps: "
                   f"{', '.join(steps) or 'none'})", d)
