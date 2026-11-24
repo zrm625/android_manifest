@@ -47,6 +47,16 @@ class Enqueue(unittest.TestCase):
             with self.assertRaises(S.Refused):
                 self.enqueue(h, Path(t))
 
+    def test_replacement_refreshes_the_upstream_flag(self):
+        # Gemini minor: a replaced entry takes its flags from the new record.
+        with bench_home() as h, tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as t2:
+            self.enqueue(h, Path(t))
+            with S.transaction() as st:
+                S.set_status(st["entries"][0], "tried", "x")
+            rec2 = make_record(Path(t2), branch="upstream-perch", delta=False)
+            self.enqueue(h, Path(t2), rec=rec2)
+            self.assertTrue(S.read()["entries"][0]["flags"]["upstream"])
+
     def test_i13_alias_refused(self):
         with bench_home() as h, tempfile.TemporaryDirectory() as t, tempfile.TemporaryDirectory() as t2:
             self.enqueue(h, Path(t))

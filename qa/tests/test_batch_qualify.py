@@ -120,6 +120,41 @@ class TreeBeforePhone(unittest.TestCase):
                 self.assertEqual((self.dev.cmds, self.tools.calls), ([], []), cmd)
 
 
+class Part2(unittest.TestCase):
+    def test_part2_keeps_its_qa_result_after_the_rollback(self):
+        """Gemini minor: run_part2 reported the QA result of a stale copy
+        (None); it is read before abort clears running."""
+        from batchfakes import mk_ctx as mk
+        from riverbatch import ctx as Cx, kb, recover
+        with bench_home() as h:
+            kg_files(h)
+
+            def compose_run(ctx, bid, purpose, members, base, kg, pin, verified):
+                run = {"id": bid, "purpose": purpose, "touched": [], "base": dict(base), "members": [],
+                       "composed": {p: {"sha": v} for p, v in base.items() if p != ".repo/manifests"},
+                       "versions": {"image_id": pin}, "phase": "claimed", "outcome": None, "attempt_id": None}
+                with S.transaction() as st:
+                    st["running"] = run
+                return run
+
+            def test(ctx, run):
+                Cx.update_running(qa={"run_id": "qa-7", "exit": 0, "eligible": True})
+                return {"class": O.PASS}
+            names = ["build", "stage_run", "restore_or_void", "flash", "bench", "setup_candidate"]
+            ps = [mock.patch.object(phases, n) for n in names] + [
+                mock.patch.object(phases, "test", test), mock.patch.object(qualify, "compose_run", compose_run),
+                mock.patch.object(qualify, "commit_phase"), mock.patch.object(recover, "setup_known_good"),
+                mock.patch.object(recover, "setup_owed", return_value=(False, kb.Check(kb.OK)))]
+            for x in ps:
+                x.start()
+            try:
+                out = qualify.run_part2(mk(), dict(FULL), {"latest": {"cameras": [0, 1, 2]}}, "img", [])
+            finally:
+                mock.patch.stopall()
+            self.assertEqual(out["qa"]["run_id"], "qa-7")
+            self.assertTrue(out["passed"], out["failed"])
+
+
 class StageFinish(unittest.TestCase):
     """I6 and I10 through stage_cmd with its steps faked."""
 

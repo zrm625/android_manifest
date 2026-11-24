@@ -242,6 +242,27 @@ class KW(unittest.TestCase):
                                                            {"event": "reserve", "batch": "b0002"}]})
             self.assertFalse(merge.kw_holds(mk_ctx(), S.read()["running"]))
 
+    def test_i7_transport_at_the_known_good_write_is_75_then_written(self):
+        """Sol (I7): promoted, the merge commit not recorded locally and no
+        promotion record; GitHub gives no answer at KW: 75, nothing written;
+        the next forward pass writes it."""
+        import json
+        with bench_home() as h:
+            setup_batch(h)
+            self.promote_state(h)
+            gh = gh_with("MERGED", M, M)
+            gh.fail["pr_view"] = [C.Unknown("pr view", R, 502, "Bad Gateway")]      # once
+            rows = [{"run_id": "r1", "host_boot_seconds": "30", "system_used_kb": "1", "vendor_used_kb": "1",
+                     "used_ram_kb": str(880 * 1024)}]
+            with mock.patch("riverqa.bench.attempt_rows", return_value=rows):
+                with self.assertRaises(C.Unknown):
+                    recover.recover_running(mk_ctx(gh=gh))
+                self.assertEqual(json.loads((h / "qa/known-good.json").read_text())["latest"]["batch"], "base")
+                self.assertEqual(S.read()["running"]["id"], "b0001")
+                merge.write_known_good(mk_ctx(gh=gh), S.read()["running"])
+            kg = json.loads((h / "qa/known-good.json").read_text())
+            self.assertEqual((kg["latest"]["batch"], kg["latest"]["commit_set"][P]), ("b0001", M))
+
     def test_unreadable_merge_commit_is_unknown(self):
         with bench_home() as h:
             setup_batch(h)

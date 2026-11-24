@@ -174,6 +174,41 @@ class Flow(unittest.TestCase):
             self.assertIn("GitHub auth: zrm625/x: 401", S.read()["pause"]["reason"])
 
 
+class Checkout(unittest.TestCase):
+    def test_lfs_pull_without_network_is_a_transport_abort(self):
+        """Opus minor: `git lfs pull` failing on the network is Unknown (a
+        transport abort, 75), not a runner error."""
+        from batchfakes import FakeTree
+        from riverbatch.compose import GitError
+        with bench_home() as h:
+            base = {p: "b" * 40 for p in __import__("riverbatch.merge", fromlist=["x"]).slugs()}
+            tree = FakeTree(base)
+            tree.branches["vendor/lineage"]["batch/b0001"] = "c" * 40
+            out = tree.out
+
+            def git_out(path, *a, env=None):
+                if a[:2] == ("lfs", "pull"):
+                    raise GitError(path, list(a), 2, "batch response: Post https://github.com/...: dial tcp: "
+                                                     "lookup github.com: no such host")
+                return out(path, *a, env=env)
+            tree.out = git_out
+            run = claim(["a"])
+            with S.transaction() as st:
+                st["running"].update(touched=["vendor/lineage"], base=base,
+                                     composed={p: {"sha": "c" * 40 if p == "vendor/lineage" else v, "tree": None}
+                                               for p, v in base.items() if p != ".repo/manifests"})
+            run = S.read()["running"]
+            tools = FakeTools()
+            ctx = mk_ctx(tree=tree, tools=tools)
+            with self.assertRaises(C.Unknown):
+                tick.run_batch(ctx, run, {"latest": {"cameras": [0, 1, 2]}})
+            st = S.read()
+            self.assertIsNone(st["running"])
+            self.assertIsNone(st["lease"])                            # restored on the way out
+            self.assertEqual(st["entries"][0]["status"], "queued")
+            self.assertEqual(st["voids_in_a_row"], 0)
+
+
 class MergePathAbort(unittest.TestCase):
     """Sol M1, Gemini GB1, Opus OM2: an R10.2-R10.3 refusal before
     merge_started ends the batch in the same tick, through tick.run_batch."""
