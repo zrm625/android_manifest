@@ -208,11 +208,112 @@ class NullGit:
         return b""
 
 
-def mk_ctx(gh=None, dev=None, tools=None, podman=None, tc_ok=True, cfg=None):
-    return C.Ctx(gh=gh or FakeGH(), git=NullGit(), tools=tools or FakeTools(), podman=podman or FakePodman(),
-                 phone_factory=lambda: dev or FakeDev(), sleep=lambda s: None,
-                 tc_check=lambda exp, *a, **k: SimpleNamespace(ok=tc_ok, blocking=[] if tc_ok else ["x: dirty"],
-                                                              seconds=0.1, summary=lambda n=12: "x: dirty"),
+def tc_result(blocking):
+    return SimpleNamespace(ok=not blocking, blocking=list(blocking), seconds=0.1,
+                           summary=lambda n=12, b=list(blocking): "; ".join(b[:n]))
+
+
+def tc_contract(expected) -> list[str]:
+    """What the real tc.check demands of ``expected`` (R7.4): every fork's
+    default.xml revision is ``refs/heads/river-22.2``, not a SHA, so a fork
+    missing from ``expected`` fails; and the manifest's HEAD is checked
+    only if it is there (the restore must name it)."""
+    from riverbatch import compose, tc
+    bad = []
+    for path in sorted(compose.forks()) + [tc.MANIFEST]:
+        v = expected.get(path)
+        if v is None:
+            bad.append(f"{path}: default.xml revision 'refs/heads/river-22.2' is not a SHA" if path != tc.MANIFEST
+                       else f"{path}: HEAD not checked")
+        elif not tc.SHA_RE.match(v):
+            bad.append(f"{path}: HEAD ? is not {v[:12]}")
+    return bad
+
+
+def tc_shape(ok=True):
+    """The default TC fake: the real check's contract on ``expected``, then
+    ``ok`` for everything else."""
+    def check(expected, *a, **k):
+        return tc_result(tc_contract(expected) or ([] if ok else ["x: dirty"]))
+    return check
+
+
+class FakeTree:
+    """The working tree of every fork and the manifest, for local git and
+    TC together: ``branches[path][name] = sha``, ``head[path]`` is a branch
+    name or a detached SHA, ``dirty`` the paths with local changes."""
+
+    def __init__(self, base: dict):
+        from riverbatch import tc
+        self.branches = {p: {("default" if p == tc.MANIFEST else "river-22.2"): sha} for p, sha in base.items()}
+        self.head = {p: ("default" if p == tc.MANIFEST else "river-22.2") for p in base}
+        self.dirty, self.calls = set(), []
+
+    def sha(self, path):
+        h = self.head[path]
+        return self.branches[path].get(h, h)
+
+    # --- the git port ---
+    def try_(self, path, *args, env=None):
+        try:
+            return 0, self.out(path, *args)
+        except Exception as e:  # noqa: BLE001
+            return 1, str(e)
+
+    def out(self, path, *args, env=None):
+        self.calls.append((path, args))
+        a = list(args)
+        if a[:2] == ["rev-parse", "HEAD"]:
+            return self.sha(path) + "\n"
+        if a[:1] == ["rev-parse"]:
+            ref = a[-1]
+            return self.branches[path].get(ref, ref) + "\n"
+        if a[:3] == ["symbolic-ref", "--short", "-q"]:
+            h = self.head[path]
+            if h in self.branches[path]:
+                return h + "\n"
+            from riverbatch.compose import GitError
+            raise GitError(path, a, 1, "")
+        if a[:1] == ["status"]:
+            return " M x\n" if path in self.dirty else ""
+        if a[:2] == ["checkout", "-q"]:
+            if path in self.dirty:
+                from riverbatch.compose import GitError
+                raise GitError(path, a, 1, "error: Your local changes would be overwritten")
+            self.head[path] = a[2]
+            return ""
+        if a[:2] == ["branch", "-f"]:
+            self.branches[path][a[2]] = a[3]
+            return ""
+        if a[:3] == ["branch", "-q", "-D"]:
+            if self.head[path] == a[3]:
+                from riverbatch.compose import GitError
+                raise GitError(path, a, 1, f"error: cannot delete branch '{a[3]}' checked out")
+            self.branches[path].pop(a[3], None)
+            return ""
+        if a[:1] == ["for-each-ref"]:
+            pat = a[-1].removeprefix("refs/heads/").rstrip("*")
+            return "".join(f"{b}\n" for b in self.branches[path] if b.startswith(pat))
+        return ""
+
+    def raw(self, path, *args):
+        return b""
+
+    # --- TC on this tree, with the real check's contract ---
+    def tc_check(self, expected, *a, **k):
+        bad = tc_contract(expected)
+        for path, want in sorted(expected.items()):
+            if path in self.head and self.sha(path) != want:
+                bad.append(f"{path}: HEAD {self.sha(path)[:12]} is not {want[:12]}")
+            if path in self.dirty:
+                bad.append(f"{path}: M x")
+        return tc_result(bad)
+
+
+def mk_ctx(gh=None, dev=None, tools=None, podman=None, tc_ok=True, cfg=None, tree=None):
+    return C.Ctx(gh=gh or FakeGH(), git=tree or NullGit(), tools=tools or FakeTools(),
+                 podman=podman or FakePodman(), phone_factory=lambda: dev or FakeDev(), sleep=lambda s: None,
+                 tc_check=tree.tc_check if tree else tc_shape(tc_ok),
                  cfg={"batch_size": 4, "batches_per_tick": 3, "free_space_floor_gb": 60,
                       "wifi_ssid_file": None, "wifi_psk_file": None, **(cfg or {})})
 

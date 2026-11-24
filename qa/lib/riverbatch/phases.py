@@ -152,16 +152,25 @@ def base_heads(run: dict) -> dict[str, str]:
     return dict(run["base"])
 
 
+def new_lease(bid: str, expect: dict[str, str], base: dict[str, str]) -> dict:
+    """The tree lease (R7.4, R7.8): ``expect`` the checked-out commit of
+    each leased fork, ``base`` its river-22.2 commit, and ``restore_to``
+    the HEAD of **every** fork and the manifest once restored (Gemini GB2,
+    Opus OB1): the restore can run TC from the lease alone, with or
+    without ``running``."""
+    return {"batch": bid, "since": now_iso(), "expect": dict(expect), "base": {p: base[p] for p in expect},
+            "restore_to": dict(base)}
+
+
 def checkout(ctx: Ctx, run: dict) -> None:
-    lease = {"batch": run["id"], "since": now_iso(),
-             "expect": {p: run["composed"][p]["sha"] for p in run["touched"]},
-             "base": {p: run["base"][p] for p in run["touched"]}}
+    lease = new_lease(run["id"], {p: run["composed"][p]["sha"] for p in run["touched"]}, run["base"])
     with S.transaction("phase", phase="checking-out") as st:
         st["running"]["phase"] = "checking-out"
         st["lease"] = lease
     for p in run["touched"]:
         ctx.git.out(p, "checkout", "-q", f"batch/{run['id']}")
-        ctx.git.out(p, "lfs", "pull")
+        from .ctx import remote_git
+        remote_git(ctx, p, "lfs", "pull")                 # a network failure is Unknown, not a runner error
     r = ctx.tc_check(expected_heads(run))
     if not r.ok:
         raise Abort({"class": O.VOID, "reason": f"tree-disturbed after checkout: {r.summary()}"},
@@ -241,13 +250,16 @@ def stage_run(ctx: Ctx, run: dict, kind: str, experiment: bool, kg: dict | None)
 
 def restore(ctx: Ctx) -> tuple[bool, list[str]]:
     """Restore the tree from ``lease`` alone; clear it only after every fork
-    is restored or accepted and TC passes against river-22.2. Never forces,
-    resets, cleans or stashes."""
+    is restored or accepted and TC passes against the lease's
+    ``restore_to`` (every fork and the manifest). Never forces, resets,
+    cleans or stashes."""
     st = S.read()
     lease = st.get("lease")
     if not lease:
         return True, []
     found = []
+    if not isinstance(lease.get("restore_to"), dict) or MANIFEST not in lease["restore_to"]:
+        return False, [f"the lease of {lease.get('batch')} has no restore_to: Zak checks the tree by hand"]
     for p, want in sorted(lease["expect"].items()):
         try:
             h, b, c = head(ctx, p), branch(ctx, p), clean(ctx, p)
@@ -264,11 +276,7 @@ def restore(ctx: Ctx) -> tuple[bool, list[str]]:
         found.append(f"{p}: {'dirty' if not c else ''} {('on ' + b) if b else 'detached'} at {h[:12]}".strip())
     if found:
         return False, found
-    run = st.get("running")
-    expect = dict(run["base"]) if run else None
-    if expect is None:
-        expect = {p: ctx.git.out(p, "rev-parse", "river-22.2").strip() for p in lease["expect"]}
-    r = ctx.tc_check(expect)
+    r = ctx.tc_check(dict(lease["restore_to"]))
     if not r.ok:
         return False, r.blocking
     with S.transaction("lease-cleared", batch=lease["batch"]) as st2:

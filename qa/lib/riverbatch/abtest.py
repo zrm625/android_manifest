@@ -237,8 +237,7 @@ def one_build(ctx: Ctx, qid: str, label: str, base: dict, commits: dict, pin: st
         if commits:
             with S.transaction("phase", phase="checking-out") as st:
                 st["running"]["phase"] = "checking-out"
-                st["lease"] = {"batch": bid, "since": now_iso(), "expect": dict(commits),
-                               "base": {p: base[p] for p in commits}}
+                st["lease"] = phases.new_lease(bid, commits, base)
             for p in commits:
                 ctx.git.out(p, "checkout", "-q", f"batch/abtest-{label}")
         r = ctx.tc_check(phases.expected_heads(run))

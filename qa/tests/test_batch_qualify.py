@@ -9,7 +9,10 @@ from unittest import mock
 import _path  # noqa: F401
 from batchfakes import mk_ctx, write_json
 from benchhome import bench_home
-from riverbatch import abtest, ctx as C, outcomes as O, phases, qualify, state as S, version
+from riverbatch import abtest, ctx as C, merge, outcomes as O, phases, qualify, state as S, version
+
+
+FULL = {p: "b" * 40 for p in merge.slugs()}
 
 
 def kg_files(h, pair=None, slot_batch="kg", kg_batch="kg"):
@@ -90,7 +93,8 @@ class StageFinish(unittest.TestCase):
             seen = {}
 
             def compose_run(ctx, bid, purpose, members, base, kg, pin, verified):
-                run = {"id": bid, "purpose": purpose, "touched": [], "base": base, "composed": {},
+                run = {"id": bid, "purpose": purpose, "touched": [], "base": base,
+                       "composed": {p: {"sha": v} for p, v in base.items() if p != ".repo/manifests"},
                        "versions": {"image_id": pin}}
                 with S.transaction() as st:
                     st["running"] = run
@@ -100,7 +104,7 @@ class StageFinish(unittest.TestCase):
                 seen["kg"] = kg
                 seen["running"] = S.read()["running"]["id"]
             with mock.patch.object(qualify, "pin_image", return_value="img"), \
-                    mock.patch.object(qualify, "local_base", return_value={".repo/manifests": "m" * 40}), \
+                    mock.patch.object(qualify, "local_base", return_value=dict(FULL)), \
                     mock.patch.object(qualify, "compose_run", compose_run), \
                     mock.patch.object(qualify.phases, "build"), \
                     mock.patch.object(qualify.phases, "stage_run", stage_run), \
@@ -120,7 +124,8 @@ class StageFinish(unittest.TestCase):
             write_json(h / "batches/b0001/batch.json", {"cameras": {"set": [0, 1]}})
             with S.transaction() as st:
                 st["running"] = {"id": "b0001", "phase": "building"}
-            run = {"id": "b0001", "composed": {}, "base": {".repo/manifests": "m"}}
+            run = {"id": "b0001", "composed": {p: {"sha": v} for p, v in FULL.items() if p != ".repo/manifests"},
+                   "base": dict(FULL)}
             ctx = mk_ctx()
             with self.assertRaises(C.Abort) as cm:
                 phases.stage_run(ctx, run, "batch", False, {"latest": {"cameras": [0, 1, 2]}})
