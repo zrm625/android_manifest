@@ -5,7 +5,7 @@ a stack that passes is kept whole, a stack that fails is split.
 How a try runs and when it is kept: [CHARTER.md](CHARTER.md#pipeline-tries).
 
 RAM reference: baseline-2, 1,266 MB (median of 3 boots, 2026-11-23).
-Target: 1,000 MB. Now: 1,141 MB (stack B, kept).
+Target: 1,000 MB. Now: 1,122 MB (stack C, kept; stack D checks the combined tree).
 
 ## Kept
 
@@ -16,6 +16,10 @@ Target: 1,000 MB. Now: 1,141 MB (stack B, kept).
 | Lazy camera HAL (`ro.camera.enableLazyHal`) | sdm632-common #4 | The camera HAL (42 MB) runs only while a camera is open. All three cameras pass. |
 | Java heap headroom | sdm632-common #5 | heapmaxfree 16m → 8m, target 0.6 → 0.75 for every Java process. |
 | IPC logging off | kernel #1 | 62 Qualcomm debug-log contexts gone; MemTotal +4 MB. |
+| f2fs bitmaps in one block | kernel #2 | 105k 64-byte kmallocs (rounded to 128 on arm64) became two blocks; SUnreclaim 127 → 115 MB. |
+| Two SurfaceFlinger framebuffers | sdm632-common #6 | `max_frame_buffer_acquired_buffers` 3 → 2; SurfaceFlinger 87 → 77 MB. |
+| No ClearKey DRM service | sdm632-common #7 | Test DRM scheme; Widevine stays. |
+| No CAS HIDL service, traced off | build #3 | Broadcast-TV CAS service and Perfetto daemons not resident. `setprop persist.traced.enable 1` for a trace. |
 
 **Stack A** (Perch, zygote64, lazy camera): 1,144 MB (−122 MB), boot 49.7 s.
 `phone-qa --probe`: 34 pass. Failed: GPS (open, below), Brave and Tailscale
@@ -28,6 +32,14 @@ the GPS change and slab statistics): 1,141 MB (−3 MB), boot 50.2 s.
 flash check, which passed on two reruns (flaky in the dark; it failed the same
 way once before). Kept: heap headroom and IPC logging off. Not merged: the GPS
 change (it did not fix GPS) and slab statistics (diagnostic only).
+
+**Stack C** (f2fs bitmaps, two framebuffers, no ClearKey, no CAS HIDL, traced
+off; branched before the stack B merges, so without them): 1,122 MB (−19 MB
+against stack B), boot 51.8 s. `phone-qa --probe`: 39 pass. Failed: GPS (as
+before) and the rear-flash check, 4 of 4 times. The rear camera reads luma 1.4
+with the flash off, so its lens is against the desk; the camera daemon turned
+the flash on and the LED driver was set. No stack C change touches the camera.
+Zak: please check what the rear of the phone rests on.
 
 ## Open problems
 
@@ -44,9 +56,10 @@ change (it did not fix GPS) and slab statistics (diagnostic only).
 
 | Try | Why |
 | --- | --- |
-| `kmalloc-128` (30 MB) | 242k objects, all allocated by 40 s after boot; a one-off allocation, not a leak. The call site is being found with `slub_debug=U` and a diagnostic kernel. |
-| SurfaceFlinger buffers (87 MB) | `max_frame_buffer_acquired_buffers` 3 → 2 frees one 10 MB framebuffer. Mind smoothness. |
-| Small native services | clearkey DRM (1.9 MB), CAS (2.4 MB), traced and traced_probes (2.7 MB). |
+| Default wallpaper (stack D) | Perch is opaque and there is no lock screen, but SystemUI decodes the 1920×1920 default wallpaper. 32×32 dark image instead (vendor_lineage `small-wallpaper`). |
+| Rest of `kmalloc-128` | kernfs names 21k objects (2.6 MB), ASoC DAPM paths 17.6k (2.2 MB). arm64 has no kmalloc cache below 128 bytes. |
+| 32-bit media processes | mediaserver (23 MB) and the audio HAL are 32-bit; with no 32-bit zygote their libraries are private (.so 20 MB, 16 MB private clean). mediaserver's bitness is set in frameworks/av: a fork needs Zak. |
+| media.swcodec (22 MB) | Loads every software codec at start (.so 19 MB, 13 MB private). Trimming the APEX needs a frameworks/av fork. |
 | Kernel threads | 597 kernel threads: 97 bioset, 35 loop, 21 kverityd and 21 kdmflush (APEX loop mounts), 42 ext4 rsv-conver. Fewer preallocated loop devices. |
 | Process count | 60k of 100k `vm_area_struct` are copies of zygote's mappings in forked apps; each app that doesn't start saves its VMAs as well as its PSS. |
 | system_server (262 MB) and SystemUI (103 MB) | system_server is mostly file mappings (.jar 53 MB, .apk 40 MB, .dex 40 MB, .so 27 MB); heaps are 22 MB each. Fewer services means fewer classes loaded. |
