@@ -175,8 +175,8 @@ def next_batch(ctx: Ctx, pre: dict) -> dict | None:
         for e, why in comp.needs_reapproval + comp.waiting_zak:
             status = "needs-reapproval" if any(x is e for x, _ in comp.needs_reapproval) else "waiting-zak"
             with S.transaction("compose-drop", name=e["name"], status=status) as st2:
-                x = S.entry(st2, e["name"])
-                if x and x["status"] == "queued" and x["rev"] == e["rev"]:
+                x = S.same_entry(st2, e)                                   # Sol SB1
+                if x and x["status"] == "queued":
                     S.set_status(x, status, why)
         if not comp.members:
             continue

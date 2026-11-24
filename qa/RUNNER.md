@@ -419,7 +419,8 @@ does not parse.
  "entries": []}                         // R4.2
 ```
 
-R4.2. **Entry:** `name`, `branch`, `record_sha256` (the bundle, R5.1),
+R4.2. **Entry:** `name`, `id` (immutable, `e<position>`; Sol SB1),
+`branch`, `record_sha256` (the bundle, R5.1),
 `kind` (`change` or `experiment`), `prs` (`key` `owner/name#n`, `path`,
 approved `head`), `position` (fixed at first enqueue, kept forever), `flags`
 (`alone`, `solo`, `upstream`), `status`, `status_at`, `reason`, `rev`
@@ -431,8 +432,10 @@ clears, so it survives record replacement and `withdraw` followed by a new
 `enqueue` under the same name.
 
 R4.3. **`running`:** `id`, `purpose` (`batch`, `experiment`, `qualify`,
-`calibration`, `baseline`), `members` (name and `rev` at claim; `batch` and `experiment`
-only), `borrowed` (names composed by `qualify` or `stage`, whose entries are
+`calibration`, `baseline`), `members` (`name`, `id`, `record_sha256` and
+`rev` at claim; `batch` and `experiment` only; every later lookup of a member
+is by `id` and requires the entry still claimed by this run under that
+record), `borrowed` (names composed by `qualify` or `stage`, whose entries are
 never changed), `phase`, `intent` (R11.1), `versions` (harness,
 `runner_build`, `runner_tools`, image ID, manifest HEAD), `base`,
 `base_verified`, `composed` (per path: sha, tree), `content_key`,
@@ -712,10 +715,15 @@ leftovers of an unclaimed earlier try at this ID), using
 `git -c user.name=river-batch -c user.email=river-batch@localhost` and the
 same `GIT_AUTHOR_*`/`GIT_COMMITTER_*`.
 
-The **claim transaction** re-reads every member and requires its `status`
-`queued` and its `rev` unchanged since the member checks (a concurrent
-`withdraw` wins); otherwise it writes nothing and selection starts again.
-It records members with their `rev`, base, `base_verified`, composed SHAs and
+The **claim transaction** re-reads every member **by its immutable `id`**
+and requires the same name, `status` `queued`, its `rev` and its
+`record_sha256` unchanged since the member checks (a concurrent `withdraw`
+wins, and a new entry enqueued under the withdrawn one's name is another
+entry, Sol SB1); otherwise it writes nothing and selection starts again.
+Every other compare-and-update of an entry (member checks, compose drops,
+requeue, enqueue's replacement) checks `id` and `rev` the same way, and the
+merge rule (R10.1) requires every member still claimed under its record.
+It records members with their `id`, `record_sha256`, `rev`, base, `base_verified`, composed SHAs and
 trees, content key and versions, advances `next_batch`, and makes members
 `in-batch`.
 

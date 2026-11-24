@@ -105,8 +105,8 @@ def member_checks(ctx: Ctx, members: list[dict], base: dict[str, str], slugs: di
     if write:
         for e, status, why in bad:
             with S.transaction("member-check", name=e["name"], status=status) as st:
-                x = S.entry(st, e["name"])
-                if x and x["status"] == "queued" and x["rev"] == e["rev"]:
+                x = S.same_entry(st, e)                     # Sol SB1: by ID, at the checked rev and record
+                if x and x["status"] == "queued":
                     S.set_status(x, status, why)
     return bad
 
@@ -114,7 +114,8 @@ def member_checks(ctx: Ctx, members: list[dict], base: dict[str, str], slugs: di
 def new_running(bid: str, purpose: str, versions: dict, base: dict, verified: bool, comp: compose.Composed,
                 ckey: str, members: list[dict], borrowed: list[str]) -> dict:
     return {"id": bid, "purpose": purpose, "phase": "claimed", "intent": None, "started_at": now_iso(),
-            "members": [{"name": e["name"], "rev": e["rev"] + (1 if purpose in ("batch", "experiment") else 0)}
+            "members": [{"name": e["name"], "id": e["id"], "record_sha256": e["record_sha256"],
+                         "rev": e["rev"] + (1 if purpose in ("batch", "experiment") else 0)}
                         for e in members] if purpose in ("batch", "experiment") else [],
             "borrowed": borrowed, "versions": versions, "base": base, "base_verified": verified,
             "composed": {p: {"sha": base[p] if p not in comp.commits else comp.commits[p], "tree": t}
@@ -124,16 +125,17 @@ def new_running(bid: str, purpose: str, versions: dict, base: dict, verified: bo
 
 
 def claim(running: dict, members: list[dict], next_field: str) -> bool:
-    """The claim transaction (R7.3): every member still queued at its
-    checked rev; record the run; advance the ID; members in-batch. False:
-    nothing written, select again."""
+    """The claim transaction (R7.3): every member is still the same entry
+    (its immutable ID, Sol SB1), queued at its checked rev under the record
+    it was composed from; record the run; advance the ID; members in-batch.
+    False: nothing written, select again."""
     with S.transaction("claim", batch=running["id"]) as st:
         if st["running"] or st["lease"]:
             return False
         xs = []
         for m in members:
-            x = S.entry(st, m["name"])
-            if not x or x["status"] != "queued" or x["rev"] != m["rev"]:
+            x = S.same_entry(st, m)
+            if not x or x["status"] != "queued":
                 return False
             xs.append(x)
         for x in xs:

@@ -189,7 +189,7 @@ def finish_merged(ctx: Ctx) -> None:
     with S.transaction("finish", batch=bid) as st:
         r = st["running"]
         for m in r["members"]:
-            e = S.entry(st, m["name"])
+            e = S.member_entry(st, r, m)                    # Sol SB1
             if e and e["status"] == "in-batch":
                 e["batch"] = bid
                 e["merged"] = {"batch": bid, "tag": f"known-good-{bid}", "at": now_iso()}

@@ -170,8 +170,8 @@ def desk_suspect(last_fail: dict | None, members: list[str], checks: list[str], 
 def members_of(st: dict, running: dict) -> list[dict]:
     out = []
     for m in running.get("members") or []:
-        e = S.entry(st, m["name"])
-        if e and e["status"] == "in-batch" and e.get("batch") == running["id"]:
+        e = S.member_entry(st, running, m)                  # Sol SB1: by ID, never by name
+        if e and e["status"] == "in-batch":
             out.append(e)
     return out
 

@@ -18,6 +18,13 @@ Schema (version 6)::
      "cleanup": [], "reports_pending": [], "lease": null, "running": null, "entries": [],
      "blocker": null}             # why the last tick could not run a batch: {"kind", "message", "at", "report"}
 
+Every entry has an immutable ``id`` (``e<position>``; positions are never
+reused and entries are never deleted). A run's members name it: ``{"name",
+"id", "rev", "record_sha256"}``. Every compare-and-update of an entry checks
+the ID and the rev (Sol SB1): a withdrawn entry followed by a new one under
+the same name is another entry. An older state file gets the IDs on read
+(``_backfill``).
+
 A cleanup item (R13.3, I12)::
 
     {"batch": "b0007", "branch": "batch/b0007",
@@ -75,7 +82,25 @@ def _parse(text: str) -> dict:
         st.setdefault(k, copy.deepcopy(v))
     for k in STRIKES:
         st["strikes"].setdefault(k, 0)
+    _backfill(st)
     return st
+
+
+def _backfill(st: dict) -> None:
+    """IDs for entries and running members written before they existed
+    (Sol SB1). An entry's ID is ``e<position>``; a member without one is the
+    entry this run claimed (in-batch under this run's ID), else none."""
+    for i, e in enumerate(st["entries"]):
+        if not e.get("id"):
+            e["id"] = f"e{e['position']}" if isinstance(e.get("position"), int) else f"x{i}"
+    run = st.get("running")
+    for m in (run or {}).get("members") or []:
+        if not m.get("id"):
+            x = next((e for e in reversed(st["entries"]) if e["name"] == m.get("name")
+                      and e.get("status") == "in-batch" and e.get("batch") == run.get("id")), None)
+            m["id"] = x["id"] if x else None
+            if x and "record_sha256" not in m:
+                m["record_sha256"] = x.get("record_sha256")
 
 
 def read() -> dict:
@@ -126,6 +151,44 @@ def entry(st: dict, name: str) -> dict | None:
 def live_entry(st: dict, name: str) -> dict | None:
     e = entry(st, name)
     return e if e and e["status"] not in FINAL else None
+
+
+def entry_by_id(st: dict, eid: str | None) -> dict | None:
+    if not eid:
+        return None
+    return next((e for e in st["entries"] if e.get("id") == eid), None)
+
+
+def same_entry(st: dict, ref: dict) -> dict | None:
+    """The entry ``ref`` (an entry or a run member) names, by its immutable
+    ID, if it still has ``ref``'s name, rev and record (Sol SB1); else
+    None."""
+    x = entry_by_id(st, ref.get("id"))
+    if not x or x["name"] != ref.get("name") or x.get("rev") != ref.get("rev"):
+        return None
+    if "record_sha256" in ref and x.get("record_sha256") != ref["record_sha256"]:
+        return None
+    return x
+
+
+def member_entry(st: dict, run: dict, m: dict) -> dict | None:
+    """The entry of run member ``m``: by ID, still claimed by this run and
+    under the record it was claimed with; else None (Sol SB1)."""
+    # A member written before IDs (none after _backfill on read) is the
+    # entry of its name that this run claimed.
+    x = entry_by_id(st, m["id"]) if "id" in m else entry(st, m.get("name"))
+    if not x or x["name"] != m.get("name") or x.get("batch") != run.get("id"):
+        return None
+    if m.get("record_sha256") is not None and x.get("record_sha256") != m["record_sha256"]:
+        return None
+    return x
+
+
+def new_entry_id(st: dict, position: int) -> str:
+    eid = f"e{position}"
+    if entry_by_id(st, eid):
+        raise StateError(f"entry ID {eid} is taken")
+    return eid
 
 
 def set_status(e: dict, status: str, reason: str | None = None, *, by: str = "runner", action: str | None = None,

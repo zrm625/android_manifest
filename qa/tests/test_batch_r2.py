@@ -139,3 +139,95 @@ class SessionEscape(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- Sol SB1: immutable entry IDs ------------------------------------------------------------------
+
+def _entry(name, pos, status="queued", rev=1, sha="r" * 64, head="1" * 40):
+    return {"name": name, "id": f"e{pos}", "position": pos, "status": status, "rev": rev, "batch": None,
+            "record_sha256": sha, "kind": "change", "branch": name, "identity": f"zrm625/x#{pos}",
+            "prs": [{"key": f"zrm625/x#{pos}", "path": "device/motorola/river", "head": head}],
+            "flags": {}, "decisions": [], "records_before": []}
+
+
+class EntryIdentity(unittest.TestCase):
+    def test_withdraw_and_reenqueue_between_composition_and_claim(self):
+        """A is composed; then A is withdrawn and B enqueued under the same
+        name, at the same rev, before the claim. The claim must not take B
+        with A's composition: the run claims B only after composing B."""
+        from riverbatch import compose, phases, tick
+        from riverbatch import state as S
+        from batchfakes import mk_ctx
+        with bench_home():
+            with S.transaction() as st:
+                st["entries"] = [_entry("perch", 1, sha="a" * 64)]
+            composed = []
+            raced = {"done": False}
+
+            def fake_compose(git, bid, members, base, cams):
+                composed.append([(m["id"], m["record_sha256"]) for m in members])
+                return compose.Composed(members=list(members), commits={"device/motorola/river": "c" * 40},
+                                        trees={"device/motorola/river": "d" * 40})
+
+            def race(git, bid, commits):
+                if raced["done"]:
+                    return
+                raced["done"] = True
+                from riverbatch import commands
+                commands.withdraw("perch")
+                with S.transaction() as st:
+                    b = _entry("perch", S.next_position(st), sha="b" * 64)
+                    st["entries"].append(b)
+            pre = {"base": {"device/motorola/river": "1" * 40, ".repo/manifests": "2" * 40}, "kg": {},
+                   "verified": True, "slugs": {}}
+            with mock.patch.object(phases, "member_checks", return_value=[]), \
+                    mock.patch.object(compose, "compose", fake_compose), \
+                    mock.patch.object(compose, "write_refs", race), \
+                    mock.patch.object(compose, "manifest_xml", return_value={}), \
+                    mock.patch.object(tick.version, "current", return_value={}):
+                run = tick.next_batch(mk_ctx(), pre)
+            st = S.read()
+            self.assertEqual(composed, [[("e1", "a" * 64)], [("e2", "b" * 64)]])
+            self.assertEqual([(m["id"], m["record_sha256"]) for m in run["members"]], [("e2", "b" * 64)])
+            self.assertEqual([(e["id"], e["status"]) for e in st["entries"]], [("e1", "withdrawn"),
+                                                                                ("e2", "in-batch")])
+
+    def test_outcome_never_applies_to_a_new_entry_of_the_same_name(self):
+        """Members are matched by ID: a void of the run returns the entry it
+        claimed, never another one under the name."""
+        from riverbatch import outcomes as O
+        from riverbatch import state as S
+        st = S.empty()
+        a = dict(_entry("perch", 1, status="in-batch", rev=2), batch="b0001")
+        b = dict(_entry("perch", 2, status="in-batch", rev=2), batch="b0001", record_sha256="b" * 64)
+        st["entries"] = [a, b]
+        run = {"id": "b0001", "purpose": "batch", "members": [{"name": "perch", "id": "e1", "rev": 2,
+                                                                "record_sha256": "r" * 64}]}
+        O.apply(st, run, {"class": O.VOID, "reason": "x"})
+        self.assertEqual([e["status"] for e in st["entries"]], ["queued", "in-batch"])
+
+    def test_merge_rule_refuses_a_run_whose_member_record_changed(self):
+        from riverbatch import merge, outcomes as O
+        from riverbatch import state as S
+        with bench_home():
+            with S.transaction() as st:
+                st["entries"] = [dict(_entry("perch", 1, status="in-batch", rev=2), batch="b0001",
+                                      record_sha256="z" * 64)]
+            run = {"id": "b0001", "purpose": "batch", "versions": {},
+                   "members": [{"name": "perch", "id": "e1", "rev": 2, "record_sha256": "r" * 64}]}
+            why = merge.merge_rule(run, {"kind": "batch", "experiment": False}, {"class": O.PASS}, {}, True)
+            self.assertTrue(any("approval record" in w for w in why), why)
+
+    def test_old_state_gets_ids_on_read(self):
+        from riverbatch import state as S
+        with bench_home():
+            with S.transaction() as st:
+                e = _entry("perch", 3, status="in-batch")
+                del e["id"]
+                e["batch"] = "b0001"
+                st["entries"] = [e]
+                st["running"] = {"id": "b0001", "members": [{"name": "perch", "rev": 1}]}
+            st = S.read()
+            self.assertEqual(st["entries"][0]["id"], "e3")
+            self.assertEqual(st["running"]["members"][0]["id"], "e3")
+            self.assertEqual(st["running"]["members"][0]["record_sha256"], "r" * 64)

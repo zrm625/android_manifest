@@ -47,6 +47,11 @@ def merge_rule(run: dict, batch: dict, outcome: dict, versions_now: dict, qualif
             why.append(f"{k} changed since claim")
     if not qualified:
         why.append("not qualified")
+    st = S.read()
+    for m in run.get("members") or []:                      # Sol SB1: the run is bound to its claimed records
+        x = S.member_entry(st, run, m)
+        if not x or x["status"] != "in-batch":
+            why.append(f"{m.get('name')} is no longer the entry claimed under its approval record")
     return why
 
 
@@ -104,9 +109,9 @@ def pr_body(run: dict, entries: list[dict], batch: dict) -> str:
     their approved heads and its council record, then what the phone
     measured."""
     lines = [f"Batch `{run['id']}`, tested on the river test phone by the batch runner.", "", "Changes:"]
-    by_name = {e["name"]: e for e in entries}
+    by_id = {e.get("id"): e for e in entries}
     for m in run["members"]:
-        e = by_name.get(m["name"]) or {}
+        e = by_id.get(m.get("id")) or {}
         lines.append(f"- `{m['name']}`, council record `{str(e.get('record_sha256'))[:16]}` "
                      f"(runner/council/{m['name']}/)")
         for pr in e.get("prs") or []:
@@ -496,7 +501,9 @@ def change_prs(ctx: Ctx, run: dict, st: dict) -> None:
         followup(name, f"{pr['key']}: head moved during close; reopened")
 
     for m in run["members"]:
-        e = S.entry(st, m["name"])
+        e = S.member_entry(st, run, m)                   # Sol SB1
+        if e is None:
+            raise Halt(f"{m['name']}: no longer the entry {bid} claimed", advice="Zak: `batch settle <id> --zak`")
         for pr in e["prs"]:
             repo, n = records.split_key(pr["key"])
             intent = ((S.read().get("running") or {}).get("closing") or {}).get(pr["key"])

@@ -16,7 +16,7 @@ TREE = "c" * 40
 
 def run_dict(**kw):
     return {"id": "b0001", "purpose": "batch", "base": {P: BASE}, "touched": [P],
-            "composed": {P: {"sha": TESTED, "tree": TREE}}, "members": [{"name": "perch"}],
+            "composed": {P: {"sha": TESTED, "tree": TREE}}, "members": [{"name": "perch", "id": "e1"}],
             "merge": {"prs": {P: 7}, "merged": {}, "tag": None}, "attempt_id": "fa-1",
             "versions": {"harness": "h", "runner_build": "rb", "runner_tools": "rt"}, **kw}
 
@@ -290,7 +290,8 @@ class ChangePRs(unittest.TestCase):
                 return v
             gh.pr_view = view
             st = S.read()
-            st["entries"] = [{"name": "perch", "prs": [{"key": f"{R}#6", "path": P, "head": TESTED}]}]
+            st["entries"] = [{"name": "perch", "id": "e1", "batch": "b0001",
+                             "prs": [{"key": f"{R}#6", "path": P, "head": TESTED}]}]
             merge.change_prs(mk_ctx(gh=gh), st["running"], st)
             self.assertIn(("reopen_pr", R, 6), gh.calls)
             self.assertEqual(len(gh.comments_by[(R, 6)]), 2)
@@ -302,7 +303,8 @@ class ChangePRs(unittest.TestCase):
         gh.prs[(R, 6)] = {"state": "OPEN", "headRefOid": TESTED, "baseRefName": "river-22.2",
                           "isCrossRepository": False, "headRefName": "perch"}
         st = S.read()
-        st["entries"] = [{"name": "perch", "prs": [{"key": f"{R}#6", "path": P, "head": TESTED}]}]
+        st["entries"] = [{"name": "perch", "id": "e1", "batch": "b0001",
+                             "prs": [{"key": f"{R}#6", "path": P, "head": TESTED}]}]
         return gh, st
 
     def test_interrupted_close_is_checked_again(self):
@@ -321,7 +323,8 @@ class ChangePRs(unittest.TestCase):
             gh2 = FakeGH()
             gh2.prs, gh2.comments_by = gh.prs, gh.comments_by
             st = S.read()
-            st["entries"] = [{"name": "perch", "prs": [{"key": f"{R}#6", "path": P, "head": TESTED}]}]
+            st["entries"] = [{"name": "perch", "id": "e1", "batch": "b0001",
+                             "prs": [{"key": f"{R}#6", "path": P, "head": TESTED}]}]
             merge.change_prs(mk_ctx(gh=gh2), st["running"], st)
             self.assertIn(("reopen_pr", R, 6), gh2.calls)
             run = S.read()["running"]
@@ -341,7 +344,8 @@ class ChangePRs(unittest.TestCase):
             gh2 = FakeGH()
             gh2.prs, gh2.comments_by = gh.prs, gh.comments_by
             st = S.read()
-            st["entries"] = [{"name": "perch", "prs": [{"key": f"{R}#6", "path": P, "head": TESTED}]}]
+            st["entries"] = [{"name": "perch", "id": "e1", "batch": "b0001",
+                             "prs": [{"key": f"{R}#6", "path": P, "head": TESTED}]}]
             merge.change_prs(mk_ctx(gh=gh2), st["running"], st)
             self.assertNotIn(("reopen_pr", R, 6), gh2.calls)
             self.assertEqual(S.read()["running"]["closing"], {})

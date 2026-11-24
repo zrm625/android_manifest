@@ -92,8 +92,12 @@ def settle(ctx: Ctx, bid: str) -> dict:
         tags = [p for p in sorted(b.get("commit_set") or {})
                 if ctx.gh.ls_remote(url(sl[p]), f"refs/tags/known-good-{bid}") is not None]
         landed = {}
+        members = {m["name"]: S.member_entry(st, run, m) for m in run["members"]}     # Sol SB1
+        lost = [n for n, e in members.items() if e is None]
+        if lost:
+            raise Refused(f"{', '.join(lost)}: no longer the entry {bid} claimed; Zak inspects the state file")
         for m in run["members"]:
-            e = S.entry(st, m["name"])
+            e = members[m["name"]]
             got = [p for p in e["prs"] if is_ancestor(ctx, records.split_key(p["key"])[0], p["head"])]
             landed[m["name"]] = ("all" if len(got) == len(e["prs"]) else "some" if got else "none",
                                  [p["key"] for p in got])
@@ -102,7 +106,7 @@ def settle(ctx: Ctx, bid: str) -> dict:
         if not promoted:
             for name, (how, _) in landed.items():
                 if how == "none":
-                    e = S.entry(st, name)
+                    e = members[name]
                     rec, errs = records.load_bundle(name, e["record_sha256"])
                     try:
                         elig[name] = commands.eligibility_of(ctx, rec, errs)
@@ -116,7 +120,7 @@ def settle(ctx: Ctx, bid: str) -> dict:
         with S.transaction("settle", batch=bid) as st2:
             r = st2["running"]
             for m in r["members"]:
-                e = S.entry(st2, m["name"])
+                e = S.member_entry(st2, r, m)
                 if not e or e["status"] != "in-batch":
                     continue
                 how, keys = landed[m["name"]]

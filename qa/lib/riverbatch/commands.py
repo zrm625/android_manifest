@@ -68,10 +68,11 @@ def eligibility_of(ctx: Ctx, rec: dict | None, errs: list[str]) -> eligibility.O
 
 def new_entry(st: dict, rec: dict, sha: str) -> dict:
     heads = records.approved_heads(rec)
-    return {"name": rec["name"], "branch": rec["branch"], "record_sha256": sha, "kind": rec["kind"],
-            "identity": records.identity(rec),
+    pos = S.next_position(st)
+    return {"name": rec["name"], "id": S.new_entry_id(st, pos), "branch": rec["branch"], "record_sha256": sha,
+            "kind": rec["kind"], "identity": records.identity(rec),
             "prs": [{"key": p["key"], "path": p["path"], "head": heads[p["key"]]} for p in rec["prs"]],
-            "position": S.next_position(st),
+            "position": pos,
             "flags": {"alone": bool(rec.get("alone")), "solo": False,
                       "upstream": rec["branch"].startswith("upstream-")},
             "status": None, "status_at": None, "reason": None, "rev": 0, "decisions": [],
@@ -89,7 +90,7 @@ def enqueue(ctx: Ctx, record_file: Path) -> str:
     name = rec["name"]
     keys = [p["key"] for p in rec["prs"]]
     st0 = S.read()
-    _admissible(st0, rec, keys)
+    old0 = _admissible(st0, rec, keys)
     out = eligibility_of(ctx, rec, [])                            # GitHub first, outside the lock
     if out.kind == eligibility.REFUSED:
         raise Refused(out.reason)
@@ -98,6 +99,9 @@ def enqueue(ctx: Ctx, record_file: Path) -> str:
     sha = records.store_bundle(rec, raw, record_file.parent)      # R5.1: before the transaction
     with S.transaction("enqueue", name=name) as st:
         old = _admissible(st, rec, keys)
+        if (old is None) != (old0 is None) or (old is not None and (old["id"], old["rev"]) != (old0["id"],
+                                                                                                old0["rev"])):
+            raise Refused(f"{name} changed meanwhile; run enqueue again")      # Sol SB1
         if old is not None:                                       # R5.6: replace
             e = old
             e["records_before"].append(e["record_sha256"])
@@ -175,7 +179,7 @@ def requeue(ctx: Ctx, name: str, reason: str, zak: bool) -> str:
     out = eligibility_of(ctx, rec, errs)
     with S.transaction("requeue", name=name, zak=zak) as st:
         e = S.live_entry(st, name)
-        if not e or e["rev"] != e0["rev"]:
+        if not e or e["id"] != e0["id"] or e["rev"] != e0["rev"]:                 # Sol SB1
             raise Refused(f"{name} changed meanwhile; run requeue again")
         idx = e.get("last_evidence_index")
         if out.kind == eligibility.OK:
