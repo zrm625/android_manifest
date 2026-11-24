@@ -146,7 +146,8 @@ def compose_run(ctx: Ctx, bid: str, purpose: str, members: list[dict], base: dic
 def stage_cmd(ctx: Ctx, kind: str, bid: str, changes: list[str]) -> dict:
     if kind not in ("calibration", "baseline"):
         raise Refused("--kind is calibration or baseline")
-    rstage.check_id(bid, "batch ID")
+    if not re.match(r"^[A-Za-z0-9._-]{1,80}$", bid or ""):
+        raise Refused(f"bad batch ID {bid!r}")
     if RUNNER_ID_RE.match(bid):
         raise Refused(f"{bid} is a runner ID (bNNNN, qNNNN); pick another")
     if (paths.batch_dir(bid) / "batch.json").exists():

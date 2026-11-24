@@ -130,6 +130,7 @@ def failures(st: dict, name: str, ident: str | None = None) -> list[dict]:
     identity ever linked to ``name`` (through ``aliases``), plus ``ident``."""
     idents = {k for k in st["failure_history"]
               if any(st["aliases"].get(p) == name for p in k.split("+"))}
+    idents |= {e["identity"] for e in st["entries"] if e["name"] == name and e.get("identity")}
     if ident:
         idents.add(ident)
     out = []

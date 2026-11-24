@@ -115,9 +115,20 @@ def main(argv: list[str]) -> int:
     record = None
     stopping = {"sig": None}
 
+    def kill_group(sig):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
+
     def on_signal(signum, _frame):
+        # SIGTERM the group at once, SIGKILL it after GRACE; the main thread
+        # reaps the child (a handler must not wait: wait() holds the lock).
         stopping["sig"] = signum
-        end_group(pgid, proc)
+        kill_group(signal.SIGTERM)
+        signal.alarm(int(GRACE))
+
+    signal.signal(signal.SIGALRM, lambda *_: kill_group(signal.SIGKILL))
     for s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(s, on_signal)
     try:
@@ -141,6 +152,7 @@ def main(argv: list[str]) -> int:
                 record.unlink()
             except FileNotFoundError:
                 pass
+    signal.alarm(0)
     if stopping["sig"] is not None and rc == 0:
         rc = 128 + stopping["sig"]
     return 128 - rc if rc < 0 else rc

@@ -1,0 +1,229 @@
+"""stage and qualify refusals (R2.4, I20), stage's finish transaction (I6),
+the camera backstop only for production kinds (I10), part 1's measurement
+and comparison (R14.2, I8), and the runner version hashes (R2.2)."""
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import _path  # noqa: F401
+from batchfakes import mk_ctx, write_json
+from benchhome import bench_home
+from riverbatch import abtest, ctx as C, outcomes as O, phases, qualify, state as S, version
+
+
+def kg_files(h, pair=None, slot_batch="kg", kg_batch="kg"):
+    write_json(h / "slot-state.json", {"known_good_slot": "a", "known_good": {"batch": slot_batch}, "pair": pair})
+    write_json(h / "qa/known-good.json", {"latest": {"batch": kg_batch, "cameras": [0, 1, 2]}})
+
+
+class Refusals(unittest.TestCase):
+    def test_halt_is_3(self):
+        with bench_home():
+            with S.transaction() as st:
+                S.set_halt(st, "x")
+            with self.assertRaises(qualify.HaltedState):
+                qualify.refusals(mk_ctx(), "qualify")
+
+    def test_running_batch_or_merge_started(self):
+        with bench_home() as h:
+            kg_files(h)
+            with S.transaction() as st:
+                st["running"] = {"id": "b0001", "purpose": "batch"}
+            with self.assertRaises(S.Refused):
+                qualify.refusals(mk_ctx(), "qualify")
+            with S.transaction() as st:
+                st["running"] = {"id": "q0001", "purpose": "qualify"}
+            write_json(h / "batches/q0001/batch.json", {"merge_started": {"at": "t"}})
+            with self.assertRaises(S.Refused):
+                qualify.refusals(mk_ctx(), "qualify")
+
+    def test_interrupted_qualify_run_with_a_pair(self):
+        with bench_home() as h:
+            kg_files(h, pair={"batch": "q0001", "kind": "batch"})
+            with S.transaction() as st:
+                st["running"] = {"id": "q0001", "purpose": "qualify"}
+            qualify.refusals(mk_ctx(), "qualify")                   # qualify may abort it
+            with self.assertRaises(S.Refused) as cm:
+                qualify.refusals(mk_ctx(), "stage")                 # stage does no phone work
+            self.assertIn("still holds a slot pair", str(cm.exception))
+
+    def test_i20_live_blockers_refuse_even_under_a_pause(self):
+        cases = [
+            (dict(pair={"batch": "cal-1", "kind": "calibration"}), None, "phone in use by cal-1"),
+            (dict(kg_batch="other"), None, "known-good records disagree"),
+            ({}, "strike", "strike limit"),
+            ({}, "lease", "tree lease"),
+        ]
+        for kw, extra, want in cases:
+            with bench_home() as h:
+                kg_files(h, **kw)
+                with S.transaction() as st:
+                    S.set_pause(st, "two voids in a row")
+                    if extra == "strike":
+                        st["strikes"]["setup"] = 2
+                    if extra == "lease":
+                        st["lease"] = {"batch": "b0004", "expect": {}, "base": {}}
+                for cmd in ("qualify", "stage"):
+                    with self.assertRaises(S.Refused) as cm:
+                        qualify.refusals(mk_ctx(), cmd)
+                    self.assertIn(want, str(cm.exception))
+
+    def test_stage_id_rules(self):
+        with bench_home():
+            for bad, why in (("b0007", "runner ID"), ("q0001", "runner ID")):
+                with self.assertRaises(S.Refused) as cm:
+                    qualify.stage_cmd(mk_ctx(), "calibration", bad, [])
+                self.assertIn(why, str(cm.exception))
+            with self.assertRaises(S.Refused):
+                qualify.stage_cmd(mk_ctx(), "baseline", "base-3", ["perch"])
+            with self.assertRaises(S.Refused):
+                qualify.stage_cmd(mk_ctx(), "experiment", "x-1", [])
+
+
+class StageFinish(unittest.TestCase):
+    """I6 and I10 through stage_cmd with its steps faked."""
+
+    def test_running_and_lease_cleared_after_staging(self):
+        with bench_home() as h:
+            kg_files(h)
+            seen = {}
+
+            def compose_run(ctx, bid, purpose, members, base, kg, pin, verified):
+                run = {"id": bid, "purpose": purpose, "touched": [], "base": base, "composed": {},
+                       "versions": {"image_id": pin}}
+                with S.transaction() as st:
+                    st["running"] = run
+                return run
+
+            def stage_run(ctx, run, kind, experiment, kg):
+                seen["kg"] = kg
+                seen["running"] = S.read()["running"]["id"]
+            with mock.patch.object(qualify, "pin_image", return_value="img"), \
+                    mock.patch.object(qualify, "local_base", return_value={".repo/manifests": "m" * 40}), \
+                    mock.patch.object(qualify, "compose_run", compose_run), \
+                    mock.patch.object(qualify.phases, "build"), \
+                    mock.patch.object(qualify.phases, "stage_run", stage_run), \
+                    mock.patch.object(qualify.phases, "restore_or_void"), \
+                    mock.patch.object(C.Locks, "__enter__", lambda self: self), \
+                    mock.patch.object(C.Locks, "__exit__", lambda self, *a: None):
+                out = qualify.stage_cmd(mk_ctx(), "baseline", "base-3", [])
+            st = S.read()
+            self.assertEqual(out["staged"], "base-3")
+            self.assertEqual(seen, {"kg": None, "running": "base-3"})    # I10: no camera backstop
+            self.assertIsNone(st["running"])                            # I6
+            self.assertIsNone(st["lease"])
+
+    def test_camera_backstop_for_production_only(self):
+        with bench_home() as h:
+            kg_files(h)
+            write_json(h / "batches/b0001/batch.json", {"cameras": {"set": [0, 1]}})
+            with S.transaction() as st:
+                st["running"] = {"id": "b0001", "phase": "building"}
+            run = {"id": "b0001", "composed": {}, "base": {".repo/manifests": "m"}}
+            ctx = mk_ctx()
+            with self.assertRaises(C.Abort) as cm:
+                phases.stage_run(ctx, run, "batch", False, {"latest": {"cameras": [0, 1, 2]}})
+            self.assertEqual(cm.exception.pause, "camera set differs from known-good; needs Zak")
+            phases.stage_run(ctx, run, "baseline", False, None)          # a changed set is allowed
+
+
+class ABTest(unittest.TestCase):
+    """R14.2 and I8."""
+
+    CS = {"device/motorola/river": "1" * 40, "kernel/motorola/sdm632": "2" * 40, ".repo/manifests": "3" * 40}
+
+    def manifest_xml(self, river="1" * 40):
+        return ("<manifest>\n"
+                f'  <project path="device/motorola/river" name="x" revision="{river}"/>\n'
+                f'  <project path="kernel/motorola/sdm632" name="k" revision="{"2" * 40}"/>\n'
+                f'  <project path="external/foo" name="f" revision="{"7" * 40}"/>\n</manifest>\n')
+
+    def test_i8_build_manifest_revisions_checked_and_blanked(self):
+        a, errs = abtest.normalize_build_manifest(self.manifest_xml(), self.CS)
+        self.assertEqual(errs, [])
+        self.assertIn('revision="EXPECTED"', a)
+        self.assertIn("7" * 40, a)                                # other projects keep their revisions
+        b, errs = abtest.normalize_build_manifest(self.manifest_xml("9" * 40), self.CS)
+        self.assertTrue(errs and "device/motorola/river" in errs[0])
+        b_cs = dict(self.CS, **{"device/motorola/river": "9" * 40})
+        b, errs = abtest.normalize_build_manifest(self.manifest_xml("9" * 40), b_cs)
+        self.assertEqual((errs, a), ([], b))                      # A and B compare equal after blanking
+
+    def test_mask_prop(self):
+        text = "ro.build.date=X\nro.vendor.build.date.utc=1\nro.river.build_id=b1-x\nro.product.model=g7\n"
+        self.assertEqual(abtest.mask_prop(text, abtest.load("abtest_masks.json")["props"]), "ro.product.model=g7")
+
+    def test_hash_tree(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t)
+            (p / "system/product/etc").mkdir(parents=True)
+            (p / "vendor/etc").mkdir(parents=True)
+            (p / "system/build.prop").write_text("ro.build.date=1\nro.x=1\n")
+            (p / "system/product/etc/build-manifest.xml").write_text(self.manifest_xml())
+            (p / "vendor/etc/a.conf").write_text("a")
+            files, errs = abtest.hash_tree(p, ["ro\\.build\\.date"], [], self.CS)
+            (p / "system/build.prop").write_text("ro.build.date=2\nro.x=1\n")
+            files2, _ = abtest.hash_tree(p, ["ro\\.build\\.date"], [], self.CS)
+            self.assertEqual(files, files2)
+            self.assertEqual(errs, [])
+
+    def m(self, files=None, dtbo="d", ovl=None, ikc="i", old=True, new=False):
+        return {"files": files or {"vendor/etc/audio_ext_spkr.conf": "1"}, "errors": [], "dtbo": dtbo,
+                "overlays": ovl or {"o": "1"}, "boot_info": {"ikconfig_sha256": ikc}, "kernel_old": old,
+                "kernel_new": new}
+
+    def passing(self):
+        cfg = abtest.load("abtest_config.json")
+        a = self.m()
+        b1 = self.m(files={"vendor/etc/audio_ext_spkr.conf": "2", "vendor/etc/abtest-marker.txt": "3"},
+                    old=False, new=True)
+        return cfg, {"A": a, "B1": b1, "A1": self.m(), "B2": self.m(dtbo="d2", ovl={"o": "2"}), "A2": self.m(),
+                     "B3": self.m(ikc="i2"), "A3": self.m(), "B4": dict(b1), "A4": self.m()}
+
+    def test_compare_passes_and_each_criterion_fails(self):
+        cfg, m = self.passing()
+        self.assertEqual(abtest.compare(m, cfg), [])
+        bad = [("A2", dict(m["A2"], dtbo="x")), ("B2", dict(m["B2"], dtbo="d")), ("B3", dict(m["B3"], boot_info={"ikconfig_sha256": "i"})),
+               ("A4", dict(m["A4"], kernel_new=True)), ("B1", dict(m["B1"], kernel_old=True)),
+               ("A1", dict(m["A1"], files={"x": "1"}))]
+        for k, v in bad:
+            mm = dict(m, **{k: v})
+            self.assertTrue(abtest.compare(mm, cfg), k)
+
+    def test_config_targets_are_same_size(self):
+        cfg = abtest.load("abtest_config.json")
+        for b in ("B1", "B2", "B3"):
+            for e in cfg[b]["edits"]:
+                self.assertEqual(len(e["old"]), len(e["new"]), e)
+                self.assertNotEqual(e["old"], e["new"])
+        self.assertEqual(cfg["B4"]["string"], cfg["B1"]["kernel"]["new"])
+
+
+class Versions(unittest.TestCase):
+    def test_runner_build_counts_tracked_package_files_only(self):
+        files = version.package_files()
+        self.assertIn("qa/lib/riverbatch/tick.py", files)
+        self.assertIn("qa/lib/riverbatch/manifest_stub.xml", files)
+        self.assertIn("qa/lib/riverbatch/tc_allowlist.json", files)
+        self.assertFalse(any("__pycache__" in f for f in files))
+        self.assertNotIn("qa/lib/riverbatch/../riverqa/qa.py", files)
+        self.assertEqual(len(version.runner_build()), 16)
+        self.assertNotEqual(version.runner_build(), version.runner_tools())
+
+    def test_harness_version_ignores_the_runner(self):
+        from riverqa import qa
+        import inspect
+        src = inspect.getsource(qa.harness_version)
+        self.assertIn('"riverqa"', src)
+        self.assertNotIn("riverbatch", src)
+
+
+class Outcome(unittest.TestCase):
+    def test_qa_gate_state_pauses(self):
+        self.assertIn("calibrat", " ".join(phases.GATE_WORDS))
+        self.assertEqual(O.PASS, "pass")
+
+
+if __name__ == "__main__":
+    unittest.main()
