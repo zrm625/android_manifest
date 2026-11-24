@@ -1,0 +1,7 @@
+{
+  "comment": "Entries git status may show in a TC (R7.4 item 3). A trailing / is a directory prefix. An allowlisted __pycache__/ may hold only *.cpython-*.pyc files named after a .py in its parent. Nothing in the build reads these paths.",
+  "projects": {
+    "tools/extract-utils": ["extract_utils/__pycache__/"]
+  },
+  "manifest": ["qa/lib/riverqa/__pycache__/", "qa/lib/riverbatch/__pycache__/", "qa/tests/__pycache__/", "qa/.ruff_cache/"]
+}

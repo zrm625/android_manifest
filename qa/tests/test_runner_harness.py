@@ -326,7 +326,7 @@ class TypedLookup(unittest.TestCase):
         self.assertEqual(recovery.classify(1, "", "HTTP 403 x-ratelimit-remaining: 0")[0], recovery.TRANSPORT)
 
 
-from test_promote import BID, COMMITS, EXPECTED, SLUGS, phone, setup  # noqa: E402
+from test_promote import COMMITS, SLUGS, phone, setup  # noqa: E402
 
 
 def promote_with(runner):
