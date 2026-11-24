@@ -1617,12 +1617,23 @@ def launch_and_watch(run, cid, key, start_cmd, accept_vpn_dialog=False) -> Resul
         # The VPN consent dialog is the system's, not the app's: the app
         # counts as launched only if its own activity is resumed once the
         # dialog is dismissed (never accepted). Review round 2.
+        # Tailscale asks again as soon as it is back in front, so dismiss
+        # up to three times.
         d["vpn_dialog"] = "shown; dismissed, never accepted"
-        dev.sh("input keyevent KEYCODE_BACK")
-        time.sleep(2)
-        top = top_activity(dev)
+        for _ in range(3):
+            dev.sh("input keyevent KEYCODE_BACK")
+            time.sleep(2)
+            top = top_activity(dev)
+            if component_package(top[0]) != "com.android.vpndialogs":
+                break
         d["top_after_dialog"] = helper.fmt_top(top)
     opened = vpn_launch_ok(top, f["package"])
+    if (not opened and accept_vpn_dialog and component_package(top[0]) == "com.android.vpndialogs"
+            and f"{f['package']}/" in dev.sh("dumpsys activity activities", timeout=30)):
+        # The dialog keeps coming back over the app's own activity: the app
+        # launched and is asking for VPN consent.
+        d["vpn_dialog_repeats"] = "app activity in the task stack under the dialog"
+        opened = True
     resumed = opened
     run.sideload[key]["launch"] = opened
     time.sleep(10)
