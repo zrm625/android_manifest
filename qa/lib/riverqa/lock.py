@@ -125,7 +125,9 @@ class DeviceLock:
     def acquire(self) -> "DeviceLock":
         path = _path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        if self.check_build:
+        # Tries pipeline (CHARTER.md): the phone tests one try while the next
+        # builds at nice 19. RIVER_DEVICE_DURING_BUILD=1 opts in to that.
+        if self.check_build and os.environ.get("RIVER_DEVICE_DURING_BUILD") != "1":
             _refuse_during_build()
         env_token = os.environ.get("BENCH_LOCK_TOKEN")
         if env_token:
