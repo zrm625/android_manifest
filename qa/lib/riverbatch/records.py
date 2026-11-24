@@ -33,6 +33,11 @@ A SHA merely mentioned somewhere does not bind anything. Each reply also has
 a verdict line ``Verdict: APPROVE`` (optionally with the score) equal to the
 provider's recorded verdict. A reply about other heads, another scope, a
 reversed delta, swapped PRs or another verdict does not count.
+
+**One reply per provider** (Sol SB3). Every reply a record names, in every
+round, is its own file with its own content: no file name and no SHA-256
+appears twice among the replies and briefs, so one reviewer's reply can
+never count as another provider's vote.
 """
 
 from __future__ import annotations
@@ -257,10 +262,37 @@ def validate(record: dict, directory: Path, kinds=KINDS) -> list[str]:
                     errs.extend(f"{where}: {e}" for e in check_reply(text, rnd, prov, verdicts.get(prov)))
                 except RecordError as e:
                     errs.append(str(e))
+        errs.extend(_distinct_replies(rounds))
         if not isinstance(record.get("prior", []), list):
             errs.append("prior must be a list")
     except (RecordError, KeyError, TypeError, AttributeError) as e:
         errs.append(f"malformed record: {e}")
+    return errs
+
+
+def _distinct_replies(rounds: list) -> list[str]:
+    """Sol SB3: every reply (and brief) of the record is a distinct file
+    with distinct content; a reused file or digest is refused."""
+    errs: list[str] = []
+    files: dict[str, str] = {}
+    digests: dict[str, str] = {}
+    for i, rnd in enumerate(rounds):
+        if not isinstance(rnd, dict):
+            continue
+        items = [("brief", rnd.get("brief"), rnd.get("brief_sha256"))]
+        items += [(prov, (rep or {}).get("file"), (rep or {}).get("sha256"))
+                  for prov, rep in sorted((rnd.get("replies") or {}).items()) if isinstance(rep, dict)]
+        for who, f, d in items:
+            where = f"round {i + 1} {who}"
+            if isinstance(f, str):
+                if f in files:
+                    errs.append(f"{where}: {f} is also {files[f]}'s file; each provider's reply is its own file")
+                files.setdefault(f, where)
+            if isinstance(d, str):
+                if d in digests:
+                    errs.append(f"{where}: its content is identical to {digests[d]}'s; one reply cannot be "
+                                "another provider's vote")
+                digests.setdefault(d, where)
     return errs
 
 

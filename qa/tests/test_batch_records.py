@@ -31,7 +31,7 @@ def write_round(d: Path, tag: str, scope: str, heads: dict, verdicts=None, reply
     verdicts = verdicts or {p: "APPROVE 9" for p in records.PROVIDERS}
     replies = {}
     for p in records.PROVIDERS:
-        text = block(scope, heads) + f"I reviewed it.\nVerdict: {verdicts[p]}\n{reply_extra}"
+        text = block(scope, heads) + f"{p} reviewed it.\nVerdict: {verdicts[p]}\n{reply_extra}"
         (d / f"{tag}-{p}.txt").write_text(text)
         replies[p] = {"file": f"{tag}-{p}.txt", "sha256": sha(text.encode())}
     return {"scope": scope, "at": "2026-11-23", "brief": f"{tag}-brief.md", "brief_sha256": sha(brief.encode()),

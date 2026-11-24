@@ -508,6 +508,9 @@ spells it. A record is valid only if:
    to the round's `heads` exactly; each reply also has the provider's
    recorded `Verdict:`. A reply from another round, about other heads, with
    a reversed delta or swapped PRs, does not count.
+6. **One reply per provider** (Sol SB3). No file name and no SHA-256
+   appears twice among the record's briefs and replies, in any round: a
+   reply reused under another provider's name, or a copy of it, is refused.
 
 R5.3. **PR set check:** the open PRs in every fork and the manifest with head
 branch `branch` and base `river-22.2` are exactly the record's PRs, each at

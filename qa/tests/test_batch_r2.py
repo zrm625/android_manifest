@@ -231,3 +231,42 @@ class EntryIdentity(unittest.TestCase):
             self.assertEqual(st["entries"][0]["id"], "e3")
             self.assertEqual(st["running"]["members"][0]["id"], "e3")
             self.assertEqual(st["running"]["members"][0]["record_sha256"], "r" * 64)
+
+
+# --- Sol SB3: one reply per provider ---------------------------------------------------------------
+
+class OneReplyPerProvider(unittest.TestCase):
+    def enqueue_with(self, mutate):
+        from batchfakes import FakeGH, mk_ctx
+        from riverbatch import commands, records
+        from riverbatch import state as S
+        from test_batch_commands import world
+        from test_batch_records import make_record
+        with bench_home() as h, tempfile.TemporaryDirectory() as t:
+            d = Path(t)
+            rec = make_record(d, delta=False)
+            mutate(d, rec["rounds"][0])
+            (d / "record.json").write_text(json.dumps(rec))
+            gh = FakeGH()
+            world(h, gh, rec)
+            with self.assertRaises(S.Refused) as cm:
+                commands.enqueue(mk_ctx(gh=gh), d / "record.json")
+            self.assertEqual(S.read()["entries"], [])
+            self.assertFalse((h / "runner/council").exists())
+            return str(cm.exception)
+
+    def test_one_file_for_every_provider_is_refused(self):
+        def same_file(d, rnd):
+            for p in ("gemini", "sol"):
+                rnd["replies"][p] = dict(rnd["replies"]["opus"])
+        why = self.enqueue_with(same_file)
+        self.assertIn("its own file", why)
+
+    def test_identical_content_under_other_names_is_refused(self):
+        def same_text(d, rnd):
+            text = (d / rnd["replies"]["opus"]["file"]).read_bytes()
+            for p in ("gemini", "sol"):
+                (d / rnd["replies"][p]["file"]).write_bytes(text)
+                rnd["replies"][p]["sha256"] = rnd["replies"]["opus"]["sha256"]
+        why = self.enqueue_with(same_text)
+        self.assertIn("identical", why)
