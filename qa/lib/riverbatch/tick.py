@@ -69,11 +69,12 @@ def preflight(ctx: Ctx) -> dict:
     expect = dict(base)
     r = ctx.tc_check(expect)                                                     # 4
     if not r.ok:
-        raise Blocked("tree check failed: " + r.summary())
+        raise Blocked("tree check failed: " + r.summary(), step="tree")
     recover.retention(ctx)                                                       # 5 (I17)
     free = ctx.free_gb(paths.home())
     if free < ctx.cfg["free_space_floor_gb"]:
-        raise Blocked(f"only {free:.0f} GB free in $BENCH_HOME (floor {ctx.cfg['free_space_floor_gb']} GB)")
+        raise Blocked(f"only {free:.0f} GB free in $BENCH_HOME (floor {ctx.cfg['free_space_floor_gb']} GB)",
+                      step="free-space")
     why = qualification_problems(ctx)                                            # 6
     if why:
         raise NotQualified("not qualified: " + "; ".join(why))
@@ -175,8 +176,8 @@ def next_batch(ctx: Ctx, pre: dict) -> dict | None:
         for e, why in comp.needs_reapproval + comp.waiting_zak:
             status = "needs-reapproval" if any(x is e for x, _ in comp.needs_reapproval) else "waiting-zak"
             with S.transaction("compose-drop", name=e["name"], status=status) as st2:
-                x = S.entry(st2, e["name"])
-                if x and x["status"] == "queued" and x["rev"] == e["rev"]:
+                x = S.same_entry(st2, e)                                   # Sol SB1
+                if x and x["status"] == "queued":
                     S.set_status(x, status, why)
         if not comp.members:
             continue
@@ -218,16 +219,20 @@ def run_batch(ctx: Ctx, run: dict, kg: dict) -> None:
                 try:
                     merge_path(ctx)
                     return
-                except Abort as a:
+                except (Abort, Refused) as a:
                     # Sol M1, Gemini GB1, Opus OM2: R10.2-R10.3 refused before
                     # merge_started (a stale base, a conflict, a PR at another
-                    # head, the pair or versions changed): the batch is void
+                    # head, the pair or versions changed), or GitHub refused a
+                    # call there (Sol SM3, Gemini GM2-3): the batch is void
                     # and ends here, through R11.2 step 2, in this tick.
                     if (ctx.batch_json(run["id"]) or {}).get("merge_started"):
-                        raise Halt(f"{run['id']}: the merge path aborted after merge_started: {a}",
+                        raise Halt(f"{run['id']}: the merge path stopped after merge_started: {a}",
                                    advice="Zak: `batch settle <id> --zak`") from a
-                    with S.transaction("decided", batch=run["id"], cls=a.outcome.get("class")) as st:
-                        st["running"]["outcome"] = dict(a.outcome, pause=a.pause or a.outcome.get("pause"))
+                    out = a.outcome if isinstance(a, Abort) else {"class": O.VOID,
+                                                                  "reason": f"GitHub refused: {a}"}
+                    pause = a.pause if isinstance(a, Abort) else None
+                    with S.transaction("decided", batch=run["id"], cls=out.get("class")) as st:
+                        st["running"]["outcome"] = dict(out, pause=pause or out.get("pause"))
             else:
                 with S.transaction() as st:
                     st["running"]["outcome"] = {"class": O.VOID, "reason": "merge rule: " + "; ".join(why),
@@ -303,11 +308,17 @@ def commit_stop(e: Stop) -> None:
                 S.set_pause(st, e.message, e.step, e.advice)
                 S.add_report(st, f"pause-{int(time.time())}")
         elif isinstance(e, (Blocked, NotQualified, Retry)):
+            # Opus minor: a blocker is keyed on its kind and stable cause
+            # (``step`` when the message carries changing numbers, such as
+            # the free space), so one cause queues one report.
             old = st.get("blocker") or {}
-            if (old.get("kind"), old.get("message")) != (e.kind, e.message):
-                st["blocker"] = {"kind": e.kind, "message": e.message, "at": now_iso(),
+            cause = e.step or e.message
+            if (old.get("kind"), old.get("cause", old.get("message"))) != (e.kind, cause):
+                st["blocker"] = {"kind": e.kind, "cause": cause, "message": e.message, "at": now_iso(),
                                  "report": f"{e.kind}-{int(time.time())}"}
                 S.add_report(st, st["blocker"]["report"])
+            else:
+                st["blocker"] = dict(old, message=e.message)
 
 
 def clear_blocker() -> None:
@@ -318,6 +329,7 @@ def clear_blocker() -> None:
 
 def tick(ctx: Ctx, max_batches: int) -> tuple[int, dict]:
     summary = {"ran": [], "state": "idle"}
+    ctx.tick_id = ctx.tick_id or f"{now_iso()}-{os.getpid()}"
     st = S.read()
     report.flush(ctx)                                                          # 1
     if st.get("halt"):
@@ -347,7 +359,7 @@ def tick(ctx: Ctx, max_batches: int) -> tuple[int, dict]:
                 locks.release()
                 locks = Locks(ctx).__enter__()
                 if S.read().get("halt"):
-                    return EXIT_HALT, {"state": "halted", **summary}
+                    return EXIT_HALT, {**summary, "state": "halted"}
                 if S.read().get("pause"):
                     paused_now = True
                     break
@@ -361,7 +373,7 @@ def tick(ctx: Ctx, max_batches: int) -> tuple[int, dict]:
             commit_stop(e)
             if isinstance(e, Halt):
                 report.flush(ctx)
-                return EXIT_HALT, {"state": "halted", "halt": e.message, **summary}
+                return EXIT_HALT, {**summary, "state": "halted", "halt": e.message}
             paused_now = paused_now or isinstance(e, Pause)
             summary["state"] = e.kind
             summary["why"] = e.message
@@ -373,11 +385,15 @@ def tick(ctx: Ctx, max_batches: int) -> tuple[int, dict]:
                 recover.entry_point(ctx, setup=True, local_only=bool(ctx.unknown))
         except Unknown as e:
             ctx.unknown = ctx.unknown or str(e)
+        except AuthRefused as e:                        # Gemini minor: at step 6 too, a pause
+            commit_stop(Pause(f"GitHub auth: {e.repo}: {e.status}", step="auth"))
+            if summary["state"] == "idle":
+                summary["state"], summary["why"] = "pause", f"GitHub auth: {e.repo}: {e.status}"
         except (Halt, Pause, Blocked, Retry) as e:
             commit_stop(e)
             if isinstance(e, Halt):
                 report.flush(ctx)
-                return EXIT_HALT, {"state": "halted", "halt": e.message, **summary}
+                return EXIT_HALT, {**summary, "state": "halted", "halt": e.message}
             if summary["state"] == "idle":
                 summary["state"], summary["why"] = e.kind, e.message
         report.flush(ctx)

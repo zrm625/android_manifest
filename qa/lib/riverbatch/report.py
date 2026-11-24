@@ -9,9 +9,84 @@ from __future__ import annotations
 import html
 import json
 
-from riverqa.core import now_iso, read_json, read_jsonl
+from riverqa.core import now_iso, read_json, read_jsonl, write_json
 
 from . import paths, state as S
+
+MEASURED = ("run_id", "host_boot_seconds", "used_ram_kb", "system_used_kb", "vendor_used_kb")
+
+
+def snapshot(ctx, run: dict, outcome: dict, final: bool) -> None:
+    """Sol SM8: ``batches/<id>/outcome.json``, the run's outcome with its
+    evidence, QA result, the candidate's measurements and the known-good
+    reference it was decided against, written at the decision and again
+    when the run ends, so a split, a void or a finish never loses it once
+    ``running`` is cleared. Reports render it."""
+    from riverqa import bench as rbench
+    bid = run.get("id")
+    try:
+        d = paths.batch_dir(bid)
+    except ValueError:
+        return
+    b = read_json(d / "batch.json", {}) or {}
+    try:
+        rows = rbench.attempt_rows(b) if b.get("batch") else []
+    except (OSError, KeyError, ValueError):
+        rows = []
+    old = read_json(d / "outcome.json", {}) or {}
+    kg = read_json(paths.known_good_file(), {}) or {}
+    latest = kg.get("latest") or {}
+    snap = {"batch": bid, "purpose": run.get("purpose"), "at": now_iso(), "final": final,
+            "outcome": outcome, "members": run.get("members") or [], "borrowed": run.get("borrowed") or [],
+            "attempt_id": run.get("attempt_id"), "content_key": run.get("content_key"),
+            "base_verified": run.get("base_verified"), "qa": run.get("qa"), "ram": run.get("ram"),
+            "measurements": [{k: r.get(k) for k in MEASURED} for r in rows],
+            # the reference as it stood at the decision; the final write keeps it
+            "reference": old.get("reference") or {
+                "ram_reference": kg.get("ram_reference"),
+                "known_good": {k: latest.get(k) for k in ("batch", "tag", "host_boot_seconds", "system_used_kb",
+                                                          "vendor_used_kb")}}}
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        write_json(d / "outcome.json", snap)
+    except OSError:
+        pass
+
+
+def _outcome_section(rid: str) -> list[str]:
+    try:
+        snap = read_json(paths.batch_dir(rid) / "outcome.json")
+    except (ValueError, OSError):
+        snap = None
+    if not snap:
+        return []
+    o = snap.get("outcome") or {}
+    ev = o.get("evidence") or {}
+    rows = [("class", e(o.get("class"))), ("reason", e(o.get("reason"))),
+            ("failing checks", e(", ".join(o.get("checks") or []))), ("rescued", e(o.get("rescued"))),
+            ("step", e(ev.get("step"))), ("QA run", e((snap.get("qa") or {}).get("run_id"))),
+            ("QA exit / eligible", e(f"{(snap.get('qa') or {}).get('exit')} / {(snap.get('qa') or {}).get('eligible')}")),
+            ("flash attempt", e(snap.get("attempt_id"))), ("content key", e(snap.get("content_key"))),
+            ("members", e(", ".join(m.get("name", "?") for m in snap.get("members") or []))),
+            ("final", e(snap.get("final")))]
+    if ev.get("report"):
+        rows.append(("phone-qa report", f"<a href='file://{e(ev['report'])}'>{e(ev['report'])}</a>"))
+    for k in ("readback", "fingerprints", "why", "exit", "not_eligible_because"):
+        if ev.get(k):
+            rows.append((k, f"<code>{e(json.dumps(ev[k])[:600])}</code>"))
+    out = ["<h2>Outcome and evidence</h2><table>" + _rows(rows) + "</table>"]
+    ms = snap.get("measurements") or []
+    if ms:
+        out.append("<h2>Candidate measurements</h2><table><tr>" + "".join(f"<th>{e(k)}</th>" for k in MEASURED)
+                   + "</tr>" + _rows([[e(r.get(k)) for k in MEASURED] for r in ms]) + "</table>")
+    ref = snap.get("reference") or {}
+    kgr = ref.get("known_good") or {}
+    out.append("<h2>Reference at the decision</h2><table>" + _rows([
+        ("known-good batch", e(kgr.get("batch"))), ("tag", e(kgr.get("tag"))),
+        ("boot s", e(kgr.get("host_boot_seconds"))),
+        ("RAM reference MB", e((ref.get("ram_reference") or {}).get("median_mb"))),
+        ("/system KB", e(kgr.get("system_used_kb"))), ("/vendor KB", e(kgr.get("vendor_used_kb")))]) + "</table>")
+    return out
 
 CSS = ("body{font:14px system-ui,sans-serif;margin:16px;max-width:980px;color:#1b1b1b;background:#fff}"
        "h1{font-size:20px}h2{font-size:16px;margin-top:20px}table{border-collapse:collapse;width:100%}"
@@ -50,6 +125,7 @@ def render(rid: str, st: dict) -> str:
             ("promoted", e(settle["promoted"])), ("known-good.json written", e(settle["known_good_written"])),
             ("changes landed", e(settle["landed"])), ("tags present in", e(settle["tags"])),
             ("re-baseline owed", e(settle["rebaseline"])), ("drifted forks", e(settle.get("drifted"))),
+            ("change PRs left open", e(", ".join(settle.get("change_prs_open") or []) or "none")),
             ("advice", e(settle.get("advice")))]) + "</table>")
     events = [x for x in read_jsonl(paths.events_file()) if x.get("batch") == rid][-40:]
     members = [x for x in st["entries"] if x.get("batch") == rid
@@ -57,6 +133,11 @@ def render(rid: str, st: dict) -> str:
                or rid in str(x.get("reason") or "")]
     outcome = next((x for x in reversed(events) if x.get("event") in ("decided", "finish", "abort", "settle")), None)
     parts.append(f"<h2>Outcome</h2><p>{e(outcome.get('event') + ' ' + str(outcome.get('cls') or '') if outcome else 'see events')}</p>")
+    parts.extend(_outcome_section(rid))
+    for x in members:
+        if x.get("experiment_result"):                    # Sol SM8: the experiment's result, for Zak
+            parts.append(f"<h2>Experiment result: {e(x['name'])}</h2><p><code>"
+                         f"{e(json.dumps(x['experiment_result'])[:1200])}</code></p>")
     if members:
         parts.append("<h2>Changes</h2><table><tr><th>change</th><th>status</th><th>PRs</th><th>reason</th></tr>")
         parts.append(_rows([(e(x["name"]), e(x["status"]),

@@ -95,7 +95,7 @@ Tests: `qa/tests/test_batch_*.py` (runner) and `qa/tests/test_runner_harness.py`
 | I1 | `kb.check`, `kb.READ_CMD`: `ro.river.build_id` plus `ro.vendor.build.date.utc` against `batches/<known-good batch>/batch.json` `dates.vendor`; never `ro.vendor.river.build_id` or `/vendor/build.prop`. Live check on ZY225DPT7F with non-root adbd (2026-11-23): `getprop ro.vendor.river.build_id` is empty and `/vendor/build.prop` is denied, also from `/vendor/bin/sh` (vendor_shell); `ro.river.build_id` and `ro.vendor.build.date.utc` read correctly | `test_batch_kb.KB.test_holds_with_one_non_elevating_read`, `test_vendor_matched_by_staged_vendor_date`, `test_missing_staged_date_blocks` |
 | I2 | `kb.read_props`: one `sh_rc`, no `guard()`/`root()`; HALT only on rc 0 with a non-empty mismatched product or serial; a failed read or an empty product, serial or slot re-checks USB (pause or blocked); an empty or `0` `sys.boot_completed` and empty stamps also re-check USB, then are "phone still booting" or "unstamped" (blocked) | `test_batch_kb.KB.test_halt_only_on_rc0_identity_mismatch`, `test_empty_values_recheck_state`, `test_empty_boot_completed_is_booting_not_a_pause`, `test_empty_stamps_recheck_the_usb_state`, `test_usb_states` (FakeDev fails the test on `root()` or `guard()`) |
 | I3 | `flashing.flash_batch` sends the bootloader-fallback path through `rescue()`; `outcomes.rescue_evidence`, `outcomes.adopt_flash`, `phases._bench` | `test_runner_harness.RescueAttemptIDs.*`, `test_batch_outcomes.Rescue.*`, `test_batch_flow.Crash.test_rescue_evidence_first` |
-| I4 | `merge.classify` (`lag` is never landed), `merge.reconcile_one`; `slots.landed_but_open`: `flash --promote` and `flash --recover` exit 75 for a PR still OPEN while its merge is river-22.2's tip, before or after the tag, and only if that lag is the sole gap; `merge_all` sends any non-OPEN PR through R10.4a | `test_batch_merge.Classify.test_i4_open_after_landed_tip_is_not_landed`, `Reconcile.test_i4_lag_is_unknown_even_when_reads_agree`, `MergeAll.test_unexpected_merged_goes_through_reconciliation`, `MergeAll.test_merged_after_the_pending_read_is_reconciled_not_halted`, `test_runner_harness.PromoteTyped.test_pr_still_open_with_its_merge_tagged_is_75`, `test_open_at_landed_tip_before_any_tag_is_75`, `test_lag_next_to_another_mismatch_halts` |
+| I4 | `merge.classify` (`lag` is never landed), `merge.reconcile_one`; `slots.landed_but_open`: `flash --promote` and `flash --recover` exit 75 for a PR still OPEN while its merge is river-22.2's tip, before or after the tag, and only if that lag is the sole gap (an absent tag is allowed, a present tag must be exactly right: Sol SM2); `merge_all` sends any non-OPEN PR through R10.4a | `test_batch_merge.Classify.test_i4_open_after_landed_tip_is_not_landed`, `Reconcile.test_i4_lag_is_unknown_even_when_reads_agree`, `MergeAll.test_unexpected_merged_goes_through_reconciliation`, `MergeAll.test_merged_after_the_pending_read_is_reconciled_not_halted`, `test_runner_harness.PromoteTyped.test_pr_still_open_with_its_merge_tagged_is_75`, `test_open_at_landed_tip_before_any_tag_is_75`, `test_lag_next_to_another_mismatch_halts` |
 | I5 | `merge.reconcile_one` (agreeing non-fitting observations: mismatch; disagreeing or failed reads: unknown); `merge.unknown_started` (failed reads too, from the state file); `settle.preconditions` (unknown > 24 h) | `test_batch_merge.Reconcile.test_i5_*`, `ReconcileClock.test_a_failed_read_starts_the_i5_clock`, `test_batch_recover.Settle.test_i5_preconditions` |
 | I6 | `qualify.stage_cmd` ends with the `staged` transaction clearing `running` and `lease`; `recover.owns_pair`: a pair is the runner's only for a batch, experiment or qualify run at its own attempt, so a pair with a stage run's ID is foreign | `test_batch_qualify.StageFinish.test_running_and_lease_cleared_after_staging`, `test_batch_restore.StageRunOwnership.*` |
 | I7 | `merge.kw_commit_set` (running.merge, then batch.json `promotion`, then GitHub), `merge.write_known_good` | `test_batch_merge.KW.*` (incl. `test_i7_transport_at_the_known_good_write_is_75_then_written`) |
@@ -144,6 +144,31 @@ check is in the round-1 report).
 | Gemini GM7 | `tc.status_problems` | `test_batch_tools.TreeCheck.test_allowlist_covers_untracked_and_ignored_only` |
 | Gemini GM8, Opus OM1 | `phases.test` (an experiment's clean run), `recover.abort` (pass to void only for a batch) | `test_batch_flow.RealQA.*` |
 | Minors | `phases.gate_reasons`; `abtest.mask_prop` (full match); `recover.abort` (own cause names the pause); `qualify.run_part2` (QA result); `cli` (last_error only on 0, RecordError a refusal); `merge.reconcile_one` (lag that clears); `phases.checkout` (`git lfs pull` through `remote_git`); `tc.lfs_problems`; `records.files_of`, `store_bundle`, `load_bundle`; `commands.enqueue` (upstream flag); `scripts/change` (`--record` FILE); `qualify.stage_cmd`, `paths.batch_dir` (IDs); `merge.pr_body`; `state.add_failure` (`record_sha256`, `ref`) | `test_batch_flow.RealQA.test_gate_reasons_are_whole_reasons`, `test_batch_qualify.BuildManifestProducer.test_mask_is_a_full_match`, `test_batch_flow.Flow.test_auth_names_the_pause_over_the_transport_strike`, `test_batch_qualify.Part2.*`, `test_batch_deadlines.LastError.*`, `test_batch_commands.CLI.test_a_bad_record_is_a_refusal_not_a_runner_error`, `test_batch_merge.ReconcileClock.test_lag_that_clears_on_the_second_read_is_landed`, `test_batch_flow.Checkout.test_lfs_pull_without_network_is_a_transport_abort`, `test_batch_tools.TreeCheck.test_lfs_pointer_is_the_dash_token`, `test_batch_records.Bundles.*`, `test_batch_commands.Enqueue.test_replacement_refreshes_the_upstream_flag`, `test_batch_tools.Tooling.test_change_merge_record_needs_a_file`, `test_batch_tools.Tooling.test_fetches_before_it_reads`, `test_batch_qualify.Refusals.test_stage_id_rules`, `test_batch_mergepath.MergePath.test_clean_batch_merges_tags_promotes_and_finishes`, `test_batch_flow.Flow.test_single_fail_rolls_back_and_records`, `test_batch_merge.Cleanup.test_third_same_refusal_pauses_and_stops` |
+
+### Code review round 2: findings, code and tests
+
+Fixed forward after PR #12 merged. Each row names the finding (Sol S-,
+Gemini GM2-, Opus), the code that closes it and the tests that fail when the
+fix is reverted (the mutation check is in the fix PR's description). All
+tests named here are in `qa/tests/test_batch_r2.py` unless another module is
+named.
+
+| Finding | Code | Tests |
+| --- | --- | --- |
+| Sol SB2 | `hold.py` (`session_pids`, `signal_session`, `end_group` keeps the record while the session lives; `sid` in the record), `riverqa.children.record_live`/`pgid_alive`/`blocking` (session), `scripts/phone-setup` (`timeout --foreground`) | `SessionEscape.*` |
+| Sol SB1 | `state._backfill`, `entry_by_id`, `same_entry`, `member_entry`, `new_entry_id`; `phases.claim`, `member_checks`, `new_running`; `tick.next_batch` (compose drops); `commands.enqueue`, `requeue`; `outcomes.members_of`; `recover.finish_merged`; `settle.settle`; `merge.merge_rule`, `pr_body`, `change_prs` | `EntryIdentity.*` |
+| Sol SB3 | `records._distinct_replies` (R5.2 item 6) | `OneReplyPerProvider.*` |
+| Gemini GM2-1 | `qualify.run_part2` (HALT propagates), `cli._run` (`qualified: false` exits 1) | `QualifyExits.test_a_halt_in_the_rollback_exits_3_and_is_committed`, `test_not_qualified_exits_1` |
+| Gemini GM2-2 | `qualify.local_base` (re-exec after fast-forwarding the manifest, loop guard) | `QualifyExits.test_qualify_reexecs_after_fast_forwarding_the_manifest` |
+| Sol SM3, Gemini GM2-3 | `tick.run_batch` (Refused before `merge_started`), `merge.open_prs` (lookup after a lost or refused create), `merge.check_mergeable`, `merge.merge_all` (`attempted`, `acked`, refusal reconciled), `merge.reconcile` (acked SHA = landed tip), `merge.push_tags`/`remote_tag`, `merge.delete_branch`, `phases.member_checks` (refused fetch), `recover.recover_running` (forward refusal is a HALT) | `PRPhaseRefusals.*`, `MergeLag.*`, `ForwardRefusals.*`, `ForwardRefusalHalts.*` |
+| Sol SM1, Gemini GM2-4 | `settle.settle` (hold whenever a re-baseline is owed; `landed_open`), `state.cleanup_item`, `recover.cleanup_items` (expected merge at the tested head; landed-open PRs wait, branch kept) | `SettleHolds.*` |
+| Sol SM2 | `riverqa.slots.commit_set_proof(require_tags=IF_PRESENT)`, `slots.landed_but_open`; `merge.reconcile_one` (second read confirms the first) | `LagConfirmation.*` |
+| Sol SM4 | `abtest.interrupted_build` (build deadline, Busy keeps `running` and the lease, `tools.current` reset), `abtest._container_running` | `B4Deadline.*` |
+| Sol SM5 | `phases.tree_problems`, `qualify.tree_first` (stage and qualify, before the interrupted run's rollback) | `TreeBeforeRollback.*` |
+| Sol SM6 | `scripts/change` `cmd_merge` (delete the topic branch only if its tip is in `origin/river-22.2`) | `ChangeMergeBranch.test_a_merged_topic_branch_is_deleted`, `test_later_local_commits_keep_the_branch` |
+| Sol SM7 | `recover.retention` | `LogRetention.*` |
+| Sol SM8 | `report.snapshot`, `report._outcome_section`, `report.render` (experiment results); `recover.commit_outcome`, `abort`, `finish_merged`; `state.set_pause` queues a report; `recover.cleanup_items` (`refusal_tick`), `ctx.Ctx.tick_id`; `settle.settle` (`change_prs_open`) | `ReportEvidence.*`, `Minors.test_settle_advice_and_change_prs_left_open` |
+| Minors | `commands.resume` (every strike); `abtest.hash_tree` (build-manifest regular file, before the allowlist); `tick.tick` (HALT summary state; AuthRefused at step 6); `cli` (AuthRefused of a command exits 1, failed qualify exits 1); `tick.commit_stop` (blocker cause); `merge.push_tags` (lightweight tag); `phases._ssid`; `qualify.stage_cmd` (69-character IDs; dead lease branch removed); `tc.tools_problems` (`gh api --slurp`); `riverqa.flashing.merge_started` (base on either side); `settle` advice (REST merge); `recover.forward` (tag message); `scripts/change` `cmd_pr` text | `Minors.*`, `ChangeMergeBranch.test_change_pr_points_image_changes_at_batch_enqueue` |
 
 ### Requalification after a camera re-baseline (I10)
 
@@ -217,7 +242,9 @@ batch's heads landed.
   or SIGINT, the holder is stopped and reaped before the runner releases
   its locks. `phone-setup` bounds each adb call (`ADB_CALL_TIMEOUT`).
 - **Blockers.** A blocked or not-qualified tick records `blocker` in the
-  state file and writes a report when it changes; `batch status` shows it.
+  state file and writes a report when its kind or stable cause changes (the
+  cause is the step, such as `free-space`, when the message carries changing
+  numbers); `batch status` shows it.
 - **Not exercised on hardware.** The runner has not built, flashed or run a
   batch; every path is covered by unit tests with fakes. Qualification
   (R14) is the first real run.
@@ -379,8 +406,10 @@ pass: a person runs them deliberately.
 ## 3. Exit codes and configuration
 
 R3.1. **Exit codes.** 0: done, idle, paused, blocked, not qualified, or
-waiting on Zak. 1: runner error (R11.5) or a refused command. 3: HALT, now or
-still. 75: **resumable**: a lock or the build container is busy, a child of an
+waiting on Zak. 1: runner error (R11.5), a refused command, a failed `batch
+qualify` (`"qualified": false`), or a GitHub auth refusal of a command other
+than `tick` (a tick pauses on it). 3: HALT, now or still; the summary's
+`state` is then always `halted`. 75: **resumable**: a lock or the build container is busy, a child of an
 earlier run is alive, or GitHub or the network failed or gave no answer; the
 state file is consistent and the next call continues from it. The last stdout
 line is a JSON summary.
@@ -419,7 +448,8 @@ does not parse.
  "entries": []}                         // R4.2
 ```
 
-R4.2. **Entry:** `name`, `branch`, `record_sha256` (the bundle, R5.1),
+R4.2. **Entry:** `name`, `id` (immutable, `e<position>`; Sol SB1),
+`branch`, `record_sha256` (the bundle, R5.1),
 `kind` (`change` or `experiment`), `prs` (`key` `owner/name#n`, `path`,
 approved `head`), `position` (fixed at first enqueue, kept forever), `flags`
 (`alone`, `solo`, `upstream`), `status`, `status_at`, `reason`, `rev`
@@ -431,8 +461,10 @@ clears, so it survives record replacement and `withdraw` followed by a new
 `enqueue` under the same name.
 
 R4.3. **`running`:** `id`, `purpose` (`batch`, `experiment`, `qualify`,
-`calibration`, `baseline`), `members` (name and `rev` at claim; `batch` and `experiment`
-only), `borrowed` (names composed by `qualify` or `stage`, whose entries are
+`calibration`, `baseline`), `members` (`name`, `id`, `record_sha256` and
+`rev` at claim; `batch` and `experiment` only; every later lookup of a member
+is by `id` and requires the entry still claimed by this run under that
+record), `borrowed` (names composed by `qualify` or `stage`, whose entries are
 never changed), `phase`, `intent` (R11.1), `versions` (harness,
 `runner_build`, `runner_tools`, image ID, manifest HEAD), `base`,
 `base_verified`, `composed` (per path: sha, tree), `content_key`,
@@ -504,7 +536,12 @@ spells it. A record is valid only if:
    `Delta: <key> <40-hex from> -> <40-hex to>` line per PR (delta), equal
    to the round's `heads` exactly; each reply also has the provider's
    recorded `Verdict:`. A reply from another round, about other heads, with
-   a reversed delta or swapped PRs, does not count.
+   a reversed delta or swapped PRs, does not count. Any line that starts
+   with `Head:` or `Delta:` is read as a binding line, so prose in a brief
+   or reply must not start a line that way (Gemini minor: kept strict).
+6. **One reply per provider** (Sol SB3). No file name and no SHA-256
+   appears twice among the record's briefs and replies, in any round: a
+   reply reused under another provider's name, or a copy of it, is refused.
 
 R5.3. **PR set check:** the open PRs in every fork and the manifest with head
 branch `branch` and base `river-22.2` are exactly the record's PRs, each at
@@ -622,19 +659,23 @@ lock fds and `start_new_session=True`. The holder:
    blocks reading the pipe; on one byte it `exec`s the real command, so pid,
    pgid and start time do not change; on EOF (the holder died) it exits 1
    without `exec`;
-2. writes `runner/children/<pid>.json` (`cmd`, `pid`, `pgid`, host
+2. writes `runner/children/<pid>.json` (`cmd`, `pid`, `pgid`, `sid`, host
    `boot_id` from `/proc/sys/kernel/random/boot_id`, start time from
    `/proc/<pid>/stat` field 22) through a temp file named `.<pid>.tmp` and
    rename, and fsyncs it and the directory (readers list only names matching
    `^[0-9]+\.json$`, so a temp file never counts or blocks);
 3. writes one byte to the pipe, releasing the stub;
-4. waits for it, then SIGTERMs whatever is left in its process group,
-   SIGKILLs it after 10 s, reaps, deletes its file and exits with the child's
-   status. On SIGTERM it does the same at once.
+4. waits for it, then SIGTERMs whatever is left in its **session** (every
+   process group in it: GNU `timeout` without `--foreground` makes one),
+   SIGKILLs it after 10 s, reaps, and deletes its file only once no process
+   of the session is left (Sol SB2); it exits with the child's status. On
+   SIGTERM it does the same at once. `phone-setup` runs adb under
+   `timeout --foreground`, so adb stays in the tool's own group.
 
 **Live child records** (`riverqa.children`, H15): a file counts only if its
 `boot_id` is the current host boot and its pid's start time matches (or, with
-the leader gone, a live process still has that pgid). Others are deleted. A
+the leader gone, a live process still has that pgid as its group or that
+`sid` as its session). Others are deleted. A
 tick exits 75 while any counted file remains or while a podman container named
 `lineageos-build` is running. A `lineageos-build` container in any other state
 (created, exited, dead) is removed with `podman rm lineageos-build` (never
@@ -661,7 +702,7 @@ passing TC against `river-22.2`, and it survives the runner's death.
 
 R6.5. **Cooperating tools** (H4, H15). `scripts/build`, `flash`,
 `device-bench`, `phone-qa`, `phone-setup`, `change`, `merge-upstream` and
-`setup-forks` refuse (exit 1) while a live child record exists whose pgid is
+`setup-forks` refuse (exit 1) while a live child record exists whose session (`sid`, else pgid) is
 not the caller's session ID (so the runner's own child and its descendants
 pass; an orphan of a killed runner blocks everyone). `change start|pr|merge|tag`,
 `merge-upstream` and `setup-forks` also take the build lock once, at the
@@ -712,10 +753,15 @@ leftovers of an unclaimed earlier try at this ID), using
 `git -c user.name=river-batch -c user.email=river-batch@localhost` and the
 same `GIT_AUTHOR_*`/`GIT_COMMITTER_*`.
 
-The **claim transaction** re-reads every member and requires its `status`
-`queued` and its `rev` unchanged since the member checks (a concurrent
-`withdraw` wins); otherwise it writes nothing and selection starts again.
-It records members with their `rev`, base, `base_verified`, composed SHAs and
+The **claim transaction** re-reads every member **by its immutable `id`**
+and requires the same name, `status` `queued`, its `rev` and its
+`record_sha256` unchanged since the member checks (a concurrent `withdraw`
+wins, and a new entry enqueued under the withdrawn one's name is another
+entry, Sol SB1); otherwise it writes nothing and selection starts again.
+Every other compare-and-update of an entry (member checks, compose drops,
+requeue, enqueue's replacement) checks `id` and `rev` the same way, and the
+merge rule (R10.1) requires every member still claimed under its record.
+It records members with their `id`, `record_sha256`, `rev`, base, `base_verified`, composed SHAs and
 trees, content key and versions, advances `next_batch`, and makes members
 `in-batch`.
 
@@ -751,7 +797,8 @@ R7.4. **Whole-tree check (TC).** Passes only if:
 TC runs over the projects in parallel (8 workers) and records its duration.
 It runs at preflight, after checkout, after the build (before stage) and after
 restore. Preflight also requires git ≥ 2.38 and `git lfs version`, with
-`$TOP/.repo-bootstrap/bin` first on `PATH`.
+`$TOP/.repo-bootstrap/bin` first on `PATH`, and a `gh` whose `gh api`
+supports `--slurp` (paginated reads, Opus minor).
 
 R7.5. **Checkout and build**, under the lease: `git checkout batch/<id>` and
 `git lfs pull` in each touched fork, TC, then the image check, the
@@ -1090,7 +1137,10 @@ classified:
 - **unknown:** any read failed; or the PR is `MERGED` but the tip is the base
   or another commit, or `mergeCommit` is null; or two reads of the same
   observation, 30 s apart, differ. Exit 75 (R11.6); nothing is recorded or
-  merged;
+  merged. The one exception (Sol SM2): a first read that is the lag (tip a
+  landed merge, PR still `OPEN`) and a second read that is landed with the
+  same tip, parents, tree, PR head, base and repository is landed on that
+  second read; any other pair of differing reads stays unknown;
 - **mismatch:** two observations 30 s apart agree, and the tip is neither
   the base nor a landed merge (or the PR is `CLOSED`, retargeted or at
   another head). HALT before anything more is merged or tagged.
@@ -1241,6 +1291,25 @@ only a confirmed refusal can HALT (R10.2 step 1, R10.4, R10.4a, R10.6 step
 1). An auth refusal never HALTs: it pauses ("GitHub auth: <repo>:
 <status>"); before `merge_started` the batch is first aborted as
 `transport`, after it the forward path resumes after `batch resume`.
+
+**Confirmed refusals and uncertain writes** (Sol SM3, Gemini GM2-3):
+- Before `merge_started`, a confirmed refusal of any call of R10.2-R10.3
+  (a PR create refused with no PR found, a PR read 404) voids the batch,
+  which is rolled back in the same tick (R11.2 step 2); never a runner error.
+- A PR create with no answer, or refused, is followed by a lookup by exact
+  head branch: a PR found is used.
+- A merge: `running.merge.attempted[path]` is committed before the call and
+  `running.merge.acked[path]` (the SHA GitHub answered) after it. An acked
+  merge is never sent again: lagging reads are unknown (I5's clock runs),
+  and the landed tip must equal the answered SHA (else HALT). A refused merge
+  is reconciled first (landed is success); a refusal of a merge sent before
+  without an answer is unknown, not a HALT.
+- A refused tag push or branch delete is read again: the tag at the wanted
+  commit, or the branch absent, is success.
+- A refused fetch of a member's PR head makes that member
+  `needs-reapproval` (R7.2).
+- After `merge_started`, any other confirmed refusal on the forward path is a
+  HALT (Zak settles), never a runner error.
 
 **Bounded transport aborts** (O-C3): a `transport` abort of a batch that
 reached phase `prs-open` adds one to `strikes.transport_prs`; the second in
@@ -1397,8 +1466,15 @@ nothing landed. Then:
   landed, `river-22.2` is still the known-good base and nothing is owed.
 - One transaction: the above, the batch's `cleanup` item **replaced** by one
   whose `branch_repos` are only the branches still present and whose
-  `pr_repos` are only the batch PRs still open, `running` and `halt`
-  cleared, the report added to `reports_pending`. KW for a promoted batch is
+  `pr_repos` are only the batch PRs still open whose tested head is not in
+  `river-22.2`. A batch PR still OPEN whose tested head is already in
+  `river-22.2` (GitHub lag) goes in `landed_open` and `expected_merged`:
+  cleanup never closes it and keeps its branch until GitHub shows it MERGED
+  (Sol SM1). Whenever a re-baseline is owed the item is **held** (nothing
+  closed or deleted) until the re-baseline closes, whether or not any PR
+  reads MERGED (Gemini GM2-4). An expected or held PR found MERGED counts
+  only at its tested head, into `river-22.2`, not cross-repository; any
+  other merge pauses. `running` and `halt` cleared, the report added to `reports_pending`. KW for a promoted batch is
   written before this transaction (R10.6 step 3).
 
 The report says which changes landed fully, partly or not at all, which repos
@@ -1411,6 +1487,9 @@ R14.1. **Harness, and `batch stage`.** `phone-qa qualified` (H3) exits 0,
 following README "Order of qualification". Its calibration batch, and a
 baseline build (R13.4, §18 Z7, Z8), are built with
 `batch stage --kind calibration|baseline --id ID [--change NAME...]`:
+- **ID:** letters, digits, `.`, `_` and `-`, not starting with `.`, at most
+  69 characters (`scripts/build` appends `-<10-hex>` and caps a build ID at
+  80), and never a runner ID (`bNNNN`, `qNNNN`).
 - **Refusals:** R2.4. Under both locks (busy: 75).
 - **No phone work at all** (minor), recovery included: of the recovery entry
   point it runs only R13.2 steps 2 and 3 for an interrupted run R2.4 allows
@@ -1493,7 +1572,20 @@ an entry. It runs R8.3 phases 1-9 and 11 and passes only if every tool exits
 0, `phone-qa` exits 0 with `eligible: true`, `halted` null and a bound result,
 the rollback exits 0, the end-of-tick setup and its readback pass, TC passes
 after restore, and the state file ends with no `running` or `lease` and
-nothing derived pending (R13.2). A failure says which criterion failed.
+nothing derived pending (R13.2). A failure says which criterion failed
+and exits 1 (`"qualified": false`); a HALT anywhere in it (the rollback,
+the setup) is committed and exits 3, never reported as a failed criterion
+(Gemini GM2-1). Like the tick (R8.2 step 2), `stage` and `qualify`
+re-exec once after fast-forwarding `.repo/manifests`, so they never run
+or certify old code (Gemini GM2-2). Before an interrupted run's rollback,
+both check the tree read-only against the lease (or `river-22.2`) and refuse
+a disturbed tree without touching the phone (Sol SM5).
+
+Part 1's B4 build has the build deadline: a build that runs past it before
+the driver object appears is stopped and the trial fails. If the holder, a
+child record or the `lineageos-build` container is still alive 600 s after
+the stop, `running` and the lease stay (exit 75); the tree is restored only
+once they are gone (Sol SM4).
 - **The first qualification** uses `--change gnss-standalone --change
   perch-launcher`: the known-good base is the baseline, which has no Perch, so
   zero members cannot pass `phone-qa`.
@@ -1539,10 +1631,23 @@ batch's checks, and the tester's decision once made; boot, RAM and size
 against known-good; the phone's known-good slot, tag and any pair; the queue
 (next up, solo, `failed`, `tried`, `needs-reapproval`).
 
+Every run's outcome is kept in `batches/<id>/outcome.json` (Sol SM8),
+written when the outcome is committed (phase 10) and again when the run ends
+(abort, finish): class, reason, checks and evidence, QA result, the
+candidate's bench rows, and the known-good reference it was decided against
+(kept from the first write). A split, a void or an experiment therefore
+keeps its evidence after `running` is cleared, and the report renders it,
+with each experiment member's result. Every pause, whoever sets it, queues a
+report in the same transaction (`state.set_pause`). A cleanup refusal counts
+once per tick (`refusal_tick`), however often the entry point runs cleanup
+in it. A settle's report lists the change PRs it left open.
+
 R15.2. **Retention**, at finish: delete `batches/<id>/images/` older than 7
 days, except batches named by `known-good.json` `latest`, `slot-state.json`,
 `running` or a `failed` entry's newest evidence. Keep `batch.json`,
-`results.json` and all reports; build logs 30 days.
+`results.json` and all reports; build logs 30 days, for every batch
+directory, whether or not its images are gone or the batch is protected
+(those exclusions apply to images only; Sol SM7).
 
 ## 16. The tester thread
 
@@ -1592,7 +1697,7 @@ qualified after this PR, in README order.
 | H12 | `qa/lib/riverqa/flashing.py` (`main`) | `flash --rollback` and `flash --recover` refuse (exit 1) while `slot-state.json` holds a pair whose batch is `running.id` in `$BENCH_HOME/runner/state.json` (read under its lock shared; unparsable: refuse), unless `RIVER_BATCH_ID` equals that batch and the `DeviceLock` was reused through a matching `BENCH_LOCK_TOKEN` (`not lock.owned`: the runner's holder holds it), or `--zak` is given. | yes |
 | H13 | `qa/lib/riverqa/stage.py` | Split `camera_set` into pure `parse_camera_set(text: str \| None) -> list[int]` (None: the bootstrap set) and the file read; same rule. | yes |
 | H14 | `qa/lib/riverqa/regression.py` (`baseline_record`), `qa.py` (`baseline_close`) | `baseline_close` passes the existing `known-good.json`, if any; `baseline_record` then keeps its `ram_reference` (value, tag, batch, run IDs) when its median is lower than the new baseline's, with `seed` cleared, so a re-baseline never raises the historical minimum. The new `calibration_seed` is written as before. Unit tests pin both cases. | yes |
-| H15 | `qa/lib/riverqa/children.py` (new, standalone stdlib, also runnable as `python3 -I …/children.py`), `lock.py` (`DeviceLock.acquire`), `scripts/common.sh` (`acquire_build_lock`, `device_lock`) | `live_children()` reads the files in `$BENCH_HOME/runner/children/` whose names match `^[0-9]+\.json$` (never the holder's `.<pid>.tmp` files) with the R6.2 rule (current host boot, matching start time or a live pgid); unreadable files count as live. Every lock acquisition, and so `scripts/build`, `flash`, `device-bench`, `phone-qa`, `phone-setup`, `change`, `merge-upstream` and `setup-forks`, refuses (exit 1, naming the record) while a live record's pgid differs from the caller's session ID. **The check runs after `flock` succeeds and before the token is written** (S-M5; R6.3), in `DeviceLock.acquire`, `acquire_build_lock` and `device_lock` alike; on a live orphan the lock is released and nothing is written. The runner's R6.2 check uses the same function, again after each lock. | yes |
+| H15 | `qa/lib/riverqa/children.py` (new, standalone stdlib, also runnable as `python3 -I …/children.py`), `lock.py` (`DeviceLock.acquire`), `scripts/common.sh` (`acquire_build_lock`, `device_lock`) | `live_children()` reads the files in `$BENCH_HOME/runner/children/` whose names match `^[0-9]+\.json$` (never the holder's `.<pid>.tmp` files) with the R6.2 rule (current host boot, matching start time or a live pgid or session); unreadable files count as live. Every lock acquisition, and so `scripts/build`, `flash`, `device-bench`, `phone-qa`, `phone-setup`, `change`, `merge-upstream` and `setup-forks`, refuses (exit 1, naming the record) while a live record's session (`sid`, else pgid) differs from the caller's session ID. **The check runs after `flock` succeeds and before the token is written** (S-M5; R6.3), in `DeviceLock.acquire`, `acquire_build_lock` and `device_lock` alike; on a live orphan the lock is released and nothing is written. The runner's R6.2 check uses the same function, again after each lock. | yes |
 | H16 | `scripts/phone-setup` | **Requested SSID** (G-C5): with `--wifi`, Wi-Fi counts as set up only if `cmd wifi status` says `Wifi is connected to "<SSID>"` for the SSID in the file; connected to any other network, it connects to the requested one. The final report prints the connected SSID. | no (`runner_tools`) |
 | H17 | `qa/lib/riverqa/bench.py` (`bench.run`) | **Rescue attempt ID** (G-C6): the bench-boot failure path calls `flashing.rescue(dev, st, reason, attempt["attempt_id"])`, so the rescue's `wipes.jsonl` record carries the flash attempt ID, as `flash`'s rescue already does. A unit test pins it. | yes |
 | H18 | `qa/lib/riverqa/features.py` | **Setup settings** (minor): the `want_s` dict of `final.settings` becomes the module constant `SETUP_SETTINGS` (same keys, values and read commands), used by `final.settings` and by the runner's setup readback (R13.2 step 7), so the two cannot drift. | yes |
@@ -1850,7 +1955,7 @@ I4 (Sol B2, Gemini C4). (tip = landed merge, PR still OPEN) is `unknown` (75), n
 I5 (Opus C1). Two agreeing observations that fit neither pending nor landed are a mismatch (HALT → settle). "Unknown" is only failed or disagreeing reads. Additionally `batch settle --zak` may act on a running batch with merge_started whose reconciliation has been unknown for more than 24 h.
 I6 (Opus C3). `batch stage` ends with a finish transaction that clears `running` and `lease` after staging, so a hand-flashed calibration/baseline pair is always foreign (blocked under O-C1). Only `qualify` can leave an interrupted run holding a pair.
 I7 (Gemini C5). KW's commit_set = `running.merge` merge commits for PR repos + batch.json commit_set for no_pr repos; if any expected PR's merge commit is missing locally, resolve it from GitHub (75 on transport) before writing known-good.json; never substitute batch-branch SHAs.
-I8 (Sol B3). Part-1 A→B→A comparison: `system/product/etc/build-manifest.xml` (repo manifest -r) changes with project HEADs; verify its recorded revisions against each trial's commit set and exclude those expected revision lines from the content comparison.
+I8 (Sol B3). Part-1 A→B→A comparison: `system/product/etc/build-manifest.xml` (repo manifest -r) changes with project HEADs; verify its recorded revisions against each trial's commit set and exclude those expected revision lines from the content comparison. It must be a readable regular file (never a symlink), and it is checked before, and regardless of, the allowlist (Sol minor, round 2).
 I9 (Sol B4). Partial first merge (e.g. river Perch landed, vendor/lineage not): define the authorized repair before qualifying, i.e. Zak either completes the missing merges of the same batch (exact tested heads, `--match-head-commit`) or reverts the landed ones through reviewed PRs, then re-baselines. Also require a re-baseline whenever current fork trees have drifted from known-good, even if none of the batch's approved heads landed.
 I10 (Sol M2). Camera re-baseline: R7.7's camera backstop applies to production candidates only; `batch stage --kind baseline` allows a changed set. The requalification sequence includes a verified `flash --rollback` after README step 8 (the hand calibration pair), before runner part 2.
 I11 (Sol M3). `batch settle` checks the local promotion proof and writes known-good.json first, before any GitHub call.

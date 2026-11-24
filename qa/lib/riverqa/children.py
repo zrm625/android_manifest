@@ -2,10 +2,13 @@
 
 The runner starts every tool through its holder (qa/lib/riverbatch/hold.py),
 which writes ``$BENCH_HOME/runner/children/<pid>.json`` before it lets the
-tool run: ``{"cmd", "pid", "pgid", "boot_id", "start_time"}``. A record
-counts as **live** only if its ``boot_id`` is this host boot and either the
-pid is alive with the recorded start time (``/proc/<pid>/stat`` field 22),
-or, with the leader gone, some live process still has the recorded pgid.
+tool run: ``{"cmd", "pid", "pgid", "sid", "boot_id", "start_time"}``. A
+record counts as **live** only if its ``boot_id`` is this host boot and
+either the pid is alive with the recorded start time (``/proc/<pid>/stat``
+field 22), or, with the leader gone, some live process still has the
+recorded pgid as its process group or the recorded ``sid`` (``pgid`` for an
+older record) as its session: a descendant that made its own process group
+(GNU ``timeout``) is still the child's (Sol SB2).
 An unreadable or malformed record counts as live (fail closed). Stale
 records are deleted. Only names matching ``^[0-9]+\\.json$`` are read: the
 holder's ``.<pid>.tmp`` files never count.
@@ -58,7 +61,8 @@ def start_time(pid: int, proc: Path = Path("/proc")) -> str | None:
     return f[19] if f and len(f) > 19 else None
 
 
-def pgid_alive(pgid: int, proc: Path = Path("/proc")) -> bool:
+def pgid_alive(pgid: int, proc: Path = Path("/proc"), sid: int | None = None) -> bool:
+    """Some live process has process group ``pgid`` or session ``sid``."""
     try:
         names = os.listdir(proc)
     except OSError:
@@ -67,8 +71,10 @@ def pgid_alive(pgid: int, proc: Path = Path("/proc")) -> bool:
         if not n.isdigit():
             continue
         f = _stat_fields(proc, int(n))
-        # Field 5 (pgrp) is index 2 after comm.
-        if f and len(f) > 2 and f[2] == str(pgid) and f[0] != "Z":
+        # Fields 5 (pgrp) and 6 (session) are indexes 2 and 3 after comm.
+        if not f or len(f) < 4 or f[0] == "Z":
+            continue
+        if f[2] == str(pgid) or (sid is not None and f[3] == str(sid)):
             return True
     return False
 
@@ -77,14 +83,15 @@ def record_live(rec: dict, boot_id: str, proc: Path = Path("/proc")) -> bool:
     if rec.get("boot_id") != boot_id:
         return False
     pid, pgid = rec.get("pid"), rec.get("pgid")
-    if not isinstance(pid, int) or not isinstance(pgid, int):
+    sid = rec.get("sid", pgid)
+    if not isinstance(pid, int) or not isinstance(pgid, int) or not isinstance(sid, int):
         return True
     st = start_time(pid, proc)
     if st is not None:
         if st == str(rec.get("start_time")):
             return True
-        # The pid was reused by another process: only a live group counts.
-    return pgid_alive(pgid, proc)
+        # The pid was reused by another process: only a live group or session counts.
+    return pgid_alive(pgid, proc, sid)
 
 
 def live_children(home: Path | None = None, proc: Path = Path("/proc"), prune: bool = True) -> list[dict]:
@@ -121,9 +128,10 @@ def live_children(home: Path | None = None, proc: Path = Path("/proc"), prune: b
 
 
 def blocking(caller_sid: int | None = None, home: Path | None = None, proc: Path = Path("/proc")) -> list[dict]:
-    """Live records whose pgid is not the caller's session ID."""
+    """Live records whose session (pgid for an older record) is not the
+    caller's session ID."""
     sid = os.getsid(0) if caller_sid is None else caller_sid
-    return [r for r in live_children(home, proc) if r.get("pgid") != sid]
+    return [r for r in live_children(home, proc) if r.get("sid", r.get("pgid")) != sid]
 
 
 def describe(rec: dict) -> str:

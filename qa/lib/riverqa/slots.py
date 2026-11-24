@@ -262,7 +262,11 @@ def frozen_base(batch: dict) -> dict:
     return (ms.get("base") or {}) if isinstance(ms, dict) else {}
 
 
-def commit_set_proof(batch: dict, lookup: dict, slugs: dict[str, str], require_tags: bool = True) -> list[str]:
+IF_PRESENT = "if-present"
+
+
+def commit_set_proof(batch: dict, lookup: dict, slugs: dict[str, str],
+                     require_tags: bool | str = True) -> list[str]:
     """Why the lookup does not prove the batch's tested commit set was
     merged and tagged (C1, review rounds 2 and 3, Sol B2). Empty only if:
 
@@ -283,8 +287,10 @@ def commit_set_proof(batch: dict, lookup: dict, slugs: dict[str, str], require_t
       one, any first parent) with the tested tree; a repo without a PR
       still has river-22.2 at its tested commit.
 
-``require_tags=False`` checks everything but the tags (the lag check,
-which runs before the runner tags).
+``require_tags=IF_PRESENT`` (the lag check, which may run before the
+runner tags) allows an absent tag but checks a present one exactly like
+``require_tags=True`` (Sol SM2: a wrong tag is never masked by the lag).
+``require_tags=False`` checks everything but the tags.
 
     A PR or tag repo outside the commit set is a stale or incomplete
     record."""
@@ -331,13 +337,15 @@ which runs before the runner tags).
     for s, (path, sha) in sorted(want.items()):
         exp = expected.get(path) or {}
         t = tags.get(s)
-        if require_tags:
+        check_tag = require_tags is True or (require_tags == IF_PRESENT and bool(t) and bool(t.get("present")))
+        if require_tags is True:
             if t is None:
                 errs.append(f"{path}: not in tag_repos")
                 continue
             if not t.get("present"):
                 errs.append(f"{path}: tag missing")
                 continue
+        if check_tag:
             if not t.get("tree") or t.get("tree") != trees.get(s):
                 errs.append(f"{path}: tagged tree {str(t.get('tree'))[:12]} is not the tested tree "
                             f"{str(trees.get(s))[:12]} (merged into a branch that had moved on?)")
@@ -347,7 +355,7 @@ which runs before the runner tags).
             if p is not None:
                 errs.append(f"{path}: expected no PR, but PR {p.get('number')} was looked up")
                 continue
-            if require_tags and t.get("commit") != sha:
+            if check_tag and t.get("commit") != sha:
                 errs.append(f"{path}: no PR, so the tag must be at the tested commit {sha[:12]}, "
                             f"not {str(t.get('commit'))[:12]}")
             if tip != sha:
@@ -367,7 +375,7 @@ which runs before the runner tags).
             errs.append(f"{path}: PR not merged")
             continue
         m = p["merge_commit"]
-        if require_tags and t.get("commit") != m:
+        if check_tag and t.get("commit") != m:
             errs.append(f"{path}: tag at {str(t.get('commit'))[:12]}, merge commit {m[:12]}")
         if tip != m:
             errs.append(f"{path}: river-22.2 is at {str(tip)[:12]}, not the merge commit {m[:12]}")
@@ -401,7 +409,7 @@ def landed_but_open(batch: dict, lookup: dict, slugs: dict[str, str]) -> list[st
         prs.append(p)
     if not lag:
         return None
-    if commit_set_proof(batch, dict(lookup, prs=prs), slugs, require_tags=False):
+    if commit_set_proof(batch, dict(lookup, prs=prs), slugs, require_tags=IF_PRESENT):
         return None
     return lag
 

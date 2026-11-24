@@ -96,8 +96,12 @@ def member_checks(ctx: Ctx, members: list[dict], base: dict[str, str], slugs: di
         for pr in e["prs"]:
             n = records.split_key(pr["key"])[1]
             ref = f"refs/river-batches/pr/{pr['path'].replace('/', '_')}/{n}"
-            from .ctx import remote_git
-            remote_git(ctx, pr["path"], "fetch", "-q", "zrm625", f"+refs/pull/{n}/head:{ref}")
+            from .ctx import Refused, remote_git
+            try:
+                remote_git(ctx, pr["path"], "fetch", "-q", "zrm625", f"+refs/pull/{n}/head:{ref}")
+            except Refused as ex:                       # Gemini GM2-3: that member, not the tick
+                bad.append((e, eligibility.REAPPROVE, f"{pr['key']}: fetching its head was refused: {ex.line}"))
+                break
             got = ctx.git.out(pr["path"], "rev-parse", ref).strip()
             if got != pr["head"]:
                 bad.append((e, eligibility.REAPPROVE, f"{pr['key']} head is {got[:12]}, approved {pr['head'][:12]}"))
@@ -105,8 +109,8 @@ def member_checks(ctx: Ctx, members: list[dict], base: dict[str, str], slugs: di
     if write:
         for e, status, why in bad:
             with S.transaction("member-check", name=e["name"], status=status) as st:
-                x = S.entry(st, e["name"])
-                if x and x["status"] == "queued" and x["rev"] == e["rev"]:
+                x = S.same_entry(st, e)                     # Sol SB1: by ID, at the checked rev and record
+                if x and x["status"] == "queued":
                     S.set_status(x, status, why)
     return bad
 
@@ -114,7 +118,8 @@ def member_checks(ctx: Ctx, members: list[dict], base: dict[str, str], slugs: di
 def new_running(bid: str, purpose: str, versions: dict, base: dict, verified: bool, comp: compose.Composed,
                 ckey: str, members: list[dict], borrowed: list[str]) -> dict:
     return {"id": bid, "purpose": purpose, "phase": "claimed", "intent": None, "started_at": now_iso(),
-            "members": [{"name": e["name"], "rev": e["rev"] + (1 if purpose in ("batch", "experiment") else 0)}
+            "members": [{"name": e["name"], "id": e["id"], "record_sha256": e["record_sha256"],
+                         "rev": e["rev"] + (1 if purpose in ("batch", "experiment") else 0)}
                         for e in members] if purpose in ("batch", "experiment") else [],
             "borrowed": borrowed, "versions": versions, "base": base, "base_verified": verified,
             "composed": {p: {"sha": base[p] if p not in comp.commits else comp.commits[p], "tree": t}
@@ -124,16 +129,17 @@ def new_running(bid: str, purpose: str, versions: dict, base: dict, verified: bo
 
 
 def claim(running: dict, members: list[dict], next_field: str) -> bool:
-    """The claim transaction (R7.3): every member still queued at its
-    checked rev; record the run; advance the ID; members in-batch. False:
-    nothing written, select again."""
+    """The claim transaction (R7.3): every member is still the same entry
+    (its immutable ID, Sol SB1), queued at its checked rev under the record
+    it was composed from; record the run; advance the ID; members in-batch.
+    False: nothing written, select again."""
     with S.transaction("claim", batch=running["id"]) as st:
         if st["running"] or st["lease"]:
             return False
         xs = []
         for m in members:
-            x = S.entry(st, m["name"])
-            if not x or x["status"] != "queued" or x["rev"] != m["rev"]:
+            x = S.same_entry(st, m)
+            if not x or x["status"] != "queued":
                 return False
             xs.append(x)
         for x in xs:
@@ -286,6 +292,31 @@ def restore(ctx: Ctx) -> tuple[bool, list[str]]:
     return True, []
 
 
+def tree_problems(ctx: Ctx) -> list[str]:
+    """Read-only (Sol SM5): why the tree is not what the lease (or, with
+    no lease, river-22.2) says it should be, before anything touches the
+    phone: every fork and the manifest clean; a leased fork at its
+    ``expect`` or back on river-22.2 at its ``base``; every other fork on
+    river-22.2 and the manifest on ``default``."""
+    lease = S.read().get("lease") or {}
+    expect, lbase = lease.get("expect") or {}, lease.get("base") or {}
+    out = []
+    for p in sorted(compose.forks()) + [MANIFEST]:
+        try:
+            h, b, c = head(ctx, p), branch(ctx, p), clean(ctx, p)
+        except Exception as e:  # noqa: BLE001 - reported, never forced
+            out.append(f"{p}: unreadable ({e})")
+            continue
+        if not c:
+            out.append(f"{p} is dirty")
+        elif p in expect:
+            if h != expect[p] and not (b == "river-22.2" and h == lbase.get(p)):
+                out.append(f"{p} is at {h[:12]}, neither the lease's {expect[p][:12]} nor river-22.2")
+        elif b != ("default" if p == MANIFEST else "river-22.2"):
+            out.append(f"{p} is on {b or 'a detached HEAD'}, not {'default' if p == MANIFEST else 'river-22.2'}")
+    return out
+
+
 def restore_or_void(ctx: Ctx) -> None:
     ok, found = restore(ctx)
     if not ok:
@@ -382,7 +413,9 @@ def _ssid(ctx: Ctx) -> str:
     if not f:
         raise Pause("runner/config.json has no wifi_ssid_file")
     from pathlib import Path
-    return Path(f).read_text().strip()
+    # Opus minor: exactly what phone-setup's $(<file) reads (trailing
+    # newlines dropped, nothing else).
+    return Path(f).read_text().rstrip("\n")
 
 
 def phone_setup(ctx: Ctx, bid: str | None) -> int:

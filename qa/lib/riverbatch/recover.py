@@ -14,7 +14,7 @@ import time
 from riverqa import fbmode, journal as jmod, slots
 from riverqa.core import now_iso
 
-from . import kb, merge, outcomes as O, paths, phases, state as S, version
+from . import kb, merge, outcomes as O, paths, phases, report, state as S, version
 from .ctx import (AuthRefused, Blocked, Ctx, Halt, Pause, Refused, Retry, Unknown, commit_phase)
 
 MANIFEST = merge.MANIFEST
@@ -58,7 +58,13 @@ def recover_running(ctx: Ctx, local_only: bool = False) -> str:
     if not (b or {}).get("merge_started"):
         abort(ctx)
         return "aborted"
-    return forward(ctx, local_only)
+    try:
+        return forward(ctx, local_only)
+    except Refused as e:
+        # Gemini GM2-3: a confirmed refusal on the forward path that no step
+        # reconciled is Zak's, never a runner error.
+        raise Halt(f"{run['id']}: GitHub refused on the forward path: {e}",
+                   advice="Zak: `batch settle <id> --zak`") from e
 
 
 def abort(ctx: Ctx, extra_pause: str | None = None) -> None:
@@ -107,6 +113,7 @@ def abort(ctx: Ctx, extra_pause: str | None = None) -> None:
             outcome = {"class": O.VOID, "reason": tree_pause}
         before = st.get("pause")
         O.apply(st, run, outcome)
+        applied = (dict(run), dict(outcome))
         # A cause this abort knows (a disturbed tree, a GitHub auth refusal)
         # names the pause, over a generic one apply() set in this same
         # transaction (Gemini minor); a pause from before is never replaced.
@@ -116,6 +123,7 @@ def abort(ctx: Ctx, extra_pause: str | None = None) -> None:
                 break
         st["running"] = None
         S.add_report(st, bid)
+    report.snapshot(ctx, applied[0], applied[1], final=True)
     merge.prune_local(ctx, bid, run.get("touched") or [])
     if tree_pause or extra_pause or outcome.get("pause"):
         raise Pause(tree_pause or extra_pause or outcome.get("pause"))
@@ -133,7 +141,9 @@ def commit_outcome(ctx: Ctx, outcome: dict) -> dict:
         run["outcome"] = outcome
         run["phase"] = "decided"
         run["intent"] = None
-        return outcome
+        snap = dict(run)
+    report.snapshot(ctx, snap, outcome, final=False)        # Sol SM8: the evidence outlives running
+    return outcome
 
 
 def forward(ctx: Ctx, local_only: bool = False) -> str:
@@ -161,8 +171,11 @@ def forward(ctx: Ctx, local_only: bool = False) -> str:
         # even when every merge was already recorded; promotion is the only
         # durable proof that skips this.
         if not merge.pair_is_ours(ctx, run):
+            # Opus minor: an earlier tick may have pushed some tags already.
+            tagged = "no tag was pushed" if run.get("phase") not in ("tagging", "change-prs") else \
+                "no further tag is pushed (an earlier tick may have pushed some; settle reports them)"
             raise Halt(f"slot-state.json no longer reserves {run['id']}'s pair at attempt {run.get('attempt_id')}; "
-                       "nothing was tagged", advice="Zak resolves the pair, then `batch settle <id> --zak`")
+                       f"{tagged}", advice="Zak resolves the pair, then `batch settle <id> --zak`")
         commit_phase("tagging")
         merge.push_tags(ctx, run)
         merge.promote(ctx, run)
@@ -189,7 +202,7 @@ def finish_merged(ctx: Ctx) -> None:
     with S.transaction("finish", batch=bid) as st:
         r = st["running"]
         for m in r["members"]:
-            e = S.entry(st, m["name"])
+            e = S.member_entry(st, r, m)                    # Sol SB1
             if e and e["status"] == "in-batch":
                 e["batch"] = bid
                 e["merged"] = {"batch": bid, "tag": f"known-good-{bid}", "at": now_iso()}
@@ -209,6 +222,8 @@ def finish_merged(ctx: Ctx) -> None:
         st["last_fail"] = None
         st["running"] = None
         S.add_report(st, bid)
+        done = dict(r)
+    report.snapshot(ctx, done, dict(done.get("outcome") or {"class": O.PASS}, merged=True), final=True)
     merge.prune_local(ctx, bid, run["touched"])
     retention(ctx)
 
@@ -383,17 +398,29 @@ def cleanup_items(ctx: Ctx) -> None:
         expected = dict(item.get("expected_merged") or {})
         if hold:
             expected.update(item.get("pr_repos") or {})
-        problems, done = [], True
+        problems, done, waiting = [], True, set()
+        landed_open = item.get("landed_open") or {}
         touched = sorted(set(tested) | set(item.get("branch_repos") or {}) | set(item.get("pr_repos") or {})
                          | set(item.get("expected_merged") or {}))
         try:
             for p in touched:                       # I12: by exact head branch in every touched repo
                 for pr in ctx.gh.pr_list(sl[p], f"batch/{bid}", "all"):
+                    ident = {"repo": sl[p], "number": pr.get("number")}
                     if pr.get("state") == "MERGED":
-                        if expected.get(p) == {"repo": sl[p], "number": pr.get("number")}:
+                        # Sol SM1: an expected merge counts only at the tested
+                        # head, into river-22.2, from the repo itself.
+                        if expected.get(p) == ident and pr.get("headRefOid") == tested.get(p) \
+                                and pr.get("baseRefName") == "river-22.2" and pr.get("isCrossRepository") is False:
                             continue
-                        raise Pause(f"batch PR {sl[p]}#{pr['number']} merged without the runner", step="cleanup")
+                        raise Pause(f"batch PR {sl[p]}#{pr['number']} merged without the runner (or not at its "
+                                    "tested head into river-22.2)", step="cleanup")
                     if pr.get("state") != "OPEN":
+                        continue
+                    if landed_open.get(p) == ident:
+                        # Landed, GitHub still says OPEN: wait for MERGED;
+                        # never close it or delete its branch (Sol SM1).
+                        waiting.add(p)
+                        done = False
                         continue
                     sha = tested.get(p)
                     if not sha:
@@ -409,6 +436,8 @@ def cleanup_items(ctx: Ctx) -> None:
                                         f"Batch {bid} did not merge; closing its PR.")
                     ctx.gh.close_pr(sl[p], pr["number"])
             for p, sha in sorted((item.get("branch_repos") or {}).items()):
+                if p in waiting:
+                    continue
                 res = merge.delete_branch(ctx, p, sl[p], bid, sha)
                 if res == "other":
                     problems.append(f"{sl[p]} batch/{bid} is not at the composed SHA {sha[:12]}")
@@ -420,8 +449,13 @@ def cleanup_items(ctx: Ctx) -> None:
             with S.transaction("cleanup-refused", batch=bid) as st2:
                 it = next((c for c in st2["cleanup"] if c["batch"] == bid), None)
                 if it is not None:
-                    it["refusals"] = it.get("refusals", 0) + 1 if it.get("last_refusal") == str(e) else 1
+                    same = it.get("last_refusal") == str(e)
+                    # Sol SM8: one count per tick, however often the entry
+                    # point runs cleanup within it.
+                    if not (same and ctx.tick_id and it.get("refusal_tick") == ctx.tick_id):
+                        it["refusals"] = it.get("refusals", 0) + 1 if same else 1
                     it["last_refusal"] = str(e)
+                    it["refusal_tick"] = ctx.tick_id
                     if it["refusals"] >= 3:
                         third = True
                         S.set_pause(st2, f"cleanup of {bid}: the same refusal three ticks in a row: {e}",
@@ -472,9 +506,10 @@ def retention(ctx: Ctx, now: float | None = None) -> list[str]:
     if root.is_dir():
         for d in sorted(root.iterdir()):
             img = d / "images"
-            if d.name in keep or not img.is_dir():
-                continue
-            if now - img.stat().st_mtime > 7 * 86400:
+            # Sol SM7: the exclusions (protected batches, no images left)
+            # apply to image deletion only; the log policy runs for every
+            # batch directory.
+            if d.name not in keep and img.is_dir() and now - img.stat().st_mtime > 7 * 86400:
                 shutil.rmtree(img, ignore_errors=True)
                 removed.append(str(img))
             logs = d / "runner-logs"

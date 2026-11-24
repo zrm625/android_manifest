@@ -94,6 +94,7 @@ class Ctx:
     tc_check: object = tc.check
     cfg: dict = field(default_factory=paths.config)
     unknown: str | None = None           # R8.1: an unknown outcome left the loop
+    tick_id: str | None = None           # the tick this context runs (Sol SM8: refusals count once per tick)
     notes: list = field(default_factory=list)
     locks: tuple = ()
 

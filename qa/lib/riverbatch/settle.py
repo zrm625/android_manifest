@@ -84,6 +84,13 @@ def settle(ctx: Ctx, bid: str) -> dict:
                     open_prs[p] = {"repo": e["repo"], "number": e["number"]}
                 elif v.get("state") == "MERGED":
                     merged_prs[p] = {"repo": e["repo"], "number": e["number"]}
+        # Sol SM1, Gemini GM2-4: a batch PR GitHub still reports OPEN whose
+        # tested head is already in river-22.2 landed (GitHub lag): it is
+        # expected to show MERGED, never closed, and its branch is kept.
+        landed_open = {}
+        for p, x in sorted(open_prs.items()):
+            if is_ancestor(ctx, x["repo"], run["composed"][p]["sha"]):
+                landed_open[p] = x
         branches = {}
         for p in run.get("touched") or []:
             sha = run["composed"][p]["sha"]
@@ -92,8 +99,12 @@ def settle(ctx: Ctx, bid: str) -> dict:
         tags = [p for p in sorted(b.get("commit_set") or {})
                 if ctx.gh.ls_remote(url(sl[p]), f"refs/tags/known-good-{bid}") is not None]
         landed = {}
+        members = {m["name"]: S.member_entry(st, run, m) for m in run["members"]}     # Sol SB1
+        lost = [n for n, e in members.items() if e is None]
+        if lost:
+            raise Refused(f"{', '.join(lost)}: no longer the entry {bid} claimed; Zak inspects the state file")
         for m in run["members"]:
-            e = S.entry(st, m["name"])
+            e = members[m["name"]]
             got = [p for p in e["prs"] if is_ancestor(ctx, records.split_key(p["key"])[0], p["head"])]
             landed[m["name"]] = ("all" if len(got) == len(e["prs"]) else "some" if got else "none",
                                  [p["key"] for p in got])
@@ -102,7 +113,7 @@ def settle(ctx: Ctx, bid: str) -> dict:
         if not promoted:
             for name, (how, _) in landed.items():
                 if how == "none":
-                    e = S.entry(st, name)
+                    e = members[name]
                     rec, errs = records.load_bundle(name, e["record_sha256"])
                     try:
                         elig[name] = commands.eligibility_of(ctx, rec, errs)
@@ -116,7 +127,7 @@ def settle(ctx: Ctx, bid: str) -> dict:
         with S.transaction("settle", batch=bid) as st2:
             r = st2["running"]
             for m in r["members"]:
-                e = S.entry(st2, m["name"])
+                e = S.member_entry(st2, r, m)
                 if not e or e["status"] != "in-batch":
                     continue
                 how, keys = landed[m["name"]]
@@ -140,16 +151,19 @@ def settle(ctx: Ctx, bid: str) -> dict:
                                      by="zak", action="settle")
             st2["cleanup"] = [c for c in st2["cleanup"] if c["batch"] != bid]
             if branches or open_prs:
-                # Sol M4: after a partial merge the open batch PRs and their
-                # tested branches are Zak's repair (merge them at their tested
-                # heads); nothing is closed or deleted while the re-baseline
-                # is owed. The ones that landed are expected (Opus OM3); every
-                # touched repo keeps its tested head (Sol M5).
-                hold = ({"settle": bid, "why": "partial merge: the open batch PRs are kept for Zak's repair until "
-                                               "the re-baseline"} if rebaseline and merged_prs and open_prs else None)
+                # Sol M4, SM1, Gemini GM2-4: while a re-baseline is owed
+                # (anything landed, drift, or GitHub lagging past I5) the open
+                # batch PRs and their tested branches are Zak's repair (merge
+                # them at their tested heads): nothing is closed or deleted.
+                # The ones that landed are expected (Opus OM3), the ones
+                # landed but still OPEN too; every touched repo keeps its
+                # tested head (Sol M5).
+                hold = ({"settle": bid, "why": "the open batch PRs and branches are kept for Zak's repair until "
+                                               "the re-baseline"} if rebaseline else None)
                 st2["cleanup"].append(S.cleanup_item(
                     bid, {p: run["composed"][p]["sha"] for p in run.get("touched") or []}, branch_repos=branches,
-                    pr_repos=open_prs, expected_merged=merged_prs, hold=hold))
+                    pr_repos={p: x for p, x in open_prs.items() if p not in landed_open},
+                    expected_merged=dict(merged_prs, **landed_open), hold=hold, landed_open=landed_open))
             if rebaseline:
                 st2["rebaseline"] = {"settle": bid, "at": now_iso(), "drifted": drifted,
                                      "landed": {k: v[0] for k, v in landed.items()}}
@@ -157,14 +171,21 @@ def settle(ctx: Ctx, bid: str) -> dict:
             st2["halt"] = None
             st2["lease"] = st2["lease"] if st2["lease"] and st2["lease"]["batch"] != bid else None
             S.add_report(st2, f"settle-{bid}")
+            # Opus minor: a settle never closes change PRs (R10.7 runs only on
+            # the forward path); the report lists the merged members' ones.
+            left_open = sorted(p["key"] for m in r["members"] for e in [S.entry_by_id(st2, m.get("id"))] if e
+                               and e["status"] == "merged" for p in e["prs"])
             st2.setdefault("settles", {})[bid] = {
+                "change_prs_open": left_open,
                 "at": now_iso(), "promoted": promoted, "known_good_written": kw_written,
                 "landed": {k: v[0] for k, v in landed.items()}, "tags": tags, "rebaseline": rebaseline,
                 "drifted": drifted,
                 "advice": ("Re-baseline owed: river-22.2 holds content no gate tested as a whole. If that content is "
                            "broken, revert it through reviewed PRs first; to finish a partial merge instead, Zak "
-                           "merges the missing PRs of this batch at their exact tested heads "
-                           "(--match-head-commit). Then run the re-baseline sequence (qa/RUNNER.md, R13.4)."
+                           "merges the missing PRs of this batch at their exact tested heads with the synchronous "
+                           "REST merge (gh api -X PUT repos/<repo>/pulls/<n>/merge -f sha=<tested head> -f "
+                           "merge_method=merge; never gh pr merge, which can queue or auto-merge). Then run the "
+                           "re-baseline sequence (qa/RUNNER.md, R13.4)."
                            if rebaseline else None)}
         merge.prune_local(ctx, bid, run.get("touched") or [])
         return st2["settles"][bid]

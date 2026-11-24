@@ -269,7 +269,7 @@ def check(expected: dict[str, str], top: Path | None = None, workers: int = 8) -
 
 def tools_problems(top: Path | None = None) -> list[str]:
     """Preflight item 1: git >= 2.38 and git-lfs, with .repo-bootstrap/bin
-    first on PATH."""
+    first on PATH, and gh with ``api --slurp``."""
     top = top or paths.TOP
     bad = []
     boot = str(top / ".repo-bootstrap" / "bin")
@@ -284,4 +284,10 @@ def tools_problems(top: Path | None = None) -> list[str]:
             bad.append("git lfs is not available")
     except (OSError, subprocess.TimeoutExpired) as e:
         bad.append(f"git: {e}")
+    try:                                                   # Opus minor: GitHub.pages needs `gh api --slurp`
+        h = subprocess.run(["gh", "api", "--help"], capture_output=True, text=True, timeout=30)
+        if "--slurp" not in (h.stdout or "") + (h.stderr or ""):
+            bad.append("gh does not support `gh api --slurp` (needs gh 2.48 or later)")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        bad.append(f"gh: {e}")
     return bad
