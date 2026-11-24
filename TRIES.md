@@ -47,15 +47,21 @@ Zak: please check what the rear of the phone rests on.
 together. `phone-qa --probe`: 39 pass; GPS and the rear-flash check fail as
 before.
 
+## Dropped
+
+| Try | Branch | Why dropped |
+| --- | --- | --- |
+| No debugfs | kernel `debugfs-off` | Doesn't compile: Qualcomm audio (q6asm, apr, audio codecs) and clock-debug code keep real functions under `CONFIG_DEBUG_FS`. Worth about 6 MB; it would need driver patches. |
+| No ftrace | kernel `ftrace-off` | Stack E (with no SecureElement): 1,097 MB (−6.5 MB, not the 16 MB the tracefs file count suggested). `vendor.lineage.livedisplay-service.sdm` aborted at every boot ("PictureAdjustment backend not ready"), then init restarted it 5 s later. A tombstone on every boot isn't worth 6 MB. |
+
 ## Testing
 
-**Stack E**: on river-22.2.
+**Stack F**: on river-22.2.
 
 | Try | Branch | Why |
 | --- | --- | --- |
-| No ftrace | kernel `ftrace-off` | 1,700 trace events are 20,800 pinned tracefs files (about 16 MB of inodes and dentries). |
-| No debugfs | kernel `debugfs-off` | 7,400 pinned debugfs files (about 6 MB). Some Qualcomm drivers may mind. |
-| No SecureElement | build `drop-secure-element` | Persistent OMAPI app (6.7 MB). No NFC or eSE on the test phone; the NFC stack stays. |
+| No PinnerService pinning | sdm632-common `no-pinning` | PinnerService locked 207 MB: framework.jar 40 MB, services.jar and odex 34 MB, SystemUI apk and odex 80 MB, surfaceflinger 8 MB, WebView 20 MB, Perch 8 MB. Locked pages count as used and can't be reclaimed. |
+| No SecureElement | build `drop-secure-element` | Carried over from stack E. If LiveDisplay crashes again in stack F, this is the cause, not ftrace. |
 
 ## Open problems
 
