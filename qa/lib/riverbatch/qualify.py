@@ -161,8 +161,11 @@ def compose_run(ctx: Ctx, bid: str, purpose: str, members: list[dict], base: dic
 def stage_cmd(ctx: Ctx, kind: str, bid: str, changes: list[str]) -> dict:
     if kind not in ("calibration", "baseline"):
         raise Refused("--kind is calibration or baseline")
-    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$", bid or ""):          # never '.', '..' or a dotfile
-        raise Refused(f"bad batch ID {bid!r}")
+    # Never '.', '..' or a dotfile; at most 69 characters, because
+    # scripts/build appends "-<10-hex commit hash>" and caps the build ID at
+    # 80 (Sol minor).
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,68}$", bid or ""):
+        raise Refused(f"bad batch ID {bid!r} (letters, digits, '.', '_', '-'; at most 69 characters)")
     if RUNNER_ID_RE.match(bid):
         raise Refused(f"{bid} is a runner ID (bNNNN, qNNNN); pick another")
     if (paths.batch_dir(bid) / "batch.json").exists():
@@ -174,12 +177,8 @@ def stage_cmd(ctx: Ctx, kind: str, bid: str, changes: list[str]) -> dict:
         refusals(ctx, "stage")
         st = S.read()
         tree_first(ctx)
-        if st.get("running"):                      # R13.2 steps 2 and 3, host only
-            recover.abort(ctx)
-        elif st.get("lease"):
-            ok, found = phases.restore(ctx)
-            if not ok:
-                raise Refused("tree-disturbed: " + "; ".join(found[:4]))
+        if st.get("running"):                      # R13.2 steps 2 and 3, host only (a lease without
+            recover.abort(ctx)                     # running was refused by refusals(): Gemini minor)
         why = recover.known_good_agreement(ctx)
         if why:
             raise Refused(why)
@@ -250,10 +249,6 @@ def qualify_cmd(ctx: Ctx, run_only: bool, changes: list[str]) -> dict:
         tree_first(ctx)                               # Sol SM5: before the interrupted run's rollback
         if st.get("running"):                         # an interrupted qualify run: R11.2 step 2
             recover.abort(ctx)
-        elif st.get("lease"):
-            ok, found = phases.restore(ctx)
-            if not ok:
-                raise Refused("tree-disturbed: " + "; ".join(found[:4]))
         kg = ctx.known_good()
         if not kg:
             raise Refused("no known-good.json")

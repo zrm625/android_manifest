@@ -171,8 +171,11 @@ def forward(ctx: Ctx, local_only: bool = False) -> str:
         # even when every merge was already recorded; promotion is the only
         # durable proof that skips this.
         if not merge.pair_is_ours(ctx, run):
+            # Opus minor: an earlier tick may have pushed some tags already.
+            tagged = "no tag was pushed" if run.get("phase") not in ("tagging", "change-prs") else \
+                "no further tag is pushed (an earlier tick may have pushed some; settle reports them)"
             raise Halt(f"slot-state.json no longer reserves {run['id']}'s pair at attempt {run.get('attempt_id')}; "
-                       "nothing was tagged", advice="Zak resolves the pair, then `batch settle <id> --zak`")
+                       f"{tagged}", advice="Zak resolves the pair, then `batch settle <id> --zak`")
         commit_phase("tagging")
         merge.push_tags(ctx, run)
         merge.promote(ctx, run)

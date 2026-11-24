@@ -173,7 +173,7 @@ def settle(ctx: Ctx, bid: str) -> dict:
             S.add_report(st2, f"settle-{bid}")
             # Opus minor: a settle never closes change PRs (R10.7 runs only on
             # the forward path); the report lists the merged members' ones.
-            left_open = sorted(p["key"] for m in r["members"] for e in [S.member_entry(st2, r, m)] if e
+            left_open = sorted(p["key"] for m in r["members"] for e in [S.entry_by_id(st2, m.get("id"))] if e
                                and e["status"] == "merged" for p in e["prs"])
             st2.setdefault("settles", {})[bid] = {
                 "change_prs_open": left_open,
@@ -182,8 +182,10 @@ def settle(ctx: Ctx, bid: str) -> dict:
                 "drifted": drifted,
                 "advice": ("Re-baseline owed: river-22.2 holds content no gate tested as a whole. If that content is "
                            "broken, revert it through reviewed PRs first; to finish a partial merge instead, Zak "
-                           "merges the missing PRs of this batch at their exact tested heads "
-                           "(--match-head-commit). Then run the re-baseline sequence (qa/RUNNER.md, R13.4)."
+                           "merges the missing PRs of this batch at their exact tested heads with the synchronous "
+                           "REST merge (gh api -X PUT repos/<repo>/pulls/<n>/merge -f sha=<tested head> -f "
+                           "merge_method=merge; never gh pr merge, which can queue or auto-merge). Then run the "
+                           "re-baseline sequence (qa/RUNNER.md, R13.4)."
                            if rebaseline else None)}
         merge.prune_local(ctx, bid, run.get("touched") or [])
         return st2["settles"][bid]

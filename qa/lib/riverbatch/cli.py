@@ -161,7 +161,10 @@ def _run(a, ctx: C.Ctx) -> int:
         print(f"error: {e}", file=sys.stderr)
     except C.Busy as e:
         code, summary["busy"] = C.EXIT_RESUMABLE, e.message
-    except (C.Unknown, C.AuthRefused) as e:
+    except C.AuthRefused as e:                     # Gemini minor: an auth refusal is not resumable by retrying
+        code, summary["auth"] = C.EXIT_ERROR, str(e)
+        print(f"error: GitHub auth: {e}", file=sys.stderr)
+    except C.Unknown as e:
         code, summary["unknown"] = C.EXIT_RESUMABLE, str(e)
     except C.Halt as e:
         from .tick import commit_stop

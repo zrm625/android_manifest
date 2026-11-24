@@ -69,11 +69,12 @@ def preflight(ctx: Ctx) -> dict:
     expect = dict(base)
     r = ctx.tc_check(expect)                                                     # 4
     if not r.ok:
-        raise Blocked("tree check failed: " + r.summary())
+        raise Blocked("tree check failed: " + r.summary(), step="tree")
     recover.retention(ctx)                                                       # 5 (I17)
     free = ctx.free_gb(paths.home())
     if free < ctx.cfg["free_space_floor_gb"]:
-        raise Blocked(f"only {free:.0f} GB free in $BENCH_HOME (floor {ctx.cfg['free_space_floor_gb']} GB)")
+        raise Blocked(f"only {free:.0f} GB free in $BENCH_HOME (floor {ctx.cfg['free_space_floor_gb']} GB)",
+                      step="free-space")
     why = qualification_problems(ctx)                                            # 6
     if why:
         raise NotQualified("not qualified: " + "; ".join(why))
@@ -307,11 +308,17 @@ def commit_stop(e: Stop) -> None:
                 S.set_pause(st, e.message, e.step, e.advice)
                 S.add_report(st, f"pause-{int(time.time())}")
         elif isinstance(e, (Blocked, NotQualified, Retry)):
+            # Opus minor: a blocker is keyed on its kind and stable cause
+            # (``step`` when the message carries changing numbers, such as
+            # the free space), so one cause queues one report.
             old = st.get("blocker") or {}
-            if (old.get("kind"), old.get("message")) != (e.kind, e.message):
-                st["blocker"] = {"kind": e.kind, "message": e.message, "at": now_iso(),
+            cause = e.step or e.message
+            if (old.get("kind"), old.get("cause", old.get("message"))) != (e.kind, cause):
+                st["blocker"] = {"kind": e.kind, "cause": cause, "message": e.message, "at": now_iso(),
                                  "report": f"{e.kind}-{int(time.time())}"}
                 S.add_report(st, st["blocker"]["report"])
+            else:
+                st["blocker"] = dict(old, message=e.message)
 
 
 def clear_blocker() -> None:
@@ -352,7 +359,7 @@ def tick(ctx: Ctx, max_batches: int) -> tuple[int, dict]:
                 locks.release()
                 locks = Locks(ctx).__enter__()
                 if S.read().get("halt"):
-                    return EXIT_HALT, {"state": "halted", **summary}
+                    return EXIT_HALT, {**summary, "state": "halted"}
                 if S.read().get("pause"):
                     paused_now = True
                     break
@@ -366,7 +373,7 @@ def tick(ctx: Ctx, max_batches: int) -> tuple[int, dict]:
             commit_stop(e)
             if isinstance(e, Halt):
                 report.flush(ctx)
-                return EXIT_HALT, {"state": "halted", "halt": e.message, **summary}
+                return EXIT_HALT, {**summary, "state": "halted", "halt": e.message}
             paused_now = paused_now or isinstance(e, Pause)
             summary["state"] = e.kind
             summary["why"] = e.message
@@ -378,11 +385,15 @@ def tick(ctx: Ctx, max_batches: int) -> tuple[int, dict]:
                 recover.entry_point(ctx, setup=True, local_only=bool(ctx.unknown))
         except Unknown as e:
             ctx.unknown = ctx.unknown or str(e)
+        except AuthRefused as e:                        # Gemini minor: at step 6 too, a pause
+            commit_stop(Pause(f"GitHub auth: {e.repo}: {e.status}", step="auth"))
+            if summary["state"] == "idle":
+                summary["state"], summary["why"] = "pause", f"GitHub auth: {e.repo}: {e.status}"
         except (Halt, Pause, Blocked, Retry) as e:
             commit_stop(e)
             if isinstance(e, Halt):
                 report.flush(ctx)
-                return EXIT_HALT, {"state": "halted", "halt": e.message, **summary}
+                return EXIT_HALT, {**summary, "state": "halted", "halt": e.message}
             if summary["state"] == "idle":
                 summary["state"], summary["why"] = e.kind, e.message
         report.flush(ctx)

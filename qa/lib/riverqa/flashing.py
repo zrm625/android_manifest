@@ -878,7 +878,8 @@ def merge_started(batch_id: str) -> int:
         if not frozen:
             log(f"error: {batch_id}'s merge_started has no expected PR set; recovery will halt")
             return EXIT_ERROR
-        if expected != frozen or (batch.get("base") and ms.get("base") != batch["base"]):
+        # Gemini minor: a base recorded on either side must match the other.
+        if expected != frozen or ((batch.get("base") or ms.get("base")) and ms.get("base") != batch.get("base")):
             log(f"error: {batch_id}'s PR record changed after merge_started: "
                 + ("; ".join(errs) if errs else "a different PR set or base"))
             return EXIT_ERROR

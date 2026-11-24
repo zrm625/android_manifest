@@ -413,7 +413,9 @@ def _ssid(ctx: Ctx) -> str:
     if not f:
         raise Pause("runner/config.json has no wifi_ssid_file")
     from pathlib import Path
-    return Path(f).read_text().strip()
+    # Opus minor: exactly what phone-setup's $(<file) reads (trailing
+    # newlines dropped, nothing else).
+    return Path(f).read_text().rstrip("\n")
 
 
 def phone_setup(ctx: Ctx, bid: str | None) -> int:

@@ -120,6 +120,22 @@ def hash_tree(product: Path, masks: list[str], allow: list[str], commit_set: dic
             for n in sorted(filenames):
                 f = Path(dirpath) / n
                 rel = str(f.relative_to(product))
+                if rel == BUILD_MANIFEST:
+                    # Sol minor (I8): a readable regular file, never a
+                    # symlink and never allowlisted, its revisions checked
+                    # before any exclusion.
+                    if f.is_symlink() or not f.is_file():
+                        errs.append(f"{BUILD_MANIFEST} is not a regular file (I8)")
+                        continue
+                    try:
+                        raw = f.read_bytes()
+                    except OSError as e:
+                        errs.append(f"{BUILD_MANIFEST} cannot be read: {e} (I8)")
+                        continue
+                    text, e2 = normalize_build_manifest(raw.decode(errors="replace"), commit_set, excluded)
+                    errs += e2
+                    files[rel] = hashlib.sha256(text.encode()).hexdigest()
+                    continue
                 if rel in allow:
                     continue
                 if f.is_symlink():
@@ -128,12 +144,8 @@ def hash_tree(product: Path, masks: list[str], allow: list[str], commit_set: dic
                 data = f.read_bytes()
                 if n == "build.prop":
                     data = mask_prop(data.decode(errors="replace"), masks).encode()
-                if rel == BUILD_MANIFEST:
-                    text, e = normalize_build_manifest(data.decode(errors="replace"), commit_set, excluded)
-                    errs += e
-                    data = text.encode()
                 files[rel] = hashlib.sha256(data).hexdigest()
-    if BUILD_MANIFEST not in files and BUILD_MANIFEST not in allow:
+    if BUILD_MANIFEST not in files and not any(BUILD_MANIFEST in x for x in errs):
         errs.append(f"{BUILD_MANIFEST} is missing: the build's revisions cannot be checked (I8)")
     return files, errs
 

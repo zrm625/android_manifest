@@ -16,6 +16,7 @@ import _path  # noqa: F401
 from benchhome import bench_home
 from riverbatch import hold, paths, ports
 from riverqa import children
+from test_batch_qualify import produced
 
 
 def _alive(pid: int) -> bool:
@@ -51,8 +52,8 @@ class SessionEscape(unittest.TestCase):
             tools = ports.Tools()
             pid = None
             try:
-                r = tools.run(["sh", "-c", f'"{sys.executable}" -I "{script}" "{pidf}" </dev/null >/dev/null 2>&1 & wait'], None,
-                              timeout=3)
+                cmd = f'"{sys.executable}" -I "{script}" "{pidf}" </dev/null >/dev/null 2>&1 & wait'
+                r = tools.run(["sh", "-c", cmd], None, timeout=3)
                 self.assertTrue(r.timed_out)
                 pid, pgid, sid = map(int, pidf.read_text().split())
                 self.assertNotEqual(pgid, sid)                       # it did leave the tool's group
@@ -238,7 +239,7 @@ class EntryIdentity(unittest.TestCase):
 class OneReplyPerProvider(unittest.TestCase):
     def enqueue_with(self, mutate):
         from batchfakes import FakeGH, mk_ctx
-        from riverbatch import commands, records
+        from riverbatch import commands
         from riverbatch import state as S
         from test_batch_commands import world
         from test_batch_records import make_record
@@ -1020,3 +1021,226 @@ class ReportEvidence(unittest.TestCase):
             ctx.tick_id = "tick-2"
             recover.cleanup_items(ctx)
             self.assertEqual(S.read()["cleanup"][0]["refusals"], 2)
+
+
+# --- minors ---------------------------------------------------------------------------------------------
+
+class Minors(unittest.TestCase):
+    def test_resume_clears_every_strike_even_one_seeded_at_its_limit(self):
+        """Sol (M7/GM5 tests): every known strike at its limit, plus an
+        unknown key, are cleared by resume."""
+        from riverbatch import commands
+        from riverbatch import state as S
+        with bench_home():
+            with S.transaction() as st:
+                S.set_pause(st, "x", step="lookup")
+                st["strikes"] = {k: 2 for k in S.STRIKES} | {"later_strike": 5}
+            commands.resume()
+            self.assertEqual(S.read()["strikes"], {k: 0 for k in S.STRIKES})
+
+    def build_manifest_case(self, make, allow=()):
+        from riverbatch import abtest
+        from test_batch_qualify import BuildManifestProducer
+        t = BuildManifestProducer()
+        with tempfile.TemporaryDirectory() as d:
+            product = Path(d)
+            f = product / abtest.BUILD_MANIFEST
+            f.parent.mkdir(parents=True)
+            make(f, t)
+            _files, errs = abtest.hash_tree(product, [], list(allow), dict(t.CS),
+                                            abtest.producer_excluded(list(t.CS)))
+        return errs
+
+    def test_build_manifest_must_be_a_regular_file_and_is_checked_even_if_allowlisted(self):
+        from riverbatch import abtest
+
+        def link(f, t):
+            (f.parent / "real.xml").write_text(produced(t.CS))
+            f.symlink_to("real.xml")
+        self.assertTrue(any("not a regular file" in e for e in self.build_manifest_case(link)))
+
+        def wrong(f, t):
+            cs = dict(t.CS)
+            cs["vendor/lineage"] = "f" * 40
+            f.write_text(produced(cs))
+        errs = self.build_manifest_case(wrong, allow=[abtest.BUILD_MANIFEST])
+        self.assertTrue(any("vendor/lineage at ffffffffffff" in e for e in errs), errs)
+
+    def test_a_filtered_fork_in_build_manifest_is_an_error(self):
+        """Opus minor: the producer filters the proprietary forks; one that
+        appears means the producer changed."""
+        from riverbatch import abtest
+        from test_batch_qualify import BuildManifestProducer
+        t = BuildManifestProducer()
+        excluded = abtest.producer_excluded(list(t.CS))
+        self.assertTrue(excluded)
+        p = sorted(excluded)[0]
+        xml = produced(t.CS) + f'<project path="{p}" name="x" revision="{t.CS[p]}"/>\n'
+        _out, errs = abtest.normalize_build_manifest(xml, dict(t.CS), excluded)
+        self.assertTrue(any("which its producer filters out" in e for e in errs), errs)
+
+    def tick_with(self, end_exc):
+        from batchfakes import mk_ctx
+        from riverbatch import recover, tick
+        from riverbatch import ctx as C
+
+        def entry_point(ctx, setup, local_only=False):
+            if setup:
+                raise end_exc
+        with mock.patch.object(C.Locks, "__enter__", lambda self: self), \
+                mock.patch.object(C.Locks, "__exit__", lambda self, *a: None), \
+                mock.patch.object(C.Locks, "release", lambda self: None), \
+                mock.patch.object(recover, "entry_point", entry_point), \
+                mock.patch.object(tick, "preflight", return_value={}), \
+                mock.patch.object(tick, "next_batch", return_value=None):
+            return tick.tick(mk_ctx(), 1)
+
+    def test_a_halt_at_the_end_of_tick_reads_halted(self):
+        from riverbatch import ctx as C
+        with bench_home():
+            code, summary = self.tick_with(C.Halt("rollback halted"))
+            self.assertEqual((code, summary["state"]), (3, "halted"))
+
+    def test_auth_refusal_at_the_end_of_tick_pauses(self):
+        from riverbatch import ctx as C
+        from riverbatch import state as S
+        with bench_home():
+            code, summary = self.tick_with(C.AuthRefused("pr list", "zrm625/x", 401, "Bad credentials"))
+            self.assertEqual(code, 0)
+            self.assertIn("GitHub auth", S.read()["pause"]["reason"])
+
+    def test_auth_refusal_of_a_command_exits_1(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from batchfakes import mk_ctx
+        from riverbatch import cli, commands
+        from riverbatch import ctx as C
+        with bench_home(), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
+                mock.patch.object(commands, "enqueue", side_effect=C.AuthRefused("x", "zrm625/x", 401, "")):
+            self.assertEqual(cli.main(["enqueue", "--record", "/nonexistent"], mk_ctx()), 1)
+
+    def test_one_blocker_cause_queues_one_report(self):
+        from riverbatch import ctx as C, tick
+        from riverbatch import state as S
+        with bench_home():
+            tick.commit_stop(C.Blocked("only 50 GB free in $BENCH_HOME (floor 60 GB)", step="free-space"))
+            with S.transaction() as st:
+                st["blocker"]["at"] = "first"
+                st["reports_pending"] = []
+            tick.commit_stop(C.Blocked("only 49 GB free in $BENCH_HOME (floor 60 GB)", step="free-space"))
+            st = S.read()
+            self.assertEqual((st["blocker"]["at"], st["reports_pending"]), ("first", []))
+            self.assertIn("49 GB", st["blocker"]["message"])
+
+    def test_push_tags_accepts_a_lightweight_tag(self):
+        """Gemini minor: a lightweight tag has no ^{} line; it is read as
+        itself, so push_tags does not wait forever."""
+        import test_batch_mergepath as mp
+        from batchfakes import mk_ctx
+        from riverbatch import merge
+        from riverbatch import state as S
+        with bench_home() as h:
+            gh, git, tools, rgit = mp.world(h)
+            b = json.loads((h / "batches/b0001/batch.json").read_text())
+            b.update(tag="known-good-b0001", merge_started={"expected_prs": {}})
+            (h / "batches/b0001/batch.json").write_text(json.dumps(b))
+            sl = merge.slugs()
+
+            def push(ctx, path, *args):                           # a lightweight tag on the remote
+                gh.tips[(sl[path], "refs/tags/known-good-b0001")] = b["commit_set"][path]
+            ctx = mk_ctx(gh=gh)
+            ctx.git = git
+            with mock.patch.object(merge, "remote_git", push):
+                merge.push_tags(ctx, S.read()["running"])
+
+    def test_readback_ssid_is_what_phone_setup_reads(self):
+        from batchfakes import mk_ctx
+        from riverbatch import phases
+        with tempfile.TemporaryDirectory() as t:
+            f = Path(t) / "ssid"
+            f.write_text(" my net \n\n")
+            self.assertEqual(phases._ssid(mk_ctx(cfg={"wifi_ssid_file": str(f)})), " my net ")
+
+    def test_stage_id_leaves_room_for_the_build_suffix(self):
+        from batchfakes import mk_ctx
+        from riverbatch import qualify
+        from riverbatch import state as S
+        with bench_home():
+            with self.assertRaises(S.Refused) as cm:
+                qualify.stage_cmd(mk_ctx(), "calibration", "c" * 70, [])
+            self.assertIn("at most 69", str(cm.exception))
+            with mock.patch.object(qualify, "refusals", side_effect=S.Refused("next check")):
+                with self.assertRaises(S.Refused) as cm:
+                    qualify.stage_cmd(mk_ctx(), "calibration", "c" * 69, [])
+            self.assertEqual(str(cm.exception), "next check")
+
+    def test_preflight_needs_gh_with_slurp(self):
+        from riverbatch import tc
+        with tempfile.TemporaryDirectory() as t:
+            b = Path(t) / "bin"
+            b.mkdir()
+            (b / "gh").write_text("#!/bin/sh\necho 'usage: gh api <endpoint> [--paginate]'\n")
+            (b / "gh").chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": f"{b}:{os.environ['PATH']}"}):
+                bad = tc.tools_problems(Path(t))
+            self.assertTrue(any("--slurp" in x for x in bad), bad)
+
+    def test_merge_started_refuses_a_base_dropped_afterwards(self):
+        import io
+        from contextlib import redirect_stderr
+        from riverqa import core, flashing, stage
+        from test_promote import SLUGS, setup
+        with bench_home() as h:
+            setup(h, started=False)
+            b = core.read_json(core.batch_dir("b1") / "batch.json")
+            b["base"] = {p: "1" * 40 for p in b["commit_set"]}
+            core.write_json(core.batch_dir("b1") / "batch.json", b)
+
+            def run():
+                with mock.patch.object(stage, "repo_slugs", lambda manifest=None: dict(SLUGS)), \
+                        redirect_stderr(io.StringIO()):
+                    return flashing.main(["--merge-started", "b1"])
+            self.assertEqual(run(), flashing.EXIT_OK)
+            b = core.read_json(core.batch_dir("b1") / "batch.json")
+            del b["base"]
+            core.write_json(core.batch_dir("b1") / "batch.json", b)
+            self.assertEqual(run(), flashing.EXIT_ERROR)
+
+    def test_settle_advice_and_change_prs_left_open(self):
+        import test_batch_settle as ts
+        with bench_home() as h:
+            gh = ts.world(h)
+            out = ts.PartialSettle().settle(gh)
+            self.assertIn("gh api -X PUT", out["advice"])
+            self.assertNotIn("--match-head-commit", out["advice"])
+        with bench_home() as h:
+            gh = ts.world(h)
+            ss = json.loads((h / "slot-state.json").read_text())
+            ss["known_good"] = {"batch": "b0001"}                         # promoted
+            (h / "slot-state.json").write_text(json.dumps(ss))
+            with mock.patch("riverbatch.merge.write_known_good", return_value=False):
+                out = ts.PartialSettle().settle(gh)
+            self.assertEqual(out["change_prs_open"],
+                             sorted([f"{ts.RIVER}#6", f"{ts.VENDOR}#5", "zrm625/android_build#4"]))
+
+    def test_lost_pair_after_tagging_started_does_not_say_nothing_was_tagged(self):
+        """Opus minor: an earlier tick may have pushed some tags."""
+        from batchfakes import mk_ctx, write_json
+        from riverbatch import ctx as C, merge, recover
+        from riverbatch import state as S
+        for phase, want in (("merging", "no tag was pushed"), ("tagging", "no further tag is pushed")):
+            with bench_home() as h:
+                write_json(h / "slot-state.json", {"pair": {"batch": "b0001", "attempts": ["other"]}})
+                with S.transaction() as st:
+                    st["running"] = {"id": "b0001", "purpose": "batch", "phase": phase, "attempt_id": "fa-1",
+                                     "versions": {}, "members": []}
+                with mock.patch.object(merge, "write_known_good"), mock.patch.object(merge, "promoted",
+                                                                                     return_value=False), \
+                        mock.patch.object(recover.version, "current",
+                                          return_value=dict.fromkeys(("harness", "runner_build", "runner_tools"))), \
+                        mock.patch.object(merge, "merge_all"), mock.patch.object(merge, "commit_set_check",
+                                                                                 return_value=[]), \
+                        mock.patch.object(recover, "commit_phase"):
+                    with self.assertRaises(C.Halt) as cm:
+                        recover.forward(mk_ctx())
+                self.assertIn(want, str(cm.exception))
