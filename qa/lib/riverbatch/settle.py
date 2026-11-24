@@ -95,7 +95,7 @@ def settle(ctx: Ctx, bid: str) -> dict:
             got = [p for p in e["prs"] if is_ancestor(ctx, records.split_key(p["key"])[0], p["head"])]
             landed[m["name"]] = ("all" if len(got) == len(e["prs"]) else "some" if got else "none",
                                  [p["key"] for p in got])
-        drifted = drift(ctx, sl)
+        drifted = drift(ctx, sl) if not promoted else []
         elig = {}
         if not promoted:
             for name, (how, _) in landed.items():
