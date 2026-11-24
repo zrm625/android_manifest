@@ -305,7 +305,10 @@ class Retention(unittest.TestCase):
 
     def test_i17_retention_runs_before_the_free_space_check(self):
         order = []
-        ctx = mk_ctx()
+        import tempfile
+        f = tempfile.NamedTemporaryFile()
+        self.addCleanup(f.close)
+        ctx = mk_ctx(cfg={"wifi_ssid_file": f.name, "wifi_psk_file": f.name})
         ctx.free_gb = lambda p: order.append("free") or 1000.0
         with mock.patch.object(recover, "retention", lambda c: order.append("retention")):
             calls = [("tools", []), ("kg", {"latest": {"batch": "x", "commit_set": {}}})]

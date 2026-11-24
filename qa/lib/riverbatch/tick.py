@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 from riverqa import regression
 from riverqa.core import read_json
@@ -23,6 +24,10 @@ def preflight(ctx: Ctx) -> dict:
     """Returns {"base", "kg", "slugs", "verified"}; raises Blocked,
     NotQualified, Pause, ReExec or Unknown."""
     bad = tc.tools_problems()                                                     # 1
+    for k in ("wifi_ssid_file", "wifi_psk_file"):                                  # R3.2: setup needs both
+        f = ctx.cfg.get(k)
+        if not f or not Path(f).is_file():
+            bad.append(f"runner/config.json {k} is not a readable file")
     if bad:
         raise Blocked("; ".join(bad))
     kg = ctx.known_good()

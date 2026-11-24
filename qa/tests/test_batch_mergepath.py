@@ -9,7 +9,6 @@ import _path  # noqa: F401
 from batchfakes import FakeGH, FakeTools, mk_ctx, write_json
 from benchhome import bench_home
 from riverbatch import merge, recover, state as S, tick
-from riverbatch import github as G
 
 P = "device/motorola/river"
 BASE = {p: f"{i:x}" * 40 for i, p in enumerate(sorted(merge.slugs()), start=1)}
