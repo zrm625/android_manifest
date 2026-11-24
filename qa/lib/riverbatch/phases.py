@@ -292,6 +292,31 @@ def restore(ctx: Ctx) -> tuple[bool, list[str]]:
     return True, []
 
 
+def tree_problems(ctx: Ctx) -> list[str]:
+    """Read-only (Sol SM5): why the tree is not what the lease (or, with
+    no lease, river-22.2) says it should be, before anything touches the
+    phone: every fork and the manifest clean; a leased fork at its
+    ``expect`` or back on river-22.2 at its ``base``; every other fork on
+    river-22.2 and the manifest on ``default``."""
+    lease = S.read().get("lease") or {}
+    expect, lbase = lease.get("expect") or {}, lease.get("base") or {}
+    out = []
+    for p in sorted(compose.forks()) + [MANIFEST]:
+        try:
+            h, b, c = head(ctx, p), branch(ctx, p), clean(ctx, p)
+        except Exception as e:  # noqa: BLE001 - reported, never forced
+            out.append(f"{p}: unreadable ({e})")
+            continue
+        if not c:
+            out.append(f"{p} is dirty")
+        elif p in expect:
+            if h != expect[p] and not (b == "river-22.2" and h == lbase.get(p)):
+                out.append(f"{p} is at {h[:12]}, neither the lease's {expect[p][:12]} nor river-22.2")
+        elif b != ("default" if p == MANIFEST else "river-22.2"):
+            out.append(f"{p} is on {b or 'a detached HEAD'}, not {'default' if p == MANIFEST else 'river-22.2'}")
+    return out
+
+
 def restore_or_void(ctx: Ctx) -> None:
     ok, found = restore(ctx)
     if not ok:

@@ -42,7 +42,7 @@ from riverqa import children as rchildren, stage as rstage
 from riverqa.core import now_iso
 
 from . import compose, outcomes as O, paths, phases, state as S
-from .ctx import Abort, Busy, Ctx, children_and_container, commit_phase, head
+from .ctx import TOOL_TIMEOUTS, Abort, Busy, Ctx, children_and_container, commit_phase, head
 
 MANIFEST = compose.MANIFEST
 BUILD_MANIFEST = "system/product/etc/build-manifest.xml"
@@ -322,9 +322,16 @@ def one_build(ctx: Ctx, qid: str, label: str, base: dict, commits: dict, pin: st
 
 def interrupted_build(ctx: Ctx, run: dict, pin: str, spec: dict) -> bool:
     """B4: SIGTERM the build's holder once B1's driver object exists, is
-    newer than the build's start and holds B1's string; then wait for the
+    newer than the build's start and holds B1's string, or once the build
+    runs past its deadline (Sol SM4: never poll forever); then wait for the
     holder, its child record and the container to be gone. True if the
-    build finished first (part 1 is then inconclusive)."""
+    build finished first (part 1 is then inconclusive).
+
+    If the holder, a child or the container is still alive after the wait,
+    this raises Busy, never Abort: an Abort restores the tree while the
+    build may still read it. ``running`` and the lease stay; every later
+    lock acquisition waits (75) until they are gone, and the next entry
+    point ends the run."""
     commit_phase("building")
     phases.image_check(ctx, pin)
     phases.clear_intermediates()
@@ -332,27 +339,39 @@ def interrupted_build(ctx: Ctx, run: dict, pin: str, spec: dict) -> bool:
     log = paths.batch_dir(run["id"]) / "runner-logs"
     log.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
+    deadline = float((ctx.cfg.get("tool_timeouts") or {}).get("build", TOOL_TIMEOUTS["build"]))
+    start = ctx.now()
     proc = ctx.tools.start([str(paths.SCRIPTS / "build"), "--installclean", "--batch", run["id"]], run["id"],
                            log / "build-b4.log", {"RIVER_IMAGE_ID": pin})
     needle = spec["string"].encode()
-    stopped = False
-    while proc.poll() is None:
-        try:
-            if obj.exists() and obj.stat().st_mtime > t0 and needle in obj.read_bytes():
+    stopped = late = False
+    try:
+        while proc.poll() is None:
+            try:
+                if obj.exists() and obj.stat().st_mtime > t0 and needle in obj.read_bytes():
+                    ctx.tools.stop()
+                    stopped = True
+                    break
+            except OSError:
+                pass
+            if ctx.now() - start > deadline:
                 ctx.tools.stop()
-                stopped = True
+                late = True
                 break
-        except OSError:
-            pass
-        ctx.sleep(1)
-    proc.wait()
+            ctx.sleep(1)
+        proc.wait()
+    finally:
+        ctx.tools.current = None                         # Gemini minor: nothing left to stop
     for _ in range(STOP_WAIT_S):
         if not rchildren.live_children(paths.home()) and not _container_running(ctx):
             break
         ctx.sleep(1)
     else:
-        raise Abort({"class": O.VOID, "reason": f"B4: the build's holder, child or container is still alive after "
-                                                 f"{STOP_WAIT_S} s"})
+        raise Busy(f"B4: the build's holder, child or container is still alive after {STOP_WAIT_S} s; the run and "
+                   "its tree lease stay until they are gone")
+    if late:
+        raise Abort({"class": O.VOID, "reason": f"B4's build ran past its {deadline:.0f} s deadline before the "
+                                                 "driver object appeared"})
     # Gemini GB3: an exited lineageos-build container would collide with
     # A4's; remove it (never --force), or stop if one still runs.
     try:
@@ -369,7 +388,9 @@ def interrupted_build(ctx: Ctx, run: dict, pin: str, spec: dict) -> bool:
 
 def _container_running(ctx: Ctx) -> bool:
     r = ctx.podman.run("ps", "--filter", "name=^lineageos-build$", "--format", "{{.State}}")
-    return any(s.strip().lower() == "running" for s in (r.stdout or "").splitlines())
+    if r.returncode != 0:
+        return True                                     # unknown: not confirmed stopped
+    return any(s.strip().lower() in ("running", "paused", "stopping") for s in (r.stdout or "").splitlines())
 
 
 def run(ctx: Ctx, base: dict, pin: str) -> dict:

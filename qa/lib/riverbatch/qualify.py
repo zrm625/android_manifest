@@ -59,6 +59,14 @@ def refusals(ctx: Ctx, command: str) -> None:
         raise Refused(f"strike limit reached for {', '.join(lim)}: Zak resolves it and runs `batch resume --zak`")
 
 
+def tree_first(ctx: Ctx) -> None:
+    """I20, Sol SM5: a disturbed tree refuses before any phone recovery,
+    including the rollback of an interrupted run's own pair."""
+    bad = phases.tree_problems(ctx)
+    if bad:
+        raise Refused("tree-disturbed: " + "; ".join(bad[:4]) + " (nothing touched the phone)")
+
+
 def pin_image(ctx: Ctx) -> str:
     """ensure_image, then the image ID (R14.1 G-C3, R14.4)."""
     if image_id(ctx) is None:
@@ -165,6 +173,7 @@ def stage_cmd(ctx: Ctx, kind: str, bid: str, changes: list[str]) -> dict:
     with Locks(ctx):
         refusals(ctx, "stage")
         st = S.read()
+        tree_first(ctx)
         if st.get("running"):                      # R13.2 steps 2 and 3, host only
             recover.abort(ctx)
         elif st.get("lease"):
@@ -238,6 +247,7 @@ def qualify_cmd(ctx: Ctx, run_only: bool, changes: list[str]) -> dict:
     with Locks(ctx):
         refusals(ctx, "qualify")
         st = S.read()
+        tree_first(ctx)                               # Sol SM5: before the interrupted run's rollback
         if st.get("running"):                         # an interrupted qualify run: R11.2 step 2
             recover.abort(ctx)
         elif st.get("lease"):

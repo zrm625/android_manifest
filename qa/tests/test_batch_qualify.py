@@ -119,7 +119,7 @@ class TreeBeforePhone(unittest.TestCase):
                             qualify.qualify_cmd(ctx, False, [])
                         else:
                             qualify.stage_cmd(ctx, "calibration", "cal-9", [])
-                self.assertIn("vendor/lineage is not on a clean river-22.2", str(cm.exception), cmd)
+                self.assertIn("vendor/lineage is dirty", str(cm.exception), cmd)
                 self.assertEqual((self.dev.cmds, self.tools.calls), ([], []), cmd)
 
 
@@ -180,6 +180,7 @@ class StageFinish(unittest.TestCase):
                 seen["running"] = S.read()["running"]["id"]
             with mock.patch.object(qualify, "pin_image", return_value="img"), \
                     mock.patch.object(qualify, "local_base", return_value=dict(FULL)), \
+                    mock.patch.object(qualify, "tree_first"), \
                     mock.patch.object(qualify, "compose_run", compose_run), \
                     mock.patch.object(qualify.phases, "build"), \
                     mock.patch.object(qualify.phases, "stage_run", stage_run), \

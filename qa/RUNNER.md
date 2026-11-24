@@ -1542,7 +1542,15 @@ and exits 1 (`"qualified": false`); a HALT anywhere in it (the rollback,
 the setup) is committed and exits 3, never reported as a failed criterion
 (Gemini GM2-1). Like the tick (R8.2 step 2), `stage` and `qualify`
 re-exec once after fast-forwarding `.repo/manifests`, so they never run
-or certify old code (Gemini GM2-2).
+or certify old code (Gemini GM2-2). Before an interrupted run's rollback,
+both check the tree read-only against the lease (or `river-22.2`) and refuse
+a disturbed tree without touching the phone (Sol SM5).
+
+Part 1's B4 build has the build deadline: a build that runs past it before
+the driver object appears is stopped and the trial fails. If the holder, a
+child record or the `lineageos-build` container is still alive 600 s after
+the stop, `running` and the lease stay (exit 75); the tree is restored only
+once they are gone (Sol SM4).
 - **The first qualification** uses `--change gnss-standalone --change
   perch-launcher`: the known-good base is the baseline, which has no Perch, so
   zero members cannot pass `phone-qa`.

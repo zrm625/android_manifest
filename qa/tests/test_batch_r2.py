@@ -308,7 +308,7 @@ class QualifyExits(unittest.TestCase):
             mock.patch.object(phases, "test", return_value=outcome or {"class": O.PASS}),
             mock.patch.object(phases, "base_verified", return_value=(True, [])),
             mock.patch.object(qualify, "compose_run", compose_run), mock.patch.object(qualify, "commit_phase"),
-            mock.patch.object(qualify, "local_base", return_value=full),
+            mock.patch.object(qualify, "local_base", return_value=full), mock.patch.object(qualify, "tree_first"),
             mock.patch.object(qualify, "pin_image", return_value="img"),
             mock.patch.object(qualify.version, "runner_build", return_value="rb"),
             mock.patch.object(qualify.version, "runner_tools", return_value="rt"),
@@ -757,3 +757,100 @@ class LagConfirmation(unittest.TestCase):
         ctx = mk_ctx(gh=gh_with("MERGED", M, merge_commit=None))
         ctx.sleep = lambda s: land(ctx.gh)
         self.assertEqual(merge.reconcile_one(ctx, run_dict(), P, R, 7)[0], merge.UNKNOWN)
+
+
+# --- Sol SM4: B4's deadline, and the lease kept until the build is gone ------------------------------
+
+class B4Deadline(unittest.TestCase):
+    BASE = None
+
+    def ctx(self, ps):
+        from test_batch_qualify import BuildManifestProducer
+        from batchfakes import FakePodman, FakeTree, mk_ctx
+        self.tree = FakeTree(BuildManifestProducer.CS)
+        pod = FakePodman(image="img", ps=ps)
+        ctx = mk_ctx(tree=self.tree, podman=pod, cfg={"tool_timeouts": {"build": 5}})
+        clock = {"t": 1000.0}
+
+        def now():
+            clock["t"] += 1
+            return clock["t"]
+        ctx.now = now
+        self.procs = []
+
+        def start(argv, bid, log, env=None):                 # a live build that never makes the marker
+            p = subprocess.Popen(["sleep", "40"])
+            self.procs.append(p)
+            ctx.tools.current = p
+            return p
+        ctx.tools.start = start
+        return ctx
+
+    def one_build(self, ctx):
+        from test_batch_qualify import BuildManifestProducer
+        from riverbatch import abtest
+        cfg = abtest.load("abtest_config.json")
+        return abtest.one_build(ctx, "q0001", "B4", dict(BuildManifestProducer.CS),
+                                {"device/motorola/river": "e" * 40}, "img", cfg, interrupt=cfg["B4"])
+
+    def tearDown(self):
+        for p in getattr(self, "procs", []):
+            if p.poll() is None:
+                p.kill()
+            p.wait()
+
+    def test_a_hung_build_is_stopped_at_its_deadline_then_restored(self):
+        from riverbatch import ctx as C
+        from riverbatch import state as S
+        with bench_home():
+            ctx = self.ctx(ps="")
+            with self.assertRaises(C.Abort) as cm:
+                self.one_build(ctx)
+            self.assertIn("deadline", str(cm.exception))
+            self.assertIsNotNone(self.procs[0].poll(), "the build was never stopped")
+            self.assertIsNone(ctx.tools.current)
+            st = S.read()
+            self.assertIsNone(st["running"])
+            self.assertIsNone(st["lease"])
+            self.assertEqual(self.tree.head["device/motorola/river"], "river-22.2")
+
+    def test_a_container_still_running_keeps_the_run_and_the_lease(self):
+        from riverbatch import ctx as C
+        from riverbatch import state as S
+        with bench_home():
+            ctx = self.ctx(ps="running\n")
+            with self.assertRaises(C.Busy):
+                self.one_build(ctx)
+            st = S.read()
+            self.assertEqual(st["running"]["id"], "q0001-ab-B4")
+            self.assertEqual(st["lease"]["batch"], "q0001-ab-B4")
+            self.assertEqual(self.tree.head["device/motorola/river"], "batch/abtest-B4")
+
+
+# --- Sol SM5: the tree before the interrupted run's rollback -----------------------------------------
+
+class TreeBeforeRollback(unittest.TestCase):
+    def test_qualify_refuses_a_dirty_fork_before_rolling_back_its_own_pair(self):
+        from batchfakes import FakeDev, FakeTools, FakeTree, mk_ctx, write_json
+        from riverbatch import ctx as C
+        from riverbatch import merge, qualify
+        from riverbatch import state as S
+        full = {p: "b" * 40 for p in merge.slugs()}
+        with bench_home() as h:
+            write_json(h / "slot-state.json", {"known_good_slot": "a", "known_good": {"batch": "kg"},
+                                               "pair": {"batch": "q0003", "kind": "batch", "attempts": ["fa-1"]}})
+            write_json(h / "qa/known-good.json", {"latest": {"batch": "kg", "cameras": [0, 1, 2]}})
+            with S.transaction() as st:
+                st["running"] = {"id": "q0003", "purpose": "qualify", "phase": "benching", "attempt_id": "fa-1",
+                                 "members": [], "touched": []}
+            tree = FakeTree(full)
+            tree.dirty.add("vendor/lineage")
+            dev, tools = FakeDev(), FakeTools()
+            ctx = mk_ctx(tree=tree, dev=dev, tools=tools)
+            with mock.patch.object(C.Locks, "__enter__", lambda self: self), \
+                    mock.patch.object(C.Locks, "__exit__", lambda self, *a: None):
+                with self.assertRaises(S.Refused) as cm:
+                    qualify.qualify_cmd(ctx, False, [])
+            self.assertIn("vendor/lineage is dirty", str(cm.exception))
+            self.assertEqual((tools.calls, dev.cmds), ([], []))           # no flash --rollback, no phone read
+            self.assertEqual(S.read()["running"]["id"], "q0003")
