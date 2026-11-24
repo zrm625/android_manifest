@@ -44,8 +44,11 @@ done
 device_lock
 # Every adb call has a deadline (Sol M9): a hung adb never holds the device
 # and build locks. The runner's holder also bounds the whole run.
+# --foreground keeps timeout and adb in this script's process group (Sol
+# SB2): without it timeout makes a group of its own, which a signal to this
+# group (the holder's deadline, Ctrl-C) would miss.
 ADB_CALL_TIMEOUT=${ADB_CALL_TIMEOUT:-120}
-a() { timeout -k 10 "$ADB_CALL_TIMEOUT" adb -s "$SERIAL" "$@"; }
+a() { timeout --foreground -k 10 "$ADB_CALL_TIMEOUT" adb -s "$SERIAL" "$@"; }
 # Read the whole output before filtering: closing a dumpsys pipe early sends
 # SIGPIPE to the service being dumped.
 sh_() { a shell "$@" 2>/dev/null | tr -d '\r'; }
