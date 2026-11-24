@@ -1504,7 +1504,12 @@ an entry. It runs R8.3 phases 1-9 and 11 and passes only if every tool exits
 0, `phone-qa` exits 0 with `eligible: true`, `halted` null and a bound result,
 the rollback exits 0, the end-of-tick setup and its readback pass, TC passes
 after restore, and the state file ends with no `running` or `lease` and
-nothing derived pending (R13.2). A failure says which criterion failed.
+nothing derived pending (R13.2). A failure says which criterion failed
+and exits 1 (`"qualified": false`); a HALT anywhere in it (the rollback,
+the setup) is committed and exits 3, never reported as a failed criterion
+(Gemini GM2-1). Like the tick (R8.2 step 2), `stage` and `qualify`
+re-exec once after fast-forwarding `.repo/manifests`, so they never run
+or certify old code (Gemini GM2-2).
 - **The first qualification** uses `--change gnss-standalone --change
   perch-launcher`: the known-good base is the baseline, which has no Perch, so
   zero members cannot pass `phone-qa`.

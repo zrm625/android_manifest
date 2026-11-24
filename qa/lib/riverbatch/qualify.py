@@ -18,7 +18,7 @@ from riverqa import stage as rstage
 from riverqa.core import now_iso, read_json, write_json
 
 from . import abtest, compose, kb, merge, outcomes as O, paths, phases, recover, state as S, version
-from .ctx import (Abort, Blocked, Ctx, Halt, Locks, Pause, commit_phase, image_id, image_tag, remote_git)
+from .ctx import (Abort, Blocked, Ctx, Locks, Pause, ReExec, commit_phase, image_id, image_tag, remote_git)
 from .state import Refused
 
 MANIFEST = compose.MANIFEST
@@ -75,7 +75,10 @@ def pin_image(ctx: Ctx) -> str:
 def local_base(ctx: Ctx, check_xml: bool, kg: dict | None) -> dict[str, str]:
     """R8.2 steps 2 and 3 for stage and qualify: forks on a clean
     river-22.2 equal to zrm625 (fast-forward if behind), the manifest at
-    origin/river-22.2; then TC."""
+    origin/river-22.2; then TC. A fast-forwarded manifest checkout is new
+    runner code: re-exec once, as the tick does (Gemini GM2-2), so qualify
+    never certifies code it is not running."""
+    import os
     forks = compose.forks()
     base = {}
     for p in sorted(forks) + [MANIFEST]:
@@ -90,7 +93,11 @@ def local_base(ctx: Ctx, check_xml: bool, kg: dict | None) -> dict[str, str]:
             rc, _ = ctx.git.try_(p, "merge-base", "--is-ancestor", h, want)
             if rc != 0:
                 raise Refused(f"{p} is ahead of or diverged from {r}/river-22.2")
+            if p == MANIFEST and os.environ.get("RIVER_BATCH_REEXEC") == "1":
+                raise Refused(".repo/manifests still behind origin/river-22.2 after a re-exec")
             ctx.git.out(p, "merge", "-q", "--ff-only", f"{r}/river-22.2")
+            if p == MANIFEST:
+                raise ReExec("manifest fast-forwarded: re-exec")
         base[p] = want
     if check_xml:
         if compose.manifest_xml(base[MANIFEST], ctx.git) != phases.baseline_xml(ctx, kg):
@@ -306,14 +313,16 @@ def run_part2(ctx: Ctx, base: dict, kg: dict, pin: str, changes: list[str]) -> d
         st2["running"]["outcome"] = outcome
         st2["running"]["phase"] = "decided"
         qa = dict(st2["running"].get("qa") or {})  # before abort clears running (Gemini minor)
+    # Gemini GM2-1: a HALT from the rollback or the setup is never a failed
+    # qualification; it propagates, is committed and exits 3.
     try:
         recover.abort(ctx)                           # phase 11: rollback; nothing applied to entries
-    except (Pause, Halt) as e:
+    except Pause as e:
         failed.append(f"rollback/restore: {e.message}")
         return {"passed": False, "failed": failed, "id": qid}
     try:
         recover.setup_known_good(ctx)
-    except (Pause, Halt, Blocked) as e:
+    except (Pause, Blocked) as e:
         failed.append(f"setup on known-good: {e.message}")
     r = ctx.tc_check(dict(base))
     if not r.ok:

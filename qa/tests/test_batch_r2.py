@@ -270,3 +270,114 @@ class OneReplyPerProvider(unittest.TestCase):
                 rnd["replies"][p]["sha256"] = rnd["replies"]["opus"]["sha256"]
         why = self.enqueue_with(same_text)
         self.assertIn("identical", why)
+
+
+# --- Gemini GM2-1, GM2-2: qualify ------------------------------------------------------------------
+
+class QualifyExits(unittest.TestCase):
+    FULL = None
+
+    def run_cli(self, h, abort=None, outcome=None, argv=("qualify", "--run-only")):
+        """`batch qualify --run-only` through cli.main with part 2's phases
+        faked; ``abort`` replaces recover.abort."""
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from batchfakes import mk_ctx, write_json
+        from riverbatch import cli, kb, merge, phases, qualify, recover
+        from riverbatch import ctx as C
+        from riverbatch import outcomes as O
+        from riverbatch import state as S
+        full = {p: "b" * 40 for p in merge.slugs()}
+        write_json(h / "slot-state.json", {"known_good_slot": "a", "known_good": {"batch": "kg"}, "pair": None})
+        write_json(h / "qa/known-good.json", {"latest": {"batch": "kg", "cameras": [0, 1, 2]}})
+        write_json(h / "runner/abtest.json", {"passed": True, "runner_build": "rb", "image_id": "img"})
+
+        def compose_run(ctx, bid, purpose, members, base, kg, pin, verified):
+            run = {"id": bid, "purpose": purpose, "touched": [], "base": dict(base), "members": [],
+                   "composed": {p: {"sha": v} for p, v in base.items() if p != ".repo/manifests"},
+                   "versions": {"image_id": pin}, "phase": "claimed", "outcome": None, "attempt_id": None}
+            with S.transaction() as st:
+                st["running"] = run
+            return run
+
+        def real_abort(ctx):
+            with S.transaction() as st:
+                st["running"] = None
+        names = ["build", "stage_run", "restore_or_void", "flash", "bench", "setup_candidate"]
+        ps = [mock.patch.object(phases, n) for n in names] + [
+            mock.patch.object(phases, "test", return_value=outcome or {"class": O.PASS}),
+            mock.patch.object(phases, "base_verified", return_value=(True, [])),
+            mock.patch.object(qualify, "compose_run", compose_run), mock.patch.object(qualify, "commit_phase"),
+            mock.patch.object(qualify, "local_base", return_value=full),
+            mock.patch.object(qualify, "pin_image", return_value="img"),
+            mock.patch.object(qualify.version, "runner_build", return_value="rb"),
+            mock.patch.object(qualify.version, "runner_tools", return_value="rt"),
+            mock.patch.object(qualify.version, "harness", return_value="h"),
+            mock.patch.object(recover, "entry_point"), mock.patch.object(recover, "abort", abort or real_abort),
+            mock.patch.object(recover, "setup_known_good"),
+            mock.patch.object(recover, "setup_owed", return_value=(False, kb.Check(kb.OK))),
+            mock.patch.object(qualify.kb, "check", return_value=kb.Check(kb.OK)),
+            mock.patch.object(qualify, "owed_notes", return_value=[]),
+            mock.patch.object(C.Locks, "__enter__", lambda self: self),
+            mock.patch.object(C.Locks, "__exit__", lambda self, *a: None)]
+        for x in ps:
+            x.start()
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                code = cli.main(list(argv), mk_ctx())
+        finally:
+            mock.patch.stopall()
+        return code, json.loads(out.getvalue().strip().splitlines()[-1])
+
+    def test_a_halt_in_the_rollback_exits_3_and_is_committed(self):
+        from riverbatch import ctx as C
+        from riverbatch import state as S
+
+        def abort(ctx):
+            raise C.Halt("flash --rollback halted in q0001")
+        with bench_home() as h:
+            code, line = self.run_cli(h, abort=abort)
+            self.assertEqual(code, 3, line)
+            self.assertIn("rollback halted", S.read()["halt"]["reason"])
+            self.assertNotIn("qualified", line)
+
+    def test_not_qualified_exits_1(self):
+        from riverbatch import outcomes as O
+        with bench_home() as h:
+            code, line = self.run_cli(h, outcome={"class": O.FAIL, "checks": ["boot"]})
+            self.assertEqual((code, line.get("qualified")), (1, False), line)
+        with bench_home() as h:
+            code, line = self.run_cli(h)
+            self.assertEqual((code, line.get("qualified")), (0, True), line)
+
+    def test_qualify_reexecs_after_fast_forwarding_the_manifest(self):
+        """Gemini GM2-2: local_base fast-forwards .repo/manifests, then
+        re-execs (once) instead of certifying the old code's run."""
+        from batchfakes import FakeTree, mk_ctx
+        from riverbatch import ctx as C
+        from riverbatch import merge, qualify, tc
+        full = {p: "b" * 40 for p in merge.slugs()}
+        tree = FakeTree(full)
+        tree.branches[tc.MANIFEST]["origin/river-22.2"] = "c" * 40
+        merged = []
+        orig = tree.out
+
+        def out(path, *args, env=None):
+            if args[:3] == ("merge-base", "--is-ancestor", "b" * 40):
+                return ""
+            if args[:3] == ("merge", "-q", "--ff-only"):
+                merged.append(path)
+                tree.branches[path][tree.head[path]] = "c" * 40
+                return ""
+            return orig(path, *args, env=env)
+        tree.out = out
+        ctx = mk_ctx(tree=tree)
+        with mock.patch.object(qualify, "remote_git"), mock.patch.dict(os.environ, {"RIVER_BATCH_REEXEC": ""}):
+            with self.assertRaises(C.ReExec):
+                qualify.local_base(ctx, check_xml=False, kg=None)
+        self.assertEqual(merged, [tc.MANIFEST])
+        tree.branches[tc.MANIFEST]["default"] = "b" * 40
+        with mock.patch.object(qualify, "remote_git"), mock.patch.dict(os.environ, {"RIVER_BATCH_REEXEC": "1"}):
+            with self.assertRaises(qualify.Refused):
+                qualify.local_base(ctx, check_xml=False, kg=None)

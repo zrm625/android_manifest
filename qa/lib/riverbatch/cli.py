@@ -1,7 +1,7 @@
 """`scripts/batch`: the batch runner's command line (R2.3, R3.1).
 
 Exit codes: 0 done, idle, paused, blocked, not qualified or waiting on Zak;
-1 a runner error or a refused command; 3 HALT, now or still; 75 resumable
+1 a runner error, a refused command or a failed `batch qualify`; 3 HALT, now or still; 75 resumable
 (a lock or the build container is busy, a child of an earlier run is alive,
 or GitHub or the network gave no answer). The last stdout line is a JSON
 summary.
@@ -146,6 +146,8 @@ def _run(a, ctx: C.Ctx) -> int:
             from . import qualify
             summary.update(qualify.qualify_cmd(ctx, a.run_only, a.change))
             report.flush(ctx)
+            if summary.get("qualified") is not True:
+                code = C.EXIT_ERROR                   # Gemini GM2-1: not qualified is a failed command
         elif a.cmd == "migrate":
             summary.update(commands.migrate(ctx, a.record))
         elif a.cmd == "report":
