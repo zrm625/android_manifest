@@ -228,8 +228,12 @@ def reconcile_one(ctx: Ctx, run: dict, path: str, repo: str, number: int) -> tup
     ctx.sleep(30)
     o2 = _with_commit(ctx, repo, observe(ctx, repo, number), base)
     if o1 != o2:
-        if classify(o2, base, t, tt) == LANDED:
-            return LANDED, o2                   # a lag that cleared: landed on this read (Opus minor)
+        # A lag that cleared is landed on this read (Opus minor), but only if
+        # the second read confirms the first one's landed tip and PR (Sol
+        # SM2); any other disagreement stays unknown.
+        same = all(o1[k] == o2[k] for k in ("tip", "parents", "tree", "head", "base_ref", "cross"))
+        if c1 == "lag" and same and classify(o2, base, t, tt) == LANDED:
+            return LANDED, o2
         return UNKNOWN, o2
     if c1 == "lag":
         return UNKNOWN, o1

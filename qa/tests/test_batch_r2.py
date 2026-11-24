@@ -702,3 +702,58 @@ class SettleHolds(unittest.TestCase):
             from test_batch_settle import PartialSettle
             with self.assertRaises(C.Pause):
                 PartialSettle().cleanup(gh)
+
+
+# --- Sol SM2: lag never masks a wrong tag; a second read must confirm the first ---------------------
+
+class LagConfirmation(unittest.TestCase):
+    def test_lag_with_a_wrong_tag_present_halts(self):
+        """flash --promote: r1 lags (OPEN at its landed merge) and already has
+        known-good tag at another commit: not a lag (75), a HALT."""
+        from test_runner_harness import PromoteTyped, promote_with
+        from test_promote import setup
+        from riverqa import flashing
+        with bench_home() as h:
+            setup(h)
+            w = PromoteTyped().lag(tagged=(False, False, False))
+            w.repos["zrm625/r1"]["tags"]["kg-1"] = "e" * 40
+            w.commits[("zrm625/r1", "e" * 40)] = {"tree": "f" * 40, "parents": ["7" * 40]}
+            rc, err, _ = promote_with(w)
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+            self.assertEqual(flashing.load_state()["pair"]["batch"], "b1")
+
+    def test_lag_with_the_right_tag_or_none_is_still_75(self):
+        from test_runner_harness import PromoteTyped, promote_with
+        from test_promote import setup
+        for tagged in ((False, False, False), (True, True, True)):
+            with bench_home() as h:
+                setup(h)
+                rc, err, _ = promote_with(PromoteTyped().lag(tagged=tagged))
+                self.assertEqual(rc, 75, (tagged, err))
+
+    def test_second_read_at_another_landed_tip_is_unknown(self):
+        from batchfakes import mk_ctx
+        from riverbatch import merge
+        from test_batch_merge import BASE, M, P, R, TESTED, TREE, gh_with, run_dict
+        M2 = "8" * 40
+
+        def land_elsewhere(gh):
+            gh.commits[(R, M2)] = {"parents": [BASE, TESTED], "tree": TREE}
+            gh.prs[(R, 7)].update(state="MERGED", mergeCommit={"oid": M2})
+            gh.tips[(R, "refs/heads/river-22.2")] = M2
+        ctx = mk_ctx(gh=gh_with("OPEN", M))
+        ctx.sleep = lambda s: land_elsewhere(ctx.gh)
+        self.assertEqual(merge.reconcile_one(ctx, run_dict(), P, R, 7)[0], merge.UNKNOWN)
+
+    def test_landed_after_an_other_read_is_unknown(self):
+        """The first read fits neither pending nor the lag (a MERGED PR with
+        no merge commit yet); a landed second read does not confirm it."""
+        from batchfakes import mk_ctx
+        from riverbatch import merge
+        from test_batch_merge import M, P, R, gh_with, run_dict
+
+        def land(gh):
+            gh.prs[(R, 7)].update(state="MERGED", mergeCommit={"oid": M})
+        ctx = mk_ctx(gh=gh_with("MERGED", M, merge_commit=None))
+        ctx.sleep = lambda s: land(ctx.gh)
+        self.assertEqual(merge.reconcile_one(ctx, run_dict(), P, R, 7)[0], merge.UNKNOWN)
