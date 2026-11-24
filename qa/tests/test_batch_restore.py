@@ -86,5 +86,43 @@ class AbortRestores(unittest.TestCase):
             self.assertIsNone(st["pause"])
 
 
+class StageRunOwnership(unittest.TestCase):
+    """Sol I6: a stage run interrupted after phone-qa stage wrote batch.json
+    and before its finish transaction. Zak flashed that calibration by hand:
+    its pair carries the stage run's ID, but a stage run never flashes, so the
+    pair is foreign. Recovery restores the tree and never rolls it back."""
+
+    def test_hand_flashed_pair_of_an_interrupted_stage_run_is_foreign(self):
+        from batchfakes import FakeTools
+        with bench_home() as h:
+            write_json(h / "slot-state.json", {"known_good_slot": "a", "known_good": {"batch": "kg"},
+                                               "pair": {"batch": "cal-3", "kind": "calibration", "target": "b",
+                                                        "attempts": ["fa-zak"]}})
+            write_json(h / "qa/known-good.json", {"latest": {"batch": "kg"}})
+            write_json(h / "batches/cal-3/batch.json", {"batch": "cal-3", "kind": "calibration"})
+            tree = tree_on_batch("cal-3")
+            with S.transaction() as st:
+                st["lease"] = lease("cal-3")
+                st["running"] = {"id": "cal-3", "purpose": "calibration", "phase": "staging", "members": [],
+                                 "touched": sorted(LEASED), "base": dict(BASE), "outcome": None,
+                                 "attempt_id": None}
+            tools = FakeTools()
+            with self.assertRaises(C.Blocked) as cm:
+                recover.entry_point(mk_ctx(tree=tree, tools=tools), setup=False)
+            self.assertIn("phone in use by cal-3 (calibration)", cm.exception.message)
+            self.assertEqual(tools.calls, [])                               # never rolled back
+            st = S.read()
+            self.assertIsNone(st["running"])
+            self.assertIsNone(st["lease"])
+            self.assertEqual(tree.head["vendor/lineage"], "river-22.2")
+
+    def test_owns_pair(self):
+        run = {"id": "b0003", "purpose": "batch", "attempt_id": "fa-2"}
+        self.assertTrue(recover.owns_pair(run, {"batch": "b0003", "attempts": ["fa-1", "fa-2"]}))
+        self.assertFalse(recover.owns_pair(run, {"batch": "b0003", "attempts": ["fa-9"]}))
+        self.assertTrue(recover.owns_pair(dict(run, attempt_id=None), {"batch": "b0003", "attempts": []}))
+        self.assertFalse(recover.owns_pair(dict(run, purpose="baseline"), {"batch": "b0003", "attempts": ["fa-2"]}))
+
+
 if __name__ == "__main__":
     unittest.main()

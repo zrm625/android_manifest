@@ -108,10 +108,17 @@ def status_problems(top: Path, path: str, allow: list[str], nested: set[str]) ->
         full = f"{path}/{name}".rstrip("/")
         if full in nested or any(n.startswith(full + "/") for n in nested):
             continue          # a nested project, or a directory holding one
-        hit = next((a for a in allow if (name.startswith(a) if a.endswith("/") else name == a)), None)
+        # Gemini GM7: the allowlist covers untracked (??) and ignored (!!)
+        # entries only; a tracked file changed under an allowlisted prefix
+        # is a disturbed tree. An allowlisted __pycache__/ is checked file by
+        # file however git reports it (with or without a .gitignore).
+        code = line[:2]
+        hit = None
+        if code in ("??", "!!"):
+            hit = next((a for a in allow if (name.startswith(a) if a.endswith("/") else name == a)), None)
         if hit is None:
-            bad.append(f"{path}: {line[:2].strip() or '??'} {name}")
-        elif hit.endswith("__pycache__/") and line.startswith("!!"):
+            bad.append(f"{path}: {code.strip() or '??'} {name}")
+        elif hit.endswith("__pycache__/"):
             bad.extend(_pycache_ok(top, path, hit))
     return bad
 
@@ -138,7 +145,14 @@ def lfs_problems(top: Path, path: str) -> list[str]:
     r = _git(top, path, "lfs", "ls-files")
     if r.returncode != 0:
         return [f"{path}: git lfs ls-files failed: {r.stderr.strip()[-200:]}"]
-    return [f"{path}: LFS pointer {ln.split(' - ', 1)[1]}" for ln in r.stdout.splitlines() if " - " in ln]
+    # `git lfs ls-files`: "<oid> <*|-> <path>"; "-" is a pointer, never
+    # pulled (Gemini minor: match the token, not " - " in a file name).
+    out = []
+    for ln in r.stdout.splitlines():
+        parts = ln.split(None, 2)
+        if len(parts) == 3 and parts[1] == "-":
+            out.append(f"{path}: LFS pointer {parts[2]}")
+    return out
 
 
 def head_problem(top: Path, path: str, want: str) -> list[str]:

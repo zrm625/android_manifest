@@ -14,7 +14,7 @@ def claim(members=("a",), purpose="batch"):
     with S.transaction() as st:
         st["entries"] = [{"name": m, "position": i + 1, "status": "in-batch", "batch": "b0001", "rev": 2,
                           "prs": [{"key": f"zrm625/x#{i}", "path": "p", "head": "1" * 40}], "flags": {},
-                          "identity": f"zrm625/x#{i}", "kind": "change", "decisions": []}
+                          "identity": f"zrm625/x#{i}", "kind": "change", "decisions": [], "record_sha256": "r" * 64}
                          for i, m in enumerate(members)]
         st["running"] = {"id": "b0001", "purpose": purpose, "phase": "claimed", "members": [{"name": m}
                                                                                             for m in members],
@@ -62,6 +62,8 @@ class Flow(unittest.TestCase):
             self.assertIsNone(st["running"])
             self.assertEqual(st["entries"][0]["status"], "failed")
             self.assertEqual(S.failures(st, "a")[0]["checks"], ["apps.camera"])
+            ev = S.failures(st, "a")[0]                                   # Sol minor: record and stable ref
+            self.assertEqual((ev["record_sha256"], ev["ref"]), ("r" * 64, "zrm625/x#0#0"))
             self.assertEqual(st["last_fail"]["batch"], "b0001")
             self.assertIn("b0001", st["reports_pending"])
 
@@ -317,7 +319,7 @@ class Crash(unittest.TestCase):
             claim(["a"])
             with S.transaction() as st:
                 st["running"]["phase"] = "testing"
-            write_json(h / "slot-state.json", {"pair": {"batch": "b0001"}})
+            write_json(h / "slot-state.json", {"pair": {"batch": "b0001", "kind": "batch", "attempts": ["fa-1"]}})
             tools = FakeTools()
             recover.recover_running(mk_ctx(tools=tools))
             st = S.read()
@@ -327,7 +329,7 @@ class Crash(unittest.TestCase):
     def test_failed_rollback_retries_and_second_pauses(self):
         with bench_home() as h:
             claim(["a"])
-            write_json(h / "slot-state.json", {"pair": {"batch": "b0001"}})
+            write_json(h / "slot-state.json", {"pair": {"batch": "b0001", "kind": "batch", "attempts": ["fa-1"]}})
             tools = FakeTools({"flash": [(1, ""), (1, "")]})
             with self.assertRaises(C.Retry):
                 recover.recover_running(mk_ctx(tools=tools))
@@ -339,7 +341,7 @@ class Crash(unittest.TestCase):
         with bench_home() as h:
             claim(["a"])
             write_json(h / "batches/b0001/batch.json", {"merge_started": {"at": "t", "expected_prs": {}}})
-            write_json(h / "slot-state.json", {"pair": {"batch": "b0001"}})
+            write_json(h / "slot-state.json", {"pair": {"batch": "b0001", "kind": "batch", "attempts": ["fa-1"]}})
             tools = FakeTools()
             self.assertEqual(recover.recover_running(mk_ctx(tools=tools), local_only=True), "waits")
             self.assertEqual(tools.calls, [])

@@ -60,6 +60,8 @@ def abtest_file() -> Path:
 
 
 def batch_dir(bid: str) -> Path:
+    if not bid or bid in (".", "..") or "/" in bid or "\0" in bid:
+        raise ValueError(f"bad batch ID {bid!r}")
     return core.BENCH_HOME / "batches" / bid
 
 

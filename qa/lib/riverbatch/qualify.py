@@ -146,7 +146,7 @@ def compose_run(ctx: Ctx, bid: str, purpose: str, members: list[dict], base: dic
 def stage_cmd(ctx: Ctx, kind: str, bid: str, changes: list[str]) -> dict:
     if kind not in ("calibration", "baseline"):
         raise Refused("--kind is calibration or baseline")
-    if not re.match(r"^[A-Za-z0-9._-]{1,80}$", bid or ""):
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$", bid or ""):          # never '.', '..' or a dotfile
         raise Refused(f"bad batch ID {bid!r}")
     if RUNNER_ID_RE.match(bid):
         raise Refused(f"{bid} is a runner ID (bNNNN, qNNNN); pick another")
@@ -230,14 +230,22 @@ def qualify_cmd(ctx: Ctx, run_only: bool, changes: list[str]) -> dict:
     refusals(ctx, "qualify")
     with Locks(ctx):
         refusals(ctx, "qualify")
-        recover.entry_point(ctx, setup=True)          # the full entry point: phone recovery allowed
-        if S.read().get("running"):
-            raise Refused("an interrupted run could not be finished")
+        st = S.read()
+        if st.get("running"):                         # an interrupted qualify run: R11.2 step 2
+            recover.abort(ctx)
+        elif st.get("lease"):
+            ok, found = phases.restore(ctx)
+            if not ok:
+                raise Refused("tree-disturbed: " + "; ".join(found[:4]))
         kg = ctx.known_good()
         if not kg:
             raise Refused("no known-good.json")
-        pin = pin_image(ctx)
+        # I20 (Sol): the tree is checked before any phone recovery or setup.
         base = local_base(ctx, check_xml=True, kg=kg)
+        recover.entry_point(ctx, setup=True)          # the full entry point: phone recovery allowed
+        if S.read().get("running"):
+            raise Refused("an interrupted run could not be finished")
+        pin = pin_image(ctx)
         ok, why = phases.base_verified(ctx, base, kg)
         if not ok:
             raise Refused("qualification needs a verified base: " + "; ".join(why[:3]))

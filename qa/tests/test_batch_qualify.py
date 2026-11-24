@@ -74,7 +74,8 @@ class Refusals(unittest.TestCase):
 
     def test_stage_id_rules(self):
         with bench_home():
-            for bad, why in (("b0007", "runner ID"), ("q0001", "runner ID")):
+            for bad, why in (("b0007", "runner ID"), ("q0001", "runner ID"), ("..", "bad batch ID"),
+                             (".", "bad batch ID"), (".hidden", "bad batch ID")):
                 with self.assertRaises(S.Refused) as cm:
                     qualify.stage_cmd(mk_ctx(), "calibration", bad, [])
                 self.assertIn(why, str(cm.exception))
@@ -82,6 +83,41 @@ class Refusals(unittest.TestCase):
                 qualify.stage_cmd(mk_ctx(), "baseline", "base-3", ["perch"])
             with self.assertRaises(S.Refused):
                 qualify.stage_cmd(mk_ctx(), "experiment", "x-1", [])
+
+
+class TreeBeforePhone(unittest.TestCase):
+    """Sol I20: both public commands, under an existing pause, refuse a
+    disturbed tree before any phone recovery, setup or tool."""
+
+    def ctx(self, h):
+        from batchfakes import FakeDev, FakeTools, FakeTree, mk_ctx as mk
+        tree = FakeTree(FULL)
+        tree.dirty.add("vendor/lineage")
+        self.dev, self.tools = FakeDev(), FakeTools()
+        return mk(tree=tree, dev=self.dev, tools=self.tools)
+
+    def locks(self):
+        return mock.patch.object(C.Locks, "__enter__", lambda self: self), \
+            mock.patch.object(C.Locks, "__exit__", lambda self, *a: None)
+
+    def test_qualify_and_stage_refuse_a_dirty_tree_before_the_phone(self):
+        for cmd in ("qualify", "stage"):
+            with bench_home() as h:
+                kg_files(h)
+                write_json(h / "batches/kg/batch.json", {"batch": "kg", "dates": {"vendor": "100"}})
+                with S.transaction() as st:
+                    S.set_pause(st, "two voids in a row")
+                ctx = self.ctx(h)
+                l1, l2 = self.locks()
+                with l1, l2, mock.patch.object(phases, "baseline_xml", return_value={}), \
+                        mock.patch.object(qualify.compose, "manifest_xml", return_value={}):
+                    with self.assertRaises(S.Refused) as cm:
+                        if cmd == "qualify":
+                            qualify.qualify_cmd(ctx, False, [])
+                        else:
+                            qualify.stage_cmd(ctx, "calibration", "cal-9", [])
+                self.assertIn("vendor/lineage is not on a clean river-22.2", str(cm.exception), cmd)
+                self.assertEqual((self.dev.cmds, self.tools.calls), ([], []), cmd)
 
 
 class StageFinish(unittest.TestCase):

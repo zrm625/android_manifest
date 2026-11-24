@@ -79,9 +79,9 @@ def abort(ctx: Ctx, extra_pause: str | None = None) -> None:
             check = "flash.boot" if run["phase"] == "flashing" else "bench.boot"
             commit_outcome(ctx, {"class": O.FAIL, "checks": [check], "rescued": True,
                                  "evidence": {"step": run["phase"], "attempt_id": att, "why": why}})
-    # b. rollback if the pair is this batch's
+    # b. rollback if the pair is this run's own reservation (I6)
     pair = (ctx.slot_state() or {}).get("pair")
-    if pair and pair.get("batch") == bid:
+    if owns_pair(run, pair):
         commit_phase("rolling-back")
         r = ctx.tool("flash", ["--rollback"], bid, "rollback")
         if r.rc == 3:
@@ -226,11 +226,24 @@ def known_good_agreement(ctx: Ctx) -> str | None:
     return None
 
 
+def owns_pair(run: dict | None, pair: dict | None) -> bool:
+    """Is ``pair`` the one this run's own flash reserved (Sol I6)? Only
+    batch, experiment and qualify runs flash; a stage run never does, so a
+    pair with a stage run's ID was flashed by hand and is foreign. Once the
+    run adopted an attempt, the pair's last attempt must be it."""
+    if not run or not pair or pair.get("batch") != run.get("id"):
+        return False
+    if run.get("purpose") not in ("batch", "experiment", "qualify"):
+        return False
+    att = run.get("attempt_id")
+    return att is None or (pair.get("attempts") or [None])[-1] == att
+
+
 def foreign_pair(ctx: Ctx) -> tuple[str, str] | None:
     """(kind, message) of a pair that is not running's, or None."""
     pair = (ctx.slot_state() or {}).get("pair")
     run = S.read().get("running")
-    if not pair or (run and pair.get("batch") == run["id"]):
+    if not pair or owns_pair(run, pair):
         return None
     if pair.get("kind") == "batch":
         return "pause", f"slot pair of {pair['batch']} is not the runner's"
@@ -441,7 +454,9 @@ def protected_batches(ctx: Ctx) -> set[str]:
         if e["status"] == "failed":
             hist = S.failures(st, e["name"], e.get("identity"))
             if hist:
-                out.add(hist[-1].get("batch"))
+                # The latest evidence by time, across every identity the
+                # change had (Sol I17): failures() concatenates them by key.
+                out.add(max(hist, key=lambda ev: str(ev.get("at") or "")).get("batch"))
     out.discard(None)
     return out
 

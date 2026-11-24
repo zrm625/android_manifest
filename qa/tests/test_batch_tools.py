@@ -142,6 +142,40 @@ class TreeCheck(unittest.TestCase):
             (d / "__pycache__/evil.cpython-313.pyc").write_bytes(b"x")
             self.assertTrue(any("evil" in b for b in tc.check(exp, top).blocking))
 
+    def test_allowlist_covers_untracked_and_ignored_only(self):
+        """Gemini GM7: a tracked file changed under an allowlisted prefix
+        blocks; an allowlisted __pycache__/ is checked file by file even when
+        git reports it untracked (no .gitignore)."""
+        with tempfile.TemporaryDirectory() as t:
+            top, exp = self.tree(t)
+            m = top / ".repo/manifests"
+            (m / "qa/.ruff_cache").mkdir(parents=True)
+            (m / "qa/.ruff_cache/tracked").write_text("a")
+            (m / "qa/tests").mkdir(parents=True)
+            (m / "qa/tests/t.py").write_text("")
+            git(m, "add", "-f", "qa/.ruff_cache/tracked", "qa/tests/t.py")
+            git(m, "commit", "-qm", "t")
+            exp[".repo/manifests"] = subprocess.run(["git", "-C", str(m), "rev-parse", "HEAD"], capture_output=True,
+                                                    text=True).stdout.strip()
+            self.assertTrue(tc.check(exp, top).ok, tc.check(exp, top).blocking)
+            (m / "qa/.ruff_cache/tracked").write_text("b")
+            self.assertTrue(any("qa/.ruff_cache/tracked" in b for b in tc.check(exp, top).blocking))
+            (m / "qa/.ruff_cache/tracked").write_text("a")
+            (m / "qa/tests/__pycache__").mkdir()
+            (m / "qa/tests/__pycache__/t.cpython-313.pyc").write_bytes(b"x")
+            self.assertTrue(tc.check(exp, top).ok, tc.check(exp, top).blocking)       # untracked, no .gitignore
+            (m / "qa/tests/__pycache__/payload.sh").write_text("x")
+            self.assertTrue(any("payload.sh" in b for b in tc.check(exp, top).blocking))
+
+    def test_lfs_pointer_is_the_dash_token(self):
+        out = ("0123456789 * prebuilt/x86/a - b.apk\n"          # pulled, though its name has " - "
+               "abcdef0123 - prebuilt/x86/webview.apk\n")      # a pointer
+        with tempfile.TemporaryDirectory() as t:
+            (Path(t) / "p").mkdir()
+            (Path(t) / "p/.gitattributes").write_text("*.apk filter=lfs diff=lfs merge=lfs -text\n")
+            with mock.patch.object(tc, "_git", return_value=subprocess.CompletedProcess([], 0, out, "")):
+                self.assertEqual(tc.lfs_problems(Path(t), "p"), ["p: LFS pointer prebuilt/x86/webview.apk"])
+
 
 class Tooling(unittest.TestCase):
     """H4: change merge --record checks, before any merge."""
@@ -179,6 +213,18 @@ class Tooling(unittest.TestCase):
             return ""
         with mock.patch.object(tooling, "git", fake_git):
             return tooling.check("runner-fix", rf, gh)
+
+    def test_fetches_before_it_reads(self):
+        """Gemini minor (H4, I21): origin/river-22.2 and refs/pull/<n>/head
+        are fetched before the reviewed head and the diff are read."""
+        calls = []
+
+        def fake_git(*args, manifest=None):
+            calls.append(args[0])
+            return {"rev-parse": self.HEAD + "\n", "merge-base": "1" * 40 + "\n"}.get(args[0], "")
+        with tempfile.TemporaryDirectory() as t, mock.patch.object(tooling, "git", fake_git):
+            tooling.check("runner-fix", self.record(Path(t)), self.gh())
+        self.assertEqual(calls[:4], ["fetch", "rev-parse", "merge-base", "diff"])
 
     def test_tooling_only_passes(self):
         with tempfile.TemporaryDirectory() as t:
@@ -221,6 +267,22 @@ class Tooling(unittest.TestCase):
         self.assertIn("--push is gone", mu)
         self.assertIn("upstream never merges into $FORK_BRANCH directly", mu)
         self.assertIn("acquire_build_lock\nrefuse_while_batch", (paths.SCRIPTS / "setup-forks").read_text())
+
+    def test_change_merge_record_needs_a_file(self):
+        """Gemini minor: `change merge NAME --record` with no FILE says so
+        (it ran into an unbound $2 before). Runs scripts/change from a
+        scratch tree with a scratch $BENCH_HOME."""
+        import shutil
+        with tempfile.TemporaryDirectory() as t:
+            m = Path(t) / ".repo/manifests"
+            shutil.copytree(paths.SCRIPTS, m / "scripts", symlinks=True)
+            shutil.copytree(paths.SCRIPTS.parent / "qa/lib", m / "qa/lib",
+                            ignore=shutil.ignore_patterns("__pycache__"))
+            r = subprocess.run(["bash", str(m / "scripts/change"), "merge", "x", "--record"], capture_output=True,
+                               text=True, timeout=60, env=dict(os.environ, BENCH_HOME=str(Path(t) / "home")))
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("--record needs a FILE", r.stderr + r.stdout)
+            self.assertNotIn("unbound variable", r.stderr)
 
 
 if __name__ == "__main__":

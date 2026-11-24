@@ -386,6 +386,26 @@ class Retention(unittest.TestCase):
             self.assertEqual(removed, [str(h / "batches/b0001/images")])
             self.assertTrue((h / "batches/kg-1/images").exists())
 
+    def test_i17_latest_failure_by_time_across_identities(self):
+        """Sol I17: a change that failed under two identities keeps its
+        newest evidence by time, not the last one of the concatenation."""
+        with bench_home() as h:
+            kg_files(h)
+            with S.transaction() as st:
+                st["aliases"] = {"zrm625/a#1": "x", "zrm625/b#2": "x"}
+                st["failure_history"] = {
+                    "zrm625/a#1": [{"batch": "b0005", "at": "2026-11-20T10:00:00+00:00"}],     # newest
+                    "zrm625/b#2": [{"batch": "b0002", "at": "2026-11-10T10:00:00+00:00"}]}
+                st["entries"] = [{"name": "x", "status": "failed", "identity": "zrm625/b#2", "position": 1}]
+            for b in ("b0002", "b0005"):
+                d = h / f"batches/{b}/images"
+                d.mkdir(parents=True)
+                old = time.time() - 8 * 86400
+                os.utime(d, (old, old))
+            removed = recover.retention(mk_ctx())
+            self.assertEqual(removed, [str(h / "batches/b0002/images")])
+            self.assertTrue((h / "batches/b0005/images").exists())
+
     def test_i17_retention_runs_before_the_free_space_check(self):
         order = []
         import tempfile

@@ -81,10 +81,11 @@ def open_prs(ctx: Ctx, run: dict) -> dict[str, int]:
     sl = slugs()
     names = ", ".join(m["name"] for m in run["members"])
     prs = {}
+    body = pr_body(run, S.read()["entries"], ctx.batch_json(bid) or {})
     for p in run["touched"]:
         found = ctx.gh.pr_list(sl[p], f"batch/{bid}", "all")
         if not found:
-            ctx.gh.create_pr(sl[p], f"batch/{bid}", f"batch {bid}: {names}", pr_body(run))
+            ctx.gh.create_pr(sl[p], f"batch/{bid}", f"batch {bid}: {names}", body)
             found = ctx.gh.pr_list(sl[p], f"batch/{bid}", "all")
             if not found:
                 raise Unknown("pr create", sl[p], None, "the new PR is not listed yet")
@@ -98,13 +99,30 @@ def open_prs(ctx: Ctx, run: dict) -> dict[str, int]:
     return prs
 
 
-def pr_body(run: dict) -> str:
+def pr_body(run: dict, entries: list[dict], batch: dict) -> str:
+    """The batch PR's description (Sol minor): each change with its PRs at
+    their approved heads and its council record, then what the phone
+    measured."""
     lines = [f"Batch `{run['id']}`, tested on the river test phone by the batch runner.", "", "Changes:"]
+    by_name = {e["name"]: e for e in entries}
     for m in run["members"]:
-        lines.append(f"- `{m['name']}`")
+        e = by_name.get(m["name"]) or {}
+        lines.append(f"- `{m['name']}`, council record `{str(e.get('record_sha256'))[:16]}` "
+                     f"(runner/council/{m['name']}/)")
+        for pr in e.get("prs") or []:
+            repo, n = records.split_key(pr["key"])
+            lines.append(f"  - {url(repo)}/pull/{n} at `{pr['head']}`")
     qa = run.get("qa") or {}
-    lines += ["", f"QA run: `{qa.get('run_id')}` (exit {qa.get('exit')}, eligible {qa.get('eligible')})",
-              f"Content key: `{run.get('content_key')}`", "", MARK.format(bid=run["id"])]
+    lines += ["", f"QA run: `{qa.get('run_id')}` (exit {qa.get('exit')}, eligible {qa.get('eligible')})"]
+    rows = rbench.attempt_rows(batch) if batch else []
+    if rows:
+        lines.append("Measured on the phone (one row per boot):")
+        for r in rows:
+            ram = r.get("used_ram_kb")
+            lines.append(f"- `{r.get('run_id')}`: boot {r.get('host_boot_seconds')} s, used RAM "
+                         f"{float(ram) / 1024:.0f} MB, /system {r.get('system_used_kb')} KB, "
+                         f"/vendor {r.get('vendor_used_kb')} KB" if ram else f"- `{r.get('run_id')}`")
+    lines += [f"Content key: `{run.get('content_key')}`", "", MARK.format(bid=run["id"])]
     return "\n".join(lines)
 
 

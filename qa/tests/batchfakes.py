@@ -97,6 +97,8 @@ class FakeGH(github.GitHub):
 
     def create_pr(self, repo, head, title, body):
         self._f("create_pr", repo, head)
+        self.bodies = getattr(self, "bodies", {})
+        self.bodies[(repo, head)] = body
         n = max([k[1] for k in self.prs if k[0] == repo] + [100]) + 1
         self.prs[(repo, n)] = {"state": "OPEN", "headRefName": head, "headRefOid": self.tips.get(
             (repo, f"refs/heads/{head}")), "baseRefName": "river-22.2", "isCrossRepository": False,
@@ -247,7 +249,9 @@ class FakeTree:
 
     def __init__(self, base: dict):
         from riverbatch import tc
-        self.branches = {p: {("default" if p == tc.MANIFEST else "river-22.2"): sha} for p, sha in base.items()}
+        self.branches = {p: {("default" if p == tc.MANIFEST else "river-22.2"): sha,
+                             ("origin/river-22.2" if p == tc.MANIFEST else "zrm625/river-22.2"): sha}
+                         for p, sha in base.items()}
         self.head = {p: ("default" if p == tc.MANIFEST else "river-22.2") for p in base}
         self.dirty, self.calls = set(), []
 

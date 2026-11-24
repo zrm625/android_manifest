@@ -169,9 +169,13 @@ def link_aliases(st: dict, name: str, pr_keys: list[str]) -> None:
 
 
 def add_failure(st: dict, e: dict, evidence: dict) -> int:
+    """Append failure evidence (R9.4, I13). Each record names the approval
+    record it failed under and a stable reference, ``<identity>#<index>``
+    (the list is append-only), for reports and decisions (Sol minor)."""
     ident = e["identity"]
     lst = st["failure_history"].setdefault(ident, [])
-    lst.append({**evidence, "name": e["name"]})
+    lst.append({**evidence, "name": e["name"], "record_sha256": e.get("record_sha256"),
+                "ref": f"{ident}#{len(lst)}"})
     return len(lst) - 1
 
 

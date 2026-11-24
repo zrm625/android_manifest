@@ -149,6 +149,10 @@ class MergePath(unittest.TestCase):
                 self.assertEqual(gh.tips[(s, "refs/tags/known-good-b0001^{}")], want, p)
             self.assertNotIn((R, "refs/heads/batch/b0001"), gh.tips)                 # branch deleted
             self.assertEqual(st["strikes"]["transport_prs"], 0)
+            body = gh.bodies[(R, "batch/b0001")]                                      # Sol minor
+            self.assertIn(f"https://github.com/{R}/pull/6 at `{TESTED}`", body)
+            self.assertIn("council record", body)
+            self.assertIn("boot 31 s, used RAM 880 MB", body)
 
     def test_moved_base_before_merge_started_is_a_void(self):
         with bench_home() as h:
