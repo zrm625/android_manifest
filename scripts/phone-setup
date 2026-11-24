@@ -42,7 +42,10 @@ while (($#)); do
 done
 
 device_lock
-a() { adb -s "$SERIAL" "$@"; }
+# Every adb call has a deadline (Sol M9): a hung adb never holds the device
+# and build locks. The runner's holder also bounds the whole run.
+ADB_CALL_TIMEOUT=${ADB_CALL_TIMEOUT:-120}
+a() { timeout -k 10 "$ADB_CALL_TIMEOUT" adb -s "$SERIAL" "$@"; }
 # Read the whole output before filtering: closing a dumpsys pipe early sends
 # SIGPIPE to the service being dumped.
 sh_() { a shell "$@" 2>/dev/null | tr -d '\r'; }

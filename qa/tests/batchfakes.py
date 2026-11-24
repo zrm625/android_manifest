@@ -158,11 +158,13 @@ class FakeTools(ports.Tools):
         super().__init__()
         self.script = script or {}
         self.calls = []
+        self.timeouts = []
 
     def run(self, argv, batch_id, log=None, env=None, timeout=None):
         name = argv[0].rsplit("/", 1)[-1]
         args = argv[1:]
         self.calls.append((name, tuple(args), batch_id))
+        self.timeouts.append((name, timeout))
         s = self.script.get(name)
         if callable(s):
             rc, out = s(args)

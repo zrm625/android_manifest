@@ -16,6 +16,10 @@ from . import github, paths, ports, state as S, tc
 from .compose import GitError
 
 EXIT_OK, EXIT_ERROR, EXIT_HALT, EXIT_RESUMABLE = 0, 1, 3, 75
+# Deadlines (seconds) per tool, generous: a cold build is ~6 h on this host,
+# a 3-boot bench and the full QA run well under 2 h each.
+TOOL_TIMEOUTS = {"build": 10 * 3600, "flash": 2 * 3600, "device-bench": 3 * 3600, "phone-qa": 4 * 3600,
+                 "phone-setup": 30 * 60}
 
 
 # --- control flow ------------------------------------------------------------------
@@ -129,6 +133,8 @@ class Ctx:
     # --- tools ----------------------------------------------------------------------
     def tool(self, name: str, args: list[str], bid: str | None, log_name: str | None = None,
              env: dict | None = None) -> ports.ToolResult:
+        """Run a tool through the holder with its deadline (Sol M9, Opus
+        minor): ``tool_timeouts`` in runner/config.json, else TOOL_TIMEOUTS."""
         script = {"flash": "flash", "device-bench": "bench/device-bench", "phone-qa": "phone-qa",
                   "phone-setup": "phone-setup", "build": "build"}[name]
         log = None
@@ -136,7 +142,8 @@ class Ctx:
             d = paths.batch_dir(bid) / "runner-logs"
             d.mkdir(parents=True, exist_ok=True)
             log = d / f"{log_name or name}.log"
-        return self.tools.run([str(paths.SCRIPTS / script), *args], bid, log, env)
+        timeout = float((self.cfg.get("tool_timeouts") or {}).get(name, TOOL_TIMEOUTS[name]))
+        return self.tools.run([str(paths.SCRIPTS / script), *args], bid, log, env, timeout=timeout)
 
 
 # --- journal commits (R11.1) ----------------------------------------------------------

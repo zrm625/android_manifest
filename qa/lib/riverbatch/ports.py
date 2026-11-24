@@ -54,14 +54,21 @@ class Git:
         return r.stdout
 
 
+TIMEOUT_RC = 124          # a tool that ran past its deadline (the holder was stopped)
+
+
 @dataclass
 class ToolResult:
     rc: int
     stdout: str
+    timed_out: bool = False
 
     def last_line(self) -> str:
         lines = [ln for ln in self.stdout.splitlines() if ln.strip()]
         return lines[-1] if lines else ""
+
+
+STOP_WAIT_S = 60
 
 
 class Tools:
@@ -83,10 +90,25 @@ class Tools:
         e["BENCH_HOME"] = str(paths.home())
         cmd = [sys.executable, "-I", str(paths.PKG / "hold.py"), str(paths.children_dir()), "--", *argv]
         logf = open(log, "ab") if log else subprocess.DEVNULL
+        timed_out = False
         try:
             self.current = subprocess.Popen(cmd, pass_fds=self.lock_fds, start_new_session=True, env=e,
                                             stdout=subprocess.PIPE, stderr=logf)
-            out, _ = self.current.communicate(timeout=timeout)
+            try:
+                out, _ = self.current.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Sol M9: past its deadline the holder is stopped (it ends the
+                # tool's process group and removes its child record); the
+                # caller treats the result as a failed step, and anything the
+                # tool reserved (a slot pair) stays for the normal recovery.
+                timed_out = True
+                self.stop()
+                out, _ = self.current.communicate()
+            except BaseException:
+                # Sol M8: a signal or an error never leaves the holder running
+                # unwatched; stop and reap it before ownership is dropped.
+                self.stop()
+                raise
             rc = self.current.returncode
         finally:
             self.current = None
@@ -96,6 +118,10 @@ class Tools:
         if log:
             with open(log, "a") as f:
                 f.write(text)
+                if timed_out:
+                    f.write(f"\nbatch: stopped after its {timeout:.0f} s deadline\n")
+        if timed_out:
+            return ToolResult(TIMEOUT_RC, text, timed_out=True)
         return ToolResult(128 - rc if rc < 0 else rc, text)
 
     def start(self, argv: list[str], batch_id: str | None, log: Path, env: dict | None = None) -> subprocess.Popen:
@@ -114,14 +140,18 @@ class Tools:
         return self.current
 
     def stop(self) -> None:
-        """The runner got a signal: SIGTERM its holder and wait (R6.2)."""
+        """SIGTERM the holder and wait for it (R6.2): it ends the tool's
+        process group (SIGKILL after its grace) and removes the child
+        record. A holder that is still alive after 60 s is killed; its child
+        record then stays, and the next lock holder waits for the group."""
         p = self.current
         if p is not None and p.poll() is None:
             p.send_signal(signal.SIGTERM)
             try:
-                p.wait(timeout=60)
+                p.wait(timeout=STOP_WAIT_S)
             except subprocess.TimeoutExpired:
-                pass
+                p.kill()
+                p.wait()
 
 
 class Podman:

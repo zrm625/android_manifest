@@ -13,6 +13,7 @@ from riverqa import bench as rbench, regression, stage
 from riverqa.core import now_iso, read_json
 
 from . import compose, eligibility, kb, outcomes as O, paths, records, state as S
+from .ports import TIMEOUT_RC
 from .ctx import (Abort, Ctx, Halt, Pause, bench_result, branch, clean, commit_phase, head, image_id, river_build, update_running)
 
 MANIFEST = compose.MANIFEST
@@ -394,6 +395,10 @@ def phone_setup(ctx: Ctx, bid: str | None) -> int:
 def setup_candidate(ctx: Ctx, run: dict) -> None:
     commit_phase("setting-up")
     rc = phone_setup(ctx, run["id"])
+    if rc == TIMEOUT_RC:
+        # Sol M9: a hung setup is the desk's, not the change's; the pair
+        # stays reserved and R11.2 step 2 rolls it back.
+        raise Abort({"class": O.VOID, "reason": "phone-setup ran past its deadline and was stopped"})
     if rc != 0:
         raise Abort({"class": O.FAIL, "checks": ["setup"], "evidence": {"step": "setup", "exit": rc}})
     c, bad = readback(ctx, ctx.phone())

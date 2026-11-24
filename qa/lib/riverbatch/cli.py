@@ -95,15 +95,24 @@ def main(argv: list[str], ctx: C.Ctx | None = None) -> int:
         print(USAGE)
         return 1
     ctx = ctx or C.Ctx()
-    summary: dict = {"command": a.cmd}
-    code = C.EXIT_OK
 
     def on_signal(signum, _frame):
+        # Sol M8, Opus minor: SIGINT too. Stop and reap the holder (it ends
+        # the tool's group) before the locks are released on the way out;
+        # running and the lease stay for the next tick's recovery.
         ctx.tools.stop()
         raise KeyboardInterrupt(f"signal {signum}")
-    for s in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(s, on_signal)
+    previous = {s: signal.signal(s, on_signal) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    try:
+        return _run(a, ctx)
+    finally:
+        for s, h in previous.items():
+            signal.signal(s, h)
 
+
+def _run(a, ctx: C.Ctx) -> int:
+    summary: dict = {"command": a.cmd}
+    code = C.EXIT_OK
     try:
         if a.cmd == "tick":
             from . import tick
@@ -172,7 +181,7 @@ def main(argv: list[str], ctx: C.Ctx | None = None) -> int:
         summary["error"] = str(e)
     except KeyboardInterrupt as e:
         code, summary["interrupted"] = C.EXIT_RESUMABLE, str(e)
-    if a.cmd == "tick" and code != C.EXIT_ERROR:
+    if a.cmd == "tick" and code == C.EXIT_OK:            # Gemini, Opus minor: only a clean tick clears it
         try:
             with S.transaction() as st:
                 st["last_error"] = None
