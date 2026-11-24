@@ -16,8 +16,12 @@ The read is one ``dev.sh_rc`` call for ``ro.product.device``,
 ``ro.serialno``, ``ro.boot.slot_suffix``, ``sys.boot_completed``,
 ``ro.river.build_id`` and ``ro.vendor.build.date.utc``. HALT only when that
 call returned 0 with a non-empty product or serial that is not this phone's.
-A failed call or empty values re-check the USB state: fastboot, unauthorized
-or recovery block; no answer pauses.
+A failed call or an empty product, serial or slot re-checks the USB state:
+fastboot, unauthorized or recovery block; no answer pauses. An empty or
+``0`` ``sys.boot_completed`` (Android leaves it unset until boot completes)
+and empty stamps also re-check the USB state first (I2, Sol); with the phone
+still on USB they are "phone still booting" and "unstamped dev build"
+(blocked), never a pause (Gemini GM2, Opus OM4).
 """
 
 from __future__ import annotations
@@ -81,12 +85,16 @@ def read_props(dev) -> Check:
             return Check(HALT, f"{SERIAL} reports product {vals['D']!r}, not {CODENAME}")
         if vals.get("N") and vals["N"] != SERIAL:
             return Check(HALT, f"adb -s {SERIAL} reached a phone with serial {vals['N']!r}")
-    if rc != 0 or not all(vals.get(k) for k in ("D", "N", "S", "C")):
+    if rc != 0 or not all(vals.get(k) for k in ("D", "N", "S")):
         again = usb_state(dev)
         if not again.ok:
             return again
         return Check(PAUSE, f"{NOT_ANSWERING} (read failed, rc {rc}: {(err or out).strip()[-120:]})")
-    return Check(OK, props={PROPS[k]: v for k, v in vals.items()})
+    if vals.get("C") != "1" or not vals.get("R") or not vals.get("V"):
+        again = usb_state(dev)                  # empty values re-check the USB state too (I2)
+        if not again.ok:
+            return again
+    return Check(OK, props={PROPS[k]: vals.get(k, "") for k in PROPS})
 
 
 def known_good_vendor_date(batch_id: str | None) -> str | None:

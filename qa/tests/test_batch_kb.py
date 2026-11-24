@@ -62,6 +62,31 @@ class KB(unittest.TestCase):
         c = self.check(Flaky({"ro.product.device": ""}))
         self.assertEqual((c.kind, c.message), (kb.BLOCKED, "phone in fastboot"))
 
+    def test_empty_boot_completed_is_booting_not_a_pause(self):
+        # Gemini GM2, Opus OM4: Android leaves sys.boot_completed unset ("")
+        # until boot completes.
+        for v in ("", "0"):
+            c = self.check(FakeDev({"sys.boot_completed": v}))
+            self.assertEqual((c.kind, c.message), (kb.BLOCKED, "phone still booting"), v)
+
+    def test_empty_stamps_recheck_the_usb_state(self):
+        # Sol (I2): an empty system or vendor stamp re-checks USB before it
+        # is called an unstamped build.
+        class Flaky(FakeDev):
+            n = 0
+
+            def state(self):
+                self.n += 1
+                return "device" if self.n == 1 else ""
+
+            def in_fastboot(self):
+                return True
+        for prop in ("ro.river.build_id", "ro.vendor.build.date.utc", "sys.boot_completed"):
+            c = self.check(Flaky({prop: ""}))
+            self.assertEqual((c.kind, c.message), (kb.BLOCKED, "phone in fastboot"), prop)
+            c = self.check(FakeDev({prop: ""}))
+            self.assertEqual(c.kind, kb.BLOCKED, prop)              # still on USB: booting or unstamped
+
     def test_usb_states(self):
         self.assertEqual(self.check(FakeDev(state="", fastboot=True)).message, "phone in fastboot")
         self.assertEqual(self.check(FakeDev(state="")).kind, kb.PAUSE)
