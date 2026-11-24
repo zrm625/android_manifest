@@ -5,6 +5,15 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "qa", "lib"))
+
+# The tree check and the tools preflight need the pinned git-lfs; put
+# .repo-bootstrap/bin first on PATH for this process and every child, as
+# scripts/change does. TOP is three levels up: TOP/.repo/manifests/scripts.
+_boot = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "..", ".repo-bootstrap", "bin")
+_boot = os.path.realpath(_boot)
+if os.path.isdir(_boot):
+    _rest = [d for d in os.environ.get("PATH", "").split(":") if d and d != _boot]
+    os.environ["PATH"] = ":".join([_boot] + _rest)
 from riverbatch.cli import entry  # noqa: E402
 
 sys.exit(entry())
