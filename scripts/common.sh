@@ -88,7 +88,9 @@ build_running() {
 device_lock() {
   local f=$BENCH_HOME/.device-lock
   mkdir -p "$BENCH_HOME"
-  if build_running; then
+  # RIVER_DEVICE_DURING_BUILD=1: the tries pipeline tests while the next try
+  # builds (CHARTER.md), as in qa/lib/riverqa/lock.py.
+  if [[ "${RIVER_DEVICE_DURING_BUILD:-}" != 1 ]] && build_running; then
     echo "error: a build holds $BENCH_HOME/.lock; device jobs wait until it finishes" >&2; exit 1
   fi
   if [[ -n "${BENCH_LOCK_TOKEN:-}" ]]; then
