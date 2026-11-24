@@ -381,3 +381,256 @@ class QualifyExits(unittest.TestCase):
         with mock.patch.object(qualify, "remote_git"), mock.patch.dict(os.environ, {"RIVER_BATCH_REEXEC": "1"}):
             with self.assertRaises(qualify.Refused):
                 qualify.local_base(ctx, check_xml=False, kg=None)
+
+
+# --- Sol SM3, Gemini GM2-3: refusals and uncertain creates and merges -------------------------------
+
+class PRPhaseRefusals(unittest.TestCase):
+    """Through tick.run_batch with the merge path for real (test_batch_mergepath's world)."""
+
+    def run_batch(self, h, gh_tweak):
+        import test_batch_mergepath as mp
+        from test_batch_flow import steps
+        from batchfakes import mk_ctx
+        from riverbatch import tick
+        from riverbatch import state as S
+        gh, git, tools, rgit = mp.world(h)
+        gh_tweak(gh)
+        flash = tools.script["flash"]
+
+        def flash2(args):
+            if args[0] == "--rollback":
+                ss = json.loads((h / "slot-state.json").read_text())
+                ss["pair"] = None
+                (h / "slot-state.json").write_text(json.dumps(ss))
+                return 0, ""
+            return flash(args)
+        tools.script["flash"] = flash2
+        ctx = mk_ctx(gh=gh, tools=tools)
+        ctx.git = git
+        run = S.read()["running"]
+        ps = steps() + [mock.patch.object(mp.merge, "remote_git", rgit), mock.patch.object(tick, "remote_git", rgit),
+                        mock.patch.object(tick.version, "current", return_value=dict(mp.VERS)),
+                        mock.patch.object(mp.recover.version, "current", return_value=dict(mp.VERS)),
+                        mock.patch.object(tick, "qualification_problems", return_value=[]),
+                        mock.patch("riverqa.bench.attempt_rows", return_value=mp.ROWS)]
+        for x in ps:
+            x.start()
+        try:
+            tick.run_batch(ctx, run, {"latest": {"cameras": [0, 1, 2]}})
+        finally:
+            mock.patch.stopall()
+        return gh, tools, S.read()
+
+    def test_refused_pr_create_voids_and_rolls_back_this_tick(self):
+        from riverbatch import ctx as C
+        with bench_home() as h:
+            def tweak(gh):
+                gh.fail["create_pr"] = C.Refused("pr create", "x", 422, "Validation Failed")
+            gh, tools, st = self.run_batch(h, tweak)
+            self.assertIn(("flash", ("--rollback",), "b0001"), tools.calls)
+            self.assertIsNone(st["running"])
+            self.assertEqual(st["entries"][0]["status"], "queued")
+            self.assertIn("refused", st["entries"][0]["reason"])
+            self.assertIsNone(st["last_error"])
+
+    def test_pr_view_404_voids_and_rolls_back_this_tick(self):
+        from riverbatch import ctx as C
+        with bench_home() as h:
+            def tweak(gh):
+                gh.fail["pr_view"] = [C.Refused("pr view", "x", 404, "Could not resolve to a PullRequest")]
+            gh, tools, st = self.run_batch(h, tweak)
+            self.assertIn(("flash", ("--rollback",), "b0001"), tools.calls)
+            self.assertIsNone(st["running"])
+            self.assertEqual(st["entries"][0]["status"], "queued")
+            self.assertIn("refused the read", st["entries"][0]["reason"])
+
+    def test_any_refusal_before_merge_started_voids_and_rolls_back_this_tick(self):
+        """A refused GitHub call no step handles (a PR list 404) is the
+        batch's void, never a runner error."""
+        from riverbatch import ctx as C
+        with bench_home() as h:
+            def tweak(gh):
+                gh.fail["pr_list"] = C.Refused("pr list", "x", 404, "Not Found")
+            gh, tools, st = self.run_batch(h, tweak)
+            self.assertIn(("flash", ("--rollback",), "b0001"), tools.calls)
+            self.assertIsNone(st["running"])
+            self.assertEqual(st["entries"][0]["status"], "queued")
+            self.assertIn("GitHub refused", st["entries"][0]["reason"])
+
+    def test_lost_create_answer_finds_the_pr_it_made(self):
+        """The create reached GitHub, its answer did not: the PR is looked
+        up and the batch goes on to merge."""
+        from riverbatch import ctx as C
+        with bench_home() as h:
+            def tweak(gh):
+                orig = gh.create_pr
+
+                def create(repo, head, title, body):
+                    orig(repo, head, title, body)
+                    raise C.Unknown("pr create", repo, None, "connection reset")
+                gh.create_pr = create
+            gh, tools, st = self.run_batch(h, tweak)
+            self.assertIsNone(st["running"])
+            self.assertEqual(st["entries"][0]["status"], "merged")
+            self.assertNotIn(("flash", ("--rollback",), "b0001"), tools.calls)
+
+
+class MergeLag(unittest.TestCase):
+    def setup(self, h):
+        from batchfakes import write_json
+        from test_batch_merge import setup_batch
+        setup_batch(h)
+        write_json(h / "slot-state.json", {"pair": {"batch": "b0001", "attempts": ["fa-1"]}})
+
+    def test_already_merged_refusal_is_reconciled(self):
+        """The first merge landed but its answer was lost; GitHub refuses
+        the second: reconciliation finds it landed; no HALT."""
+        from riverbatch import ctx as C, merge
+        from riverbatch import state as S
+        from test_batch_merge import M, P, R, gh_with
+        from batchfakes import mk_ctx
+        with bench_home() as h:
+            self.setup(h)
+            gh = gh_with()
+            calls = {"n": 0}
+
+            def merge_pr(repo, n, sha):
+                calls["n"] += 1
+                gh.prs[(R, 7)].update(state="MERGED", mergeCommit={"oid": M})
+                gh.tips[(R, "refs/heads/river-22.2")] = M
+                raise C.Refused("merge", repo, 405, "Pull Request is not mergeable")
+            gh.merge_pr = merge_pr
+            merge.merge_all(mk_ctx(gh=gh), S.read()["running"])
+            self.assertEqual(S.read()["running"]["merge"]["merged"], {P: M})
+
+    def test_acknowledged_merge_with_lagging_reads_is_never_sent_again(self):
+        from riverbatch import ctx as C, merge
+        from riverbatch import state as S
+        from test_batch_merge import M, P, R, gh_with
+        from batchfakes import mk_ctx
+        with bench_home() as h:
+            self.setup(h)
+            gh = gh_with()
+            gh.merge_answer = M                       # answered merged; reads still show OPEN at the base
+            ctx = mk_ctx(gh=gh)
+            with self.assertRaises(C.Unknown):
+                merge.merge_all(ctx, S.read()["running"])
+            self.assertEqual(S.read()["running"]["merge"]["acked"], {P: M})
+            with self.assertRaises(C.Unknown):        # next tick: still lagging; no second merge
+                merge.merge_all(ctx, S.read()["running"])
+            self.assertEqual(sum(1 for c in gh.calls if c[0] == "merge_pr"), 1)
+            self.assertIsNotNone(S.read()["running"]["reconcile_unknown_since"])
+            gh.prs[(R, 7)].update(state="MERGED", mergeCommit={"oid": M})
+            gh.tips[(R, "refs/heads/river-22.2")] = M
+            merge.merge_all(ctx, S.read()["running"])
+            self.assertEqual(S.read()["running"]["merge"]["merged"], {P: M})
+            self.assertEqual(sum(1 for c in gh.calls if c[0] == "merge_pr"), 1)
+
+    def test_refusal_after_an_unanswered_merge_is_unknown_not_halt(self):
+        from riverbatch import ctx as C, merge
+        from riverbatch import state as S
+        from test_batch_merge import gh_with
+        from batchfakes import mk_ctx
+        with bench_home() as h:
+            self.setup(h)
+            gh = gh_with()
+            gh.fail["merge_pr"] = [C.Unknown("merge", "x", None, "timeout"),
+                                   C.Refused("merge", "x", 405, "Base branch was modified")]
+            ctx = mk_ctx(gh=gh)
+            with self.assertRaises(C.Unknown):
+                merge.merge_all(ctx, S.read()["running"])
+            with self.assertRaises(C.Unknown):
+                merge.merge_all(ctx, S.read()["running"])
+
+    def test_answered_sha_that_is_not_the_landed_tip_halts(self):
+        from riverbatch import ctx as C, merge
+        from riverbatch import state as S
+        from test_batch_merge import M, OTHER, R, gh_with
+        from batchfakes import mk_ctx
+        with bench_home() as h:
+            self.setup(h)
+            gh = gh_with()
+
+            def effect(repo, n, sha):
+                gh.prs[(R, 7)].update(state="MERGED", mergeCommit={"oid": M})
+                gh.tips[(R, "refs/heads/river-22.2")] = M
+            gh.merge_effect = effect
+            gh.merge_answer = OTHER
+            with self.assertRaises(C.Halt):
+                merge.merge_all(mk_ctx(gh=gh), S.read()["running"])
+
+
+class ForwardRefusals(unittest.TestCase):
+    def test_delete_branch_with_a_stale_lease_reads_again(self):
+        from batchfakes import FakeGH, mk_ctx
+        from riverbatch import ctx as C, merge
+        gh = FakeGH()
+        R = merge.slugs()["device/motorola/river"]
+        gh.tips[(R, "refs/heads/batch/b0001")] = "a" * 40
+
+        def push(ctx, path, *args):
+            gh.tips.pop((R, "refs/heads/batch/b0001"))       # deleted meanwhile
+            raise C.Refused("git push", path, None, "! [rejected] (stale info)")
+        with mock.patch.object(merge, "remote_git", push):
+            self.assertEqual(merge.delete_branch(mk_ctx(gh=gh), "device/motorola/river", R, "b0001", "a" * 40),
+                             "absent")
+
+    def test_refused_tag_push_reads_again(self):
+        import test_batch_mergepath as mp
+        from batchfakes import mk_ctx
+        from riverbatch import ctx as C, merge
+        from riverbatch import state as S
+        with bench_home() as h:
+            gh, git, tools, rgit = mp.world(h)
+            b = json.loads((h / "batches/b0001/batch.json").read_text())
+            b.update(tag="known-good-b0001", merge_started={"expected_prs": {}})
+            (h / "batches/b0001/batch.json").write_text(json.dumps(b))
+            want = {p: s for p, s in b["commit_set"].items()}
+            sl = merge.slugs()
+            state = {"other": False}
+
+            def push(ctx, path, *args):
+                gh.tips[(sl[path], "refs/tags/known-good-b0001^{}")] = "e" * 40 if state["other"] else want[path]
+                raise C.Refused("git push", path, None, "! [rejected] (already exists)")
+            ctx = mk_ctx(gh=gh)
+            ctx.git = git
+            with mock.patch.object(merge, "remote_git", push):
+                merge.push_tags(ctx, S.read()["running"])          # every tag is where it should be
+                for p in sl:
+                    gh.tips.pop((sl[p], "refs/tags/known-good-b0001^{}"))
+                state["other"] = True
+                with self.assertRaises(C.Halt):
+                    merge.push_tags(ctx, S.read()["running"])
+
+    def test_refused_fetch_of_a_member_head_needs_reapproval(self):
+        from batchfakes import FakeGH, mk_ctx
+        from riverbatch import ctx as C, eligibility, phases
+        from riverbatch import state as S
+        with bench_home():
+            with S.transaction() as st:
+                st["entries"] = [_entry("perch", 1)]
+            e = S.read()["entries"][0]
+
+            def fetch(ctx, path, *args):
+                raise C.Refused("git fetch", path, None, "fatal: couldn't find remote ref refs/pull/1/head")
+            with mock.patch.object(eligibility, "eligible", return_value=eligibility.Outcome(eligibility.OK, None)), \
+                    mock.patch.object(phases, "entry_record", return_value=({}, [])), \
+                    mock.patch("riverbatch.ctx.remote_git", fetch):
+                bad = phases.member_checks(mk_ctx(gh=FakeGH()), [e], {}, {}, {})
+            self.assertEqual([(x["name"], s) for x, s, _ in bad], [("perch", eligibility.REAPPROVE)])
+            self.assertEqual(S.read()["entries"][0]["status"], "needs-reapproval")
+
+
+class ForwardRefusalHalts(unittest.TestCase):
+    def test_a_refusal_on_the_forward_path_is_a_halt_not_a_runner_error(self):
+        from batchfakes import mk_ctx, write_json
+        from riverbatch import ctx as C, recover
+        from riverbatch import state as S
+        with bench_home() as h:
+            write_json(h / "batches/b0001/batch.json", {"merge_started": {"at": "t"}})
+            with S.transaction() as st:
+                st["running"] = {"id": "b0001", "purpose": "batch", "members": []}
+            with mock.patch.object(recover, "forward", side_effect=C.Refused("pr close", "x", 403, "locked")):
+                with self.assertRaises(C.Halt):
+                    recover.recover_running(mk_ctx())

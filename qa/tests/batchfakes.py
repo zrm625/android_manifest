@@ -108,6 +108,8 @@ class FakeGH(github.GitHub):
         self._f("merge_pr", repo, n, sha)
         if self.merge_effect:
             self.merge_effect(repo, n, sha)
+        return self.merge_answer if hasattr(self, "merge_answer") else \
+            ((self.prs.get((repo, n)) or {}).get("mergeCommit") or {}).get("oid")
 
     def call(self, cmd, repo=None):
         self._f("call", tuple(cmd))

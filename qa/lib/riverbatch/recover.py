@@ -58,7 +58,13 @@ def recover_running(ctx: Ctx, local_only: bool = False) -> str:
     if not (b or {}).get("merge_started"):
         abort(ctx)
         return "aborted"
-    return forward(ctx, local_only)
+    try:
+        return forward(ctx, local_only)
+    except Refused as e:
+        # Gemini GM2-3: a confirmed refusal on the forward path that no step
+        # reconciled is Zak's, never a runner error.
+        raise Halt(f"{run['id']}: GitHub refused on the forward path: {e}",
+                   advice="Zak: `batch settle <id> --zak`") from e
 
 
 def abort(ctx: Ctx, extra_pause: str | None = None) -> None:

@@ -96,8 +96,12 @@ def member_checks(ctx: Ctx, members: list[dict], base: dict[str, str], slugs: di
         for pr in e["prs"]:
             n = records.split_key(pr["key"])[1]
             ref = f"refs/river-batches/pr/{pr['path'].replace('/', '_')}/{n}"
-            from .ctx import remote_git
-            remote_git(ctx, pr["path"], "fetch", "-q", "zrm625", f"+refs/pull/{n}/head:{ref}")
+            from .ctx import Refused, remote_git
+            try:
+                remote_git(ctx, pr["path"], "fetch", "-q", "zrm625", f"+refs/pull/{n}/head:{ref}")
+            except Refused as ex:                       # Gemini GM2-3: that member, not the tick
+                bad.append((e, eligibility.REAPPROVE, f"{pr['key']}: fetching its head was refused: {ex.line}"))
+                break
             got = ctx.git.out(pr["path"], "rev-parse", ref).strip()
             if got != pr["head"]:
                 bad.append((e, eligibility.REAPPROVE, f"{pr['key']} head is {got[:12]}, approved {pr['head'][:12]}"))

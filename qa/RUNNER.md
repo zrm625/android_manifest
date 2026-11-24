@@ -1253,6 +1253,25 @@ only a confirmed refusal can HALT (R10.2 step 1, R10.4, R10.4a, R10.6 step
 <status>"); before `merge_started` the batch is first aborted as
 `transport`, after it the forward path resumes after `batch resume`.
 
+**Confirmed refusals and uncertain writes** (Sol SM3, Gemini GM2-3):
+- Before `merge_started`, a confirmed refusal of any call of R10.2-R10.3
+  (a PR create refused with no PR found, a PR read 404) voids the batch,
+  which is rolled back in the same tick (R11.2 step 2); never a runner error.
+- A PR create with no answer, or refused, is followed by a lookup by exact
+  head branch: a PR found is used.
+- A merge: `running.merge.attempted[path]` is committed before the call and
+  `running.merge.acked[path]` (the SHA GitHub answered) after it. An acked
+  merge is never sent again: lagging reads are unknown (I5's clock runs),
+  and the landed tip must equal the answered SHA (else HALT). A refused merge
+  is reconciled first (landed is success); a refusal of a merge sent before
+  without an answer is unknown, not a HALT.
+- A refused tag push or branch delete is read again: the tag at the wanted
+  commit, or the branch absent, is success.
+- A refused fetch of a member's PR head makes that member
+  `needs-reapproval` (R7.2).
+- After `merge_started`, any other confirmed refusal on the forward path is a
+  HALT (Zak settles), never a runner error.
+
 **Bounded transport aborts** (O-C3): a `transport` abort of a batch that
 reached phase `prs-open` adds one to `strikes.transport_prs`; the second in
 a row pauses ("GitHub failed twice after batch PRs opened"), so a flaky

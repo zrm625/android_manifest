@@ -90,9 +90,22 @@ def open_prs(ctx: Ctx, run: dict) -> dict[str, int]:
     for p in run["touched"]:
         found = ctx.gh.pr_list(sl[p], f"batch/{bid}", "all")
         if not found:
-            ctx.gh.create_pr(sl[p], f"batch/{bid}", f"batch {bid}: {names}", body)
+            # Sol SM3: a create whose answer was lost (no answer) or refused
+            # (422: one exists already) may still have made the PR; look it
+            # up before deciding. Found: use it. A refusal with no PR is the
+            # batch's confirmed refusal (void, rolled back this tick); no
+            # answer and no PR is transport.
+            try:
+                ctx.gh.create_pr(sl[p], f"batch/{bid}", f"batch {bid}: {names}", body)
+                failed = None
+            except (Unknown, Refused) as ex:
+                failed = ex
             found = ctx.gh.pr_list(sl[p], f"batch/{bid}", "all")
             if not found:
+                if isinstance(failed, Refused):
+                    raise Abort({"class": O.VOID, "reason": f"{sl[p]}: GitHub refused the batch PR: {failed.line}"})
+                if failed is not None:
+                    raise failed
                 raise Unknown("pr create", sl[p], None, "the new PR is not listed yet")
         if len(found) != 1:
             raise Abort({"class": O.VOID, "reason": f"{sl[p]}: {len(found)} PRs from batch/{bid}"})
@@ -135,7 +148,10 @@ def check_mergeable(ctx: Ctx, run: dict, prs: dict[str, int]) -> None:
     sl = slugs()
     for p, n in prs.items():
         for i in range(16):
-            v = ctx.gh.pr_view(sl[p], n)
+            try:
+                v = ctx.gh.pr_view(sl[p], n)
+            except Refused as ex:                  # Gemini GM2-3: a 404 before merge_started voids the batch
+                raise Abort({"class": O.VOID, "reason": f"{sl[p]}#{n}: GitHub refused the read: {ex.line}"}) from ex
             if v.get("headRefOid") != tested(run, p) or v.get("baseRefName") != BRANCH \
                     or v.get("isCrossRepository") is not False:
                 raise Abort({"class": O.VOID, "reason": f"{sl[p]}#{n} is not at the tested head on {BRANCH}"})
@@ -244,6 +260,10 @@ def reconcile(ctx: Ctx, run: dict) -> dict[str, str]:
                        f"the tested merge (PR {obs['state']}); untested content may have reached river-22.2",
                        advice="Zak: inspect, then `batch settle <id> --zak`")
         if cls == LANDED:
+            acked = ((run.get("merge") or {}).get("acked") or {}).get(path)
+            if acked and acked != obs["tip"]:          # Opus minor: the answer and the landed tip agree
+                raise Halt(f"{e['repo']}#{e['number']}: GitHub answered merge commit {acked[:12]}, but "
+                           f"river-22.2 landed at {str(obs['tip'])[:12]}", advice="Zak: `batch settle <id> --zak`")
             merged[path] = obs["tip"]
         out[path] = cls
     update_running(merge=dict(run.get("merge") or {}, merged=merged), reconcile_unknown_since=None)
@@ -320,18 +340,48 @@ def merge_all(ctx: Ctx, run: dict) -> None:
             raise Halt(f"{e['repo']}#{e['number']} is not open at the tested head on {BRANCH}")
         if not pair_is_ours(ctx, run):
             raise Halt(f"slot-state.json no longer reserves {run['id']}'s pair")
+        acked = ((run.get("merge") or {}).get("acked") or {}).get(path)
+        if acked:
+            # Sol SM3: GitHub answered merged with this SHA; the reads still
+            # lag. Never send it again: wait (I5's clock runs).
+            unknown_started()
+            raise Unknown("merge", e["repo"], None, f"#{e['number']} merged as {acked[:12]} but not visible yet")
+        sent_before = path in ((run.get("merge") or {}).get("attempted") or {})
         commit_intent(f"merge {path}", f"{e['repo']}#{e['number']} open at {tested(run, path)[:12]}, "
                                        f"base tip {run['base'][path][:12]}",
                       f"merged, merge commit parents [{run['base'][path][:12]}, {tested(run, path)[:12]}]")
+        mark_merge(run, path, "attempted", now_iso())
         try:
-            ctx.gh.merge_pr(e["repo"], e["number"], tested(run, path))     # synchronous, never queued (Sol B4)
+            sha = ctx.gh.merge_pr(e["repo"], e["number"], tested(run, path))     # synchronous (Sol B4)
+            mark_merge(run, path, "acked", sha)
         except Refused as ex:
-            raise Halt(f"GitHub refused the merge of {e['repo']}#{e['number']}: {ex.line}") from ex
+            # Sol SM3: "already merged" or a lagging state is reconciled
+            # first; landed is the merge we wanted. A refusal of a merge sent
+            # before (its answer lost) is GitHub lag until I5 says otherwise.
+            reconcile(ctx, run)
+            if path in run["merge"]["merged"]:
+                continue
+            if sent_before:
+                unknown_started()
+                raise Unknown("merge", e["repo"], ex.status, f"#{e['number']} refused after an unanswered merge: "
+                                                              f"{ex.line}") from ex
+            raise Halt(f"GitHub refused the merge of {e['repo']}#{e['number']}: {ex.line}",
+                       advice="Zak: `batch settle <id> --zak`") from ex
         except Unknown:
             pass                                       # reconciled below (R11.6)
         reconcile(ctx, run)
         if path not in run["merge"]["merged"]:
             raise Unknown("merge", e["repo"], None, f"#{e['number']} not observed merged yet")
+
+
+def mark_merge(run: dict, path: str, key: str, value: str) -> None:
+    """running.merge.attempted / acked (Sol SM3): a merge sent, and the
+    merge commit GitHub answered with; in the state file and in ``run``
+    (reconcile writes ``run["merge"]`` back whole)."""
+    with S.transaction() as st:
+        m = st["running"].setdefault("merge", {})
+        m.setdefault(key, {})[path] = value
+        run["merge"] = dict(m)
 
 
 # --- R10.6 tags, promotion, known-good (KW, I7) -------------------------------------------------
@@ -353,7 +403,7 @@ def push_tags(ctx: Ctx, run: dict) -> None:
     sl = slugs()
     for p, want in sorted(tag_targets(run, b).items()):
         u = url(sl[p])
-        got = ctx.gh.ls_remote(u, f"refs/tags/{tag}^{{}}") or ctx.gh.ls_remote(u, f"refs/tags/{tag}")
+        got = remote_tag(ctx, u, tag)
         if got == want:
             continue
         if got is not None:
@@ -368,10 +418,23 @@ def push_tags(ctx: Ctx, run: dict) -> None:
         if rc != 0:
             ctx.git.out(p, "-c", "user.name=river-batch", "-c", "user.email=river-batch@localhost", "tag", "-a",
                         tag, "-m", f"known-good {run['id']}", want)
-        remote_git(ctx, p, "push", r, f"refs/tags/{tag}")
-        got = ctx.gh.ls_remote(u, f"refs/tags/{tag}^{{}}")
+        try:
+            remote_git(ctx, p, "push", r, f"refs/tags/{tag}")
+        except Refused as ex:
+            # Gemini GM2-3: a refused push (the tag exists already) is read again.
+            got = remote_tag(ctx, u, tag)
+            if got == want:
+                continue
+            raise Halt(f"{sl[p]} refused {tag}: it is at {str(got)[:12]}, not {want[:12]}: {ex.line}",
+                       advice="Zak: `batch settle <id> --zak`") from ex
+        got = remote_tag(ctx, u, tag)
         if got != want:
             raise Unknown("tag", sl[p], None, f"{tag} not visible at {want[:12]} yet")
+
+
+def remote_tag(ctx: Ctx, u: str, tag: str) -> str | None:
+    """The commit a remote tag names: peeled if annotated, else itself."""
+    return ctx.gh.ls_remote(u, f"refs/tags/{tag}^{{}}") or ctx.gh.ls_remote(u, f"refs/tags/{tag}")
 
 
 def promoted(ctx: Ctx, bid: str) -> bool:
@@ -543,7 +606,13 @@ def delete_branch(ctx: Ctx, path: str, repo: str, bid: str, sha: str) -> str:
         return "absent"
     if got != sha:
         return "other"
-    remote_git(ctx, path, "push", f"--force-with-lease={ref}:{sha}", "zrm625", f":{ref}")
+    try:
+        remote_git(ctx, path, "push", f"--force-with-lease={ref}:{sha}", "zrm625", f":{ref}")
+    except Refused:
+        # Gemini GM2-3: a stale lease (the branch moved or went meanwhile)
+        # is read again, never a runner error.
+        got = ctx.gh.ls_remote(url(repo), ref)
+        return "absent" if got is None else "other"
     return "deleted"
 
 
