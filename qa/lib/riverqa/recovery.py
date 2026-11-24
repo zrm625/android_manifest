@@ -68,8 +68,16 @@ _TRANSPORT_RE = re.compile(r"timed? ?out|timeout|connection (refused|reset)|coul
                            r"the remote end hung up|early eof|rpc failed", re.I)
 _AUTH_RE = re.compile(r"bad credentials|authentication failed|requires authentication|"
                       r"gh auth login|not logged in|invalid username or password", re.I)
+# A GraphQL error that is GitHub's explicit "no" to this request (I21): it is
+# answered, so retrying the same call cannot change it. Only rate limits and
+# server errors stay transport.
 _GRAPHQL_REFUSED_RE = re.compile(r"GraphQL: .*(could not resolve to|not_found|forbidden|"
-                                 r"must have|does not have|not accessible|unprocessable)", re.I)
+                                 r"must have|does not have|not accessible|unprocessable|"
+                                 r"not mergeable|head branch was modified|base branch was modified|"
+                                 r"already (been )?merged|merge conflict|is in (a )?clean status|"
+                                 r"required status check|review is required|reviews? required|"
+                                 r"changes must be made through|branch protection|merge queue|"
+                                 r"auto.?merge is not allowed|pull request is closed|is not open)", re.I)
 _GIT_REFUSED_RE = re.compile(r"repository not found|\[rejected\]|\[remote rejected\]|"
                              r"! \[.*\]|permission to .* denied|does not appear to be a git repository|"
                              r"stale info|protected branch", re.I)

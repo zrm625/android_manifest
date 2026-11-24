@@ -75,6 +75,15 @@ class GitHub:
         except ValueError as e:
             raise Unknown(" ".join(cmd[:4]), repo, None, f"malformed answer: {out[:120]!r}") from e
 
+    def pages(self, path: str, repo: str) -> list:
+        """Every item of a paginated REST list: ``gh api --paginate
+        --slurp`` wraps the pages in one JSON array, flattened here. A page
+        that is not a list is a malformed answer."""
+        d = self.json(["gh", "api", "--paginate", "--slurp", path], repo)
+        if not isinstance(d, list) or not all(isinstance(pg, list) for pg in d):
+            raise Unknown("gh api --paginate", repo, None, f"malformed pages of {path}")
+        return [x for pg in d for x in pg]
+
     # --- typed reads -------------------------------------------------------
     def rate_limit(self) -> dict:
         d = self.json(["gh", "api", "rate_limit"])
@@ -160,19 +169,14 @@ class GitHub:
 
     def changed_files(self, repo: str, number: int) -> list[dict]:
         """[{filename, previous_filename?, status}] of a PR (R5.4 step 3, I21)."""
-        d = self.json(["gh", "api", "--paginate", f"repos/{repo}/pulls/{number}/files"], repo)
-        if not isinstance(d, list):
-            raise Unknown("pr files", repo, None, "malformed")
-        return d
+        return self.pages(f"repos/{repo}/pulls/{number}/files", repo)
 
     # --- writes --------------------------------------------------------------
     def comment(self, repo: str, number: int, body: str) -> None:
         self.call(["gh", "pr", "comment", str(number), "--repo", repo, "--body", body], repo)
 
     def comments(self, repo: str, number: int) -> list[str]:
-        d = self.json(["gh", "api", "--paginate", f"repos/{repo}/issues/{number}/comments"], repo)
-        if not isinstance(d, list):
-            raise Unknown("comments", repo, None, "malformed")
+        d = self.pages(f"repos/{repo}/issues/{number}/comments", repo)
         return [c.get("body") or "" for c in d if isinstance(c, dict)]
 
     def comment_once(self, repo: str, number: int, marker: str, body: str) -> None:
@@ -191,9 +195,21 @@ class GitHub:
         self.call(["gh", "pr", "create", "--repo", repo, "--base", BRANCH, "--head", head, "--title", title,
                    "--body", body], repo)
 
-    def merge_pr(self, repo: str, number: int, head_sha: str) -> None:
-        self.call(["gh", "pr", "merge", str(number), "--repo", repo, "--merge", "--match-head-commit", head_sha],
-                  repo)
+    def merge_pr(self, repo: str, number: int, head_sha: str) -> str:
+        """Merge now or not at all (Sol B4): the REST merge endpoint with
+        ``sha`` merges synchronously at exactly that head, or refuses (405
+        not mergeable, 409 head moved). Unlike ``gh pr merge`` it never adds
+        the PR to a merge queue or turns on auto-merge, so no merge can land
+        later, after the runner has stopped looking. Returns the merge
+        commit. An answer that is not ``merged: true`` with a SHA is a
+        refusal; no answer is Unknown (the caller reconciles)."""
+        d = self.json(["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/{number}/merge", "-f", f"sha={head_sha}",
+                       "-f", "merge_method=merge"], repo)
+        if not isinstance(d, dict):
+            raise Unknown("merge", repo, None, "malformed answer")
+        if d.get("merged") is not True or not SHA_RE.match(str(d.get("sha") or "")):
+            raise Refused("merge", repo, None, f"not merged: {str(d.get('message'))[:200]}")
+        return d["sha"]
 
 
 def slug(repo: str) -> str:

@@ -18,7 +18,9 @@ Refused (exit 1, nothing merged) unless:
   lists both sides of a rename, so moving ``CHARTER.md`` or ``default.xml``
   into ``qa/`` is refused (S-B3).
 
-Then ``gh pr merge <n> --merge --match-head-commit <reviewed head>``.
+Then the synchronous REST merge at the reviewed head (``GitHub.merge_pr``:
+``PUT repos/{repo}/pulls/<n>/merge`` with ``sha``; never a merge queue or
+auto-merge).
 """
 
 from __future__ import annotations
