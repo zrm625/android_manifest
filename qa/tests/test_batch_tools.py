@@ -13,8 +13,7 @@ from unittest import mock
 
 import _path  # noqa: F401
 from batchfakes import FakeGH
-from benchhome import bench_home
-from riverbatch import paths, records, tc, tooling
+from riverbatch import paths, tc, tooling
 from test_batch_records import write_round
 
 HOLD = Path(paths.PKG / "hold.py")

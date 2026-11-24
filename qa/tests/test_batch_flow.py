@@ -158,7 +158,7 @@ class Crash(unittest.TestCase):
 
     def test_rescue_evidence_first(self):
         with bench_home() as h:
-            run = claim(["a"])
+            claim(["a"])
             with S.transaction() as st:
                 st["running"]["phase"] = "flashing"
                 st["running"]["attempt_id"] = None
@@ -179,7 +179,7 @@ class Crash(unittest.TestCase):
 
     def test_crash_mid_batch_rolls_back_and_voids(self):
         with bench_home() as h:
-            run = claim(["a"])
+            claim(["a"])
             with S.transaction() as st:
                 st["running"]["phase"] = "testing"
             write_json(h / "slot-state.json", {"pair": {"batch": "b0001"}})
