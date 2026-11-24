@@ -177,6 +177,56 @@ class PausedPass(unittest.TestCase):
             self.assertEqual(S.read()["reports_pending"], [])
 
 
+class BlockedTick(unittest.TestCase):
+    """Sol M12, I19: a blocked or not-qualified tick persists its blocker
+    and leaves a report, even when no batch ran."""
+
+    def tick(self, ctx, exc):
+        with mock.patch.object(C.Locks, "__enter__", lambda self: self), \
+                mock.patch.object(C.Locks, "release", lambda self: None), \
+                mock.patch.object(recover, "entry_point"), mock.patch.object(tick, "preflight", side_effect=exc):
+            return tick.tick(ctx, 1)
+
+    def test_blocked_tick_writes_the_blocker_report(self):
+        with bench_home() as h:
+            with S.transaction() as st:
+                S.add_report(st, "b0003")                            # I19: an older pending report
+            code, summary = self.tick(mk_ctx(), C.Blocked("only 12 GB free in $BENCH_HOME (floor 60 GB)"))
+            st = S.read()
+            self.assertEqual((code, summary["state"]), (C.EXIT_OK, "blocked"))
+            self.assertEqual(st["blocker"]["message"], "only 12 GB free in $BENCH_HOME (floor 60 GB)")
+            self.assertEqual(st["reports_pending"], [])
+            self.assertTrue((h / "runner/reports/b0003.html").exists())
+            page = (h / f"runner/reports/{st['blocker']['report']}.html").read_text()
+            self.assertIn("only 12 GB free", page)
+            n = len(list((h / "runner/reports").glob("blocked-*.html")))
+            self.tick(mk_ctx(), C.Blocked("only 12 GB free in $BENCH_HOME (floor 60 GB)"))
+            self.assertEqual(len(list((h / "runner/reports").glob("blocked-*.html"))), n)   # same blocker: once
+
+    def test_not_qualified_is_a_blocker_and_clears_when_preflight_passes(self):
+        with bench_home() as h:
+            self.tick(mk_ctx(), C.NotQualified("not qualified: harness_version changed since qualification"))
+            self.assertEqual(S.read()["blocker"]["kind"], "not-qualified")
+            self.assertTrue(list((h / "runner/reports").glob("not-qualified-*.html")))
+            with mock.patch.object(C.Locks, "__enter__", lambda self: self), \
+                    mock.patch.object(C.Locks, "release", lambda self: None), \
+                    mock.patch.object(recover, "entry_point"), \
+                    mock.patch.object(tick, "preflight", return_value={}), \
+                    mock.patch.object(tick, "next_batch", return_value=None):
+                tick.tick(mk_ctx(), 1)
+            self.assertIsNone(S.read()["blocker"])
+
+    def test_commit_stop_never_replaces_a_pause(self):
+        # Opus (I19 gap): the guard in commit_stop.
+        with bench_home():
+            with S.transaction() as st:
+                S.set_pause(st, "two voids in a row", step="void")
+            tick.commit_stop(C.Pause("a later reason"))
+            st = S.read()
+            self.assertEqual(st["pause"]["reason"], "two voids in a row")
+            self.assertEqual(st["reports_pending"], [])
+
+
 class Settle(unittest.TestCase):
     def setup_run(self, h, halt=True, unknown_since=None):
         write_json(h / "batches/b0001/batch.json", {

@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from riverqa import regression
-from riverqa.core import read_json
+from riverqa.core import now_iso, read_json
 
 from . import compose, eligibility, kb, merge, outcomes as O, paths, phases, recover, report, state as S, tc, \
     version
@@ -289,13 +289,31 @@ def merge_path(ctx: Ctx) -> None:
 # --- R8.1 the tick ------------------------------------------------------------------------------------
 
 def commit_stop(e: Stop) -> None:
+    """Commit how the tick stopped. HALT and a first pause are recorded with
+    a report; an existing pause is never replaced (I19). A blocked,
+    not-qualified or retry stop is persisted as the current ``blocker``, and
+    a new or changed blocker queues a report too (Sol M12), so a tick that
+    ran no batch still leaves a readable reason."""
     with S.transaction(e.kind, reason=e.message) as st:
         if isinstance(e, Halt):
             S.set_halt(st, e.message, e.step, e.advice)
             S.add_report(st, f"halt-{int(time.time())}")
-        elif isinstance(e, Pause) and not st.get("pause"):
-            S.set_pause(st, e.message, e.step, e.advice)
-            S.add_report(st, f"pause-{int(time.time())}")
+        elif isinstance(e, Pause):
+            if not st.get("pause"):
+                S.set_pause(st, e.message, e.step, e.advice)
+                S.add_report(st, f"pause-{int(time.time())}")
+        elif isinstance(e, (Blocked, NotQualified, Retry)):
+            old = st.get("blocker") or {}
+            if (old.get("kind"), old.get("message")) != (e.kind, e.message):
+                st["blocker"] = {"kind": e.kind, "message": e.message, "at": now_iso(),
+                                 "report": f"{e.kind}-{int(time.time())}"}
+                S.add_report(st, st["blocker"]["report"])
+
+
+def clear_blocker() -> None:
+    if S.read().get("blocker"):
+        with S.transaction("unblocked") as st:
+            st["blocker"] = None
 
 
 def tick(ctx: Ctx, max_batches: int) -> tuple[int, dict]:
@@ -320,6 +338,7 @@ def tick(ctx: Ctx, max_batches: int) -> tuple[int, dict]:
             recover.entry_point(ctx, setup=False)                              # 4
             for _ in range(max_batches):                                       # 5
                 pre = preflight(ctx)
+                clear_blocker()
                 run = next_batch(ctx, pre)
                 if run is None:
                     break

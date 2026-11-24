@@ -15,7 +15,8 @@ Schema (version 6)::
      "setup_wipe_seq": null, "rebaseline": null,
      "failure_history": {},       # canonical identity (sorted PR keys) -> [evidence], append-only (I13)
      "aliases": {},               # PR key -> change name, append-only (I13)
-     "cleanup": [], "reports_pending": [], "lease": null, "running": null, "entries": []}
+     "cleanup": [], "reports_pending": [], "lease": null, "running": null, "entries": [],
+     "blocker": null}             # why the last tick could not run a batch: {"kind", "message", "at", "report"}
 
 A cleanup item (R13.3, I12)::
 
@@ -59,7 +60,7 @@ def empty() -> dict:
             "halt": None, "pause": None, "last_error": None, "voids_in_a_row": 0, "last_fail": None,
             "strikes": {k: 0 for k in STRIKES}, "setup_wipe_seq": None, "rebaseline": None,
             "failure_history": {}, "aliases": {}, "cleanup": [], "reports_pending": [],
-            "lease": None, "running": None, "entries": []}
+            "lease": None, "running": None, "entries": [], "blocker": None}
 
 
 def _parse(text: str) -> dict:

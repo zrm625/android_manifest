@@ -231,6 +231,7 @@ def status(as_json: bool) -> str:
     waiting = S.waiting_on_zak(st)
     if as_json:
         return json.dumps({"waiting_on_zak": waiting, "halt": st.get("halt"), "pause": st.get("pause"),
+                           "blocker": st.get("blocker"),
                            "running": st.get("running"), "lease": st.get("lease"), "cleanup": st.get("cleanup"),
                            "entries": [{k: e.get(k) for k in ("name", "status", "position", "flags", "reason",
                                                               "batch", "status_at")} for e in st.get("entries", [])]},
@@ -238,6 +239,9 @@ def status(as_json: bool) -> str:
     lines = ["Waiting on Zak:"] + ([f"  - {w}" for w in waiting] or ["  (nothing)"])
     run = st.get("running")
     lines.append(f"Running: {run['id']} ({run['purpose']}, phase {run['phase']})" if run else "Running: none")
+    if st.get("blocker"):
+        b = st["blocker"]
+        lines.append(f"Blocked since {b.get('at')}: {b.get('kind')}: {b.get('message')}")
     if st.get("lease"):
         lines.append(f"Tree lease: {st['lease']['batch']} (do not sync, check out or merge into river-22.2)")
     lines.append("Queue:")

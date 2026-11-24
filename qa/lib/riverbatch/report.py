@@ -37,6 +37,9 @@ def render(rid: str, st: dict) -> str:
              f"<title>River batch {e(rid)}</title><style>{CSS}</style><h1>River batch report: {e(rid)}</h1>",
              f"<p>Written {e(now_iso())}.</p>", "<div class=zak><h2>Waiting on Zak</h2>"]
     parts.append("<ul>" + "".join(f"<li>{e(w)}</li>" for w in waiting) + "</ul>" if waiting else "<p>Nothing.</p>")
+    b = st.get("blocker")
+    if b:
+        parts.append(f"<p><b>No batch runs: {e(b.get('kind'))}</b> since {e(b.get('at'))}: {e(b.get('message'))}</p>")
     for c in st.get("cleanup") or []:
         parts.append(f"<p>Cleanup owed for {e(c['batch'])}: branches {e(sorted(c.get('branch_repos') or {}))}, "
                      f"PRs {e(c.get('pr_repos'))}</p>")
