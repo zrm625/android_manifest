@@ -4,8 +4,8 @@ This tree is **zrm625's fork** of LineageOS 22.2 for the Moto G7 (`river`). The
 `repo` manifest is [zrm625/android_manifest](https://github.com/zrm625/android_manifest).
 The aim is a stripped-down build. Removing projects and features is expected.
 
-Goals, the must-work list, and the batch pipeline rules (council approval,
-queue, merge) are in [CHARTER.md](CHARTER.md). Read it before you change
+Goals, the must-work list, and how a change is tried and kept are in
+[CHARTER.md](CHARTER.md). The list of tries is [TRIES.md](TRIES.md). Read the charter before you change
 anything.
 
 The start-here guide for building, installing on the phone, and using the
@@ -47,39 +47,28 @@ $S/change start <name>                  # branch <name> from river-22.2 in every
 # ...edit and commit in whichever repos need it...
 $S/change status                        # which repos have commits, uncommitted files, PRs
 $S/change pr -t "<title>" -b "<why>"    # push, open/update one PR per repo, cross-link them all
-# ...council review (three providers approve the exact heads)...
-$S/batch enqueue --record <record.json> # an image change ends here; the batch runner merges it
+# ...build, flash --wipe, phone-setup, phone-qa --quick, device-bench current...
+# keep: merge each PR (gh pr merge N --repo zrm625/<repo> --merge --match-head-commit <sha>)
+# drop: close the PRs; either way write the result in TRIES.md
 ```
 
 Re-run `change pr` after more commits; it pushes and refreshes the PR
 descriptions. Write the test plan once in `-b` or `-F file`; every PR gets it,
 plus its own commit list and links to the others.
 
-**Every image change ends at `batch enqueue`** (qa/RUNNER.md). The batch
-runner builds, flashes, benches, sets up and QAs it with other changes, and
-merges it through one batch PR per repo when the batch is clean. Never merge
-an image change yourself, in the CLI or the GitHub web UI.
+**Every image change is a try** (CHARTER.md, "Pipeline: tries"). It is kept
+and merged only after its image passed `phone-qa --quick` on the phone with
+boot time and RAM no worse; otherwise it is dropped. Record either outcome in
+TRIES.md.
 
-- `change merge NAME --record FILE` is only for a **council-reviewed,
-  tooling-only manifest PR** (`qa/`, `scripts/`, `workspace/`, `*.md` other
-  than `CHARTER.md`), and only after charter PR #11 is merged; until then Zak
-  merges every tooling PR. Without `--record` it refuses in every repo.
 - `change start|pr|merge|tag`, `merge-upstream` and `setup-forks` take the
-  build lock and wait (exit 1) while a build or a batch holds it, or while
-  `batch status` shows a running batch or a tree lease. Try again later.
-- Never push to `batch/*` branches, and never pass `--zak` to any command:
-  those are Zak's.
-- While `batch status` shows a batch or a tree lease: never `repo sync`, never
-  check out anything in a fork, never merge into `river-22.2`.
+  build lock and wait (exit 1) while a build holds it. Try again later.
+- Never pass `--zak` to any command: those are Zak's.
 - Return every fork to `river-22.2` when you finish (`git checkout
-  river-22.2`); the runner's tree check refuses a tree left on a topic branch.
+  river-22.2`).
 - **When your dev work on the phone ends, return the phone to known-good with
-  `scripts/flash --rollback`** (it wipes userdata), then `phone-setup`. The
-  runner refuses to run while the phone runs a dev build.
-- `failed` queue entries are decided by the tester thread (`batch requeue` or
-  `batch tried`, with a reason that names the evidence), never by hand.
-- Never `podman image prune` the `lineageos-bench` images: a new image ID
-  stops every batch until the runner is qualified again.
+  `scripts/flash --rollback`** (it wipes userdata), then `phone-setup`.
+- Never `podman image prune` the `lineageos-bench` images.
 
 For a one-off PR by hand, always name the repo and base explicitly:
 
@@ -98,21 +87,20 @@ gh pr create --repo zrm625/<repo> --base river-22.2
 
 - `river-22.2` is the long-lived branch in every fork and in the manifest.
 - Do work on a topic branch made from `river-22.2` (`change start`), open pull
-  requests (`change pr`), and after the council approves, queue it with
-  `batch enqueue`. The batch runner merges it.
+  requests (`change pr`), test it on the phone, and merge it if it is kept.
 - Never rebase or force-push `river-22.2`. Upstream is merged in, not rebased,
   so published history stays stable.
 
 ## Pull in upstream changes
 
-Upstream merges go through the same queue as every change:
+Upstream merges are tries like every other change:
 
 ```sh
 S=.repo/manifests/scripts
 $S/change start upstream-YYYYMM                  # the topic branch in every fork
 $S/merge-upstream                                # merge each fork's upstream into it
 $S/merge-upstream kernel/motorola/sdm632         # or one project
-$S/change pr -t "Upstream YYYY-MM"               # then the council, then batch enqueue
+$S/change pr -t "Upstream YYYY-MM"               # then try it like any change
 ```
 
 The script reads each fork's upstream from the `UPSTREAM_REPO` and
@@ -165,12 +153,11 @@ The goal is to cut build time and image size against a frozen baseline.
   after every flash (add `--wait` straight after one). It must pass before you
   open pull requests. The full edit-build-flash-check loop is in
   `~/git/river/AGENTS.md` under "Build and run a change".
-- **QA harness:** `phone-qa` is the gate for automatic batch merges. Its usage
+- **QA harness:** `phone-qa --quick` gates every try; the full run is daily. Its usage
   is in `.repo/manifests/qa/README.md` and its design in `qa/DESIGN.md`. Unit
   tests: `python3 -I -m unittest discover -s .repo/manifests/qa/tests -t .repo/manifests/qa/tests`.
-- **Batch runner:** `.repo/manifests/scripts/batch` builds, tests and merges
-  queued changes; `batch status` shows the queue, the running batch and what
-  waits on Zak. Design and rules: `.repo/manifests/qa/RUNNER.md`.
+- **Batch runner:** `.repo/manifests/scripts/batch` and `qa/RUNNER.md` are
+  not used under the tries pipeline. Leave them as they are.
 - The test phone is the USB Moto G7 only. Never run adb or fastboot commands
   against any other device, such as the Pixel on wireless adb. Always pass
   `-s ZY225DPT7F`.

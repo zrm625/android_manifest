@@ -9,15 +9,15 @@ these rules on 2026-11-23. Change them only in a pull request that Zak approves.
 | Goal | Target | How it is measured |
 | --- | --- | --- |
 | RAM | At most 1,000 MB used (1,233 MB on 2026-11-23) | `device-bench` "used RAM", taken after a boot on a freshly wiped phone. See [Measuring RAM](#measuring-ram). |
-| Must-work list | Every item passes | `phone-qa` (the QA harness) on every batch. |
-| Autonomy | No hands | Build, flash, set up, QA, then merge or send back, with no one at the phone. |
+| Must-work list | Every item passes | `phone-qa --quick` on every try, the full `phone-qa` daily. |
+| Autonomy | No hands | Build, flash, set up, QA, then keep or drop, with no one at the phone. |
 | No regressions | Boot ≤ 55 s; RAM no worse; `/system` no bigger unless RAM went down | See [Regressions](#regressions). |
-| Stay current | Monthly | Security patches and upstream LineageOS merges go through the same queue. Moving the pinned projects in `default.xml` is done by hand for now (see [Tooling changes](#tooling-changes)). |
+| Stay current | Monthly | Security patches and upstream LineageOS merges go through the same queue. Moving the pinned projects in `default.xml` is a try like any other. |
 
 ### Measuring RAM
 
-- Each batch measures RAM after one boot.
-- Once a batch gets to 1,050 MB or less, measure three boots and use the median.
+- Each try measures RAM after one boot.
+- Once a try gets to 1,050 MB or less, measure three boots and use the median.
 - A boot takes several minutes, so don't measure more often than that.
 
 ### Regressions
@@ -28,18 +28,19 @@ these rules on 2026-11-23. Change them only in a pull request that Zak approves.
   minutes, and is only recorded.
 - **RAM:** no worse than the reference. The reference is the lowest
   three-boot median of any known-good build. If one boot comes out more than
-  10 MB over the reference, measure three boots. The batch fails if the median
+  10 MB over the reference, measure three boots. The try fails if the median
   is more than 5 MB over the reference. This allows for measurement noise.
 - **Size:** `/system` and `/vendor` may not grow compared with the latest
-  known-good build, unless the same batch lowers the RAM median below the
+  known-good build, unless the same try lowers the RAM median below the
   reference. This applies to upstream merges as well.
 
-Low-RAM mode (`ro.config.low_ram`) is an experiment. Run it in its own batch
+Low-RAM mode (`ro.config.low_ram`) is an experiment. Run it as its own try
 and record the result, but don't merge it. Zak decides whether it ships.
 
 ## Must-work list
 
-Every batch must pass all of these. "Auto" means adb does the check by itself.
+Every try must pass all of these that `phone-qa --quick` checks, and the
+daily full run checks all of them. "Auto" means adb does the check by itself.
 "Fixture" means a check that needs something on the desk. "Build check"
 means QA inspects the build output, not the phone.
 
@@ -75,7 +76,7 @@ QA installs the sideloaded apps from pinned APKs in
 from pkgs.tailscale.com, and T3 Code from its nightly Android builds. Update
 an app by replacing its APK and its pinned hash in one change. If an app's APK
 can no longer be found, drop the app from this list instead of failing
-batches.
+tries.
 
 Not on the list, and not checked:
 
@@ -97,57 +98,47 @@ The river has three cameras: the rear main, the rear depth, and the front.
   black. The front and depth cameras must deliver frames that change from
   frame to frame at maximum exposure, which shows the sensor and pipeline
   work. A black photo from those two is noted in the report but doesn't fail
-  the batch.
-- A change that changes which cameras are switched on never merges
-  automatically. Zak merges it by hand. Then a new baseline is run, which
-  records the new camera set and keeps the lowest known-good RAM reference.
-  The new baseline changes the QA harness version, so the harness is
-  qualified again before the next batch.
+  the try.
+- A change that changes which cameras are switched on is never kept
+  automatically. Zak merges it by hand.
 
-## Pipeline
+## Pipeline: tries
 
-Building and testing are the bottleneck, so changes are tested in batches.
+Zak changed the pipeline on 2026-11-23: the build is the bottleneck, so work
+is a list of things to try, paced by compile time. The council, the batch
+runner and the harness qualification (calibrations, controls, `batch
+qualify`) are no longer part of it.
 
-1. **Council.** Every change goes to a council: three reviewers from three
-   different AI providers. All three must approve it. If any one objects, the
-   change goes back to be fixed.
-2. **Queue.** A change can join the queue only after the council approves it.
-   The queue is a local file on the workstation, and the tester owns it.
-3. **Batch.** The tester builds the queued changes together. Then it wipes and
-   flashes the phone, sets it up, runs the full QA, and measures it. Wiping the
-   phone for every batch is fine.
-4. **Clean batch.** If everything passes, the tester merges every change in the
-   batch and tags the known-good state. Zak doesn't have to approve anything
-   else. The tester merges through one batch pull request per repo, holding
-   exactly the commits that were tested, and closes the changes' own pull
-   requests as merged.
-5. **Failed batch.**
-   - A batch of several changes is split: each change is tested again on its
-     own, in its own batch.
-   - When a change fails on its own, the tester reads the evidence and finds
-     out why. If the change caused it, the tester marks it as tried and
-     records how it failed; it is queued again once it is fixed and the
-     council has approved the fix. If the phone, the desk or the workstation
-     caused it, the change goes back into the queue. After a change's third
-     failure, only Zak can put it back in the queue.
-   - If several different changes fail the same way in a row, the tester
-     stops and reports a likely problem with the desk or the workstation.
+1. **List.** Every idea is a row in [TRIES.md](TRIES.md): what it changes,
+   why, and later its result. The tester owns the list and picks the order,
+   cheapest and most promising first.
+2. **Try.** A try is a topic branch from `river-22.2` (`change start`), with
+   PRs to the zrm625 repos. Several small tries can share one build.
+3. **Build while testing.** The next try builds (`scripts/build`, incremental)
+   while the phone tests the last one, so the phone never waits for a review.
+4. **Test.** Flash the try's images with a wipe to the slot that isn't
+   known-good, run `phone-setup`, `phone-qa --quick`, then `device-bench
+   current` for RAM and boot time.
+5. **Keep or drop.**
+   - **Keep** when QA passes, boot is 55 s or less and RAM is no worse (see
+     [Regressions](#regressions); measure three boots when one boot is within
+     10 MB of the reference). The tester merges the try's PRs into
+     `river-22.2` and writes the result in TRIES.md.
+   - **Drop** when any of that fails. The tester writes why in TRIES.md and
+     closes the PRs. A try comes back only with a fix for the reason it failed.
+6. **Full check.** Once a day, the merged `river-22.2` gets a full
+   `phone-qa` run. If something on the must-work list broke, the tester
+   finds the try that broke it among that day's kept tries and reverts it.
+7. **Second opinion.** A change that touches signing keys, permissions,
+   SELinux or hidden-API exemptions gets one reviewer from another AI provider
+   before it is kept. Nothing else waits for a review.
 
-### Tooling changes
-
-The QA harness and the batch tools can't be tested by the batch they run.
-Changes to them (`qa/`, `scripts/`, `workspace/` and other tooling in the
-manifest repo, never `default.xml`) go through the council as a code review.
-After all three approve, they are merged by hand with `change merge`, and the
-harness or batch tools are qualified again before the next batch.
-
-For now, moving the pinned upstream projects in `default.xml` is also done by
-hand, with a council review and a new baseline, until the batch tools can test
-manifest changes.
+The phone goes back to known-good (`flash --rollback`, then `phone-setup`)
+whenever the tester stops.
 
 ### What still needs Zak
 
-These need Zak's approval even when the council has approved the change:
+These need Zak's approval:
 
 - Removing anything on the must-work list.
 - Forking `frameworks/base` or another upstream project.
@@ -160,22 +151,17 @@ These need Zak's approval even when the council has approved the change:
 
 - **Recovering from a bad flash.** `flash` writes the inactive A/B slot, so the
   previous system stays there as a fallback. If a build doesn't boot, the
-  tester switches back to the old slot over fastboot, and marks the batch as
-  failed.
+  tester switches back to the old slot over fastboot and drops the try.
 - **The phone stays on USB.** If the phone hangs and stops answering on USB,
   someone has to hold the power button. When that happens the tester stops and
   tells Zak.
-- **Known-good tags.** Every clean batch gets a tag, so there is always a
-  recent build that works.
-- **Reports.** After every batch Zak gets a short summary, as an HTML page. It
-  also lists anything that is waiting on Zak.
+- **Reports.** TRIES.md is the record. Zak gets a short summary of kept and
+  dropped tries, and anything waiting on Zak, at the end of each session.
 
 ## Order of work
 
-1. The QA harness, `phone-qa`. This is the first task to go through the council.
-2. The queue and batch tools: batch branches in the main tree (a second
-   checkout would need a cold build), the batch runner, and slot rescue.
-3. The tester thread.
-4. Perch through the council, then the first real batch.
-5. Per-camera build switches.
-6. RAM work toward 1 GB, then the backlog for removing compatibility code.
+1. Perch and the GPS fix, the first tries.
+2. RAM work toward 1 GB.
+3. Better UI.
+4. Per-camera build switches.
+5. The backlog for removing compatibility code.
