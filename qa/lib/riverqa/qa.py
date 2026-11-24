@@ -37,7 +37,8 @@ WATCHED_PROCS = {
     "system_server": "system_server",
     "cameraserver": "cameraserver",
     "audioserver": "audioserver",
-    "camera_provider": "android.hardware.camera.provider@2.4-service",
+    # No camera_provider: the lazy camera HAL (sdm632-common #4) starts and
+    # exits on demand. final.hal_deaths still catches a crashing HAL.
     "audio_hal": "android.hardware.audio.service",
     "fingerprint_hal": "android.hardware.biometrics.fingerprint@2.1-service-ets",
 }
