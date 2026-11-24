@@ -253,7 +253,11 @@ def add_report(st: dict, rid: str) -> None:
 
 
 def set_pause(st: dict, reason: str, step: str | None = None, advice: str | None = None) -> None:
+    """Set the pause and queue its report in the same transaction (Sol SM8:
+    no pause is ever written without one)."""
+    import time
     st["pause"] = {"at": now_iso(), "step": step, "reason": reason, "message": reason, "advice": advice}
+    add_report(st, f"pause-{int(time.time())}")
 
 
 def set_halt(st: dict, reason: str, step: str | None = None, advice: str | None = None) -> None:

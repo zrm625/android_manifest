@@ -171,7 +171,12 @@ def settle(ctx: Ctx, bid: str) -> dict:
             st2["halt"] = None
             st2["lease"] = st2["lease"] if st2["lease"] and st2["lease"]["batch"] != bid else None
             S.add_report(st2, f"settle-{bid}")
+            # Opus minor: a settle never closes change PRs (R10.7 runs only on
+            # the forward path); the report lists the merged members' ones.
+            left_open = sorted(p["key"] for m in r["members"] for e in [S.member_entry(st2, r, m)] if e
+                               and e["status"] == "merged" for p in e["prs"])
             st2.setdefault("settles", {})[bid] = {
+                "change_prs_open": left_open,
                 "at": now_iso(), "promoted": promoted, "known_good_written": kw_written,
                 "landed": {k: v[0] for k, v in landed.items()}, "tags": tags, "rebaseline": rebaseline,
                 "drifted": drifted,

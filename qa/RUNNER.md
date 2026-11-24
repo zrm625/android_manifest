@@ -1596,6 +1596,17 @@ batch's checks, and the tester's decision once made; boot, RAM and size
 against known-good; the phone's known-good slot, tag and any pair; the queue
 (next up, solo, `failed`, `tried`, `needs-reapproval`).
 
+Every run's outcome is kept in `batches/<id>/outcome.json` (Sol SM8),
+written when the outcome is committed (phase 10) and again when the run ends
+(abort, finish): class, reason, checks and evidence, QA result, the
+candidate's bench rows, and the known-good reference it was decided against
+(kept from the first write). A split, a void or an experiment therefore
+keeps its evidence after `running` is cleared, and the report renders it,
+with each experiment member's result. Every pause, whoever sets it, queues a
+report in the same transaction (`state.set_pause`). A cleanup refusal counts
+once per tick (`refusal_tick`), however often the entry point runs cleanup
+in it. A settle's report lists the change PRs it left open.
+
 R15.2. **Retention**, at finish: delete `batches/<id>/images/` older than 7
 days, except batches named by `known-good.json` `latest`, `slot-state.json`,
 `running` or a `failed` entry's newest evidence. Keep `batch.json`,

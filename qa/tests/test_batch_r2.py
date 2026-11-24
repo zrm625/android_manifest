@@ -938,3 +938,85 @@ class LogRetention(unittest.TestCase):
             self.assertEqual([f.exists() for f in logs], [False, False])
             self.assertTrue(fresh.exists())
             self.assertTrue((h / "batches/kg-1/images").exists())      # images of a protected batch stay
+
+
+# --- Sol SM8: reports keep the evidence ----------------------------------------------------------------
+
+class ReportEvidence(unittest.TestCase):
+    ROWS = [{"run_id": "bench-1", "host_boot_seconds": "31.5", "used_ram_kb": str(900 * 1024),
+             "system_used_kb": "100", "vendor_used_kb": "50"}]
+
+    def run_split(self, h, purpose="batch", outcome=None):
+        from batchfakes import FakeTools, mk_ctx, write_json
+        from riverbatch import report, tick
+        from test_batch_flow import claim, steps
+        write_json(h / "slot-state.json", {"pair": {"batch": "b0001", "attempts": ["fa-1"]}})
+        write_json(h / "qa/known-good.json", {"latest": {"batch": "kg", "tag": "known-good-b0000",
+                                                         "host_boot_seconds": 30.0},
+                                              "ram_reference": {"median_mb": 880.0}})
+        write_json(h / "batches/b0001/batch.json", {"batch": "b0001", "flash_attempt": "fa-1",
+                                                    "bench_runs": ["bench-1"]})
+        run = claim(["a", "b"] if purpose == "batch" else ["a"], purpose=purpose)
+        outcome = outcome or {"class": "fail", "checks": ["apps.camera"],
+                              "evidence": {"step": "qa", "run_ids": ["qa-9"], "report": "/x/qa/runs/qa-9/report.html"}}
+        ps = steps(outcome) + [mock.patch("riverqa.bench.attempt_rows", return_value=self.ROWS)]
+        for p in ps:
+            p.start()
+        try:
+            tick.run_batch(mk_ctx(tools=FakeTools()), run, {"latest": {"cameras": [0, 1, 2]}})
+            report.flush()
+        finally:
+            mock.patch.stopall()
+
+    def test_a_split_keeps_its_qa_evidence_measurements_and_reference(self):
+        from riverbatch import state as S
+        with bench_home() as h:
+            self.run_split(h)
+            st = S.read()
+            self.assertIsNone(st["running"])
+            self.assertEqual([e["status"] for e in st["entries"]], ["queued", "queued"])      # split
+            snap = json.loads((h / "batches/b0001/outcome.json").read_text())
+            self.assertTrue(snap["final"])
+            self.assertEqual(snap["outcome"]["evidence"]["run_ids"], ["qa-9"])
+            self.assertEqual(snap["measurements"][0]["run_id"], "bench-1")
+            self.assertEqual(snap["reference"]["ram_reference"]["median_mb"], 880.0)
+            html = (h / "runner/reports/b0001.html").read_text()
+            for want in ("qa-9/report.html", "apps.camera", "bench-1", "31.5", "880.0", "known-good-b0000"):
+                self.assertIn(want, html)
+
+    def test_an_experiment_result_is_rendered(self):
+        with bench_home() as h:
+            self.run_split(h, purpose="experiment",
+                           outcome={"class": "pass", "evidence": {"step": "qa", "run_ids": ["qa-5"]}})
+            html = (h / "runner/reports/b0001.html").read_text()
+            self.assertIn("Experiment result: a", html)
+            self.assertIn("qa-5", html)
+
+    def test_a_pause_written_by_an_outcome_queues_its_report(self):
+        from riverbatch import outcomes as O
+        from riverbatch import state as S
+        st = S.empty()
+        st["voids_in_a_row"] = 1
+        O.apply(st, {"id": "b0002", "purpose": "batch", "members": []}, {"class": O.VOID, "reason": "x"})
+        self.assertTrue(st["pause"])
+        self.assertTrue(any(r.startswith("pause-") for r in st["reports_pending"]))
+
+    def test_cleanup_refusals_count_once_per_tick(self):
+        from batchfakes import FakeGH, mk_ctx
+        from riverbatch import ctx as C, merge, recover
+        from riverbatch import state as S
+        with bench_home():
+            R = merge.slugs()["device/motorola/river"]
+            with S.transaction() as st:
+                st["cleanup"] = [S.cleanup_item("b0001", {"device/motorola/river": "a" * 40})]
+            gh = FakeGH()
+            gh.fail["pr_list"] = C.Refused("pr list", R, 404, "Not Found")
+            ctx = mk_ctx(gh=gh)
+            ctx.tick_id = "tick-1"
+            for _ in range(3):                                   # the entry point runs it several times a tick
+                recover.cleanup_items(ctx)
+            self.assertEqual(S.read()["cleanup"][0]["refusals"], 1)
+            self.assertIsNone(S.read()["pause"])
+            ctx.tick_id = "tick-2"
+            recover.cleanup_items(ctx)
+            self.assertEqual(S.read()["cleanup"][0]["refusals"], 2)

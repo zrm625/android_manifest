@@ -14,7 +14,7 @@ import time
 from riverqa import fbmode, journal as jmod, slots
 from riverqa.core import now_iso
 
-from . import kb, merge, outcomes as O, paths, phases, state as S, version
+from . import kb, merge, outcomes as O, paths, phases, report, state as S, version
 from .ctx import (AuthRefused, Blocked, Ctx, Halt, Pause, Refused, Retry, Unknown, commit_phase)
 
 MANIFEST = merge.MANIFEST
@@ -113,6 +113,7 @@ def abort(ctx: Ctx, extra_pause: str | None = None) -> None:
             outcome = {"class": O.VOID, "reason": tree_pause}
         before = st.get("pause")
         O.apply(st, run, outcome)
+        applied = (dict(run), dict(outcome))
         # A cause this abort knows (a disturbed tree, a GitHub auth refusal)
         # names the pause, over a generic one apply() set in this same
         # transaction (Gemini minor); a pause from before is never replaced.
@@ -122,6 +123,7 @@ def abort(ctx: Ctx, extra_pause: str | None = None) -> None:
                 break
         st["running"] = None
         S.add_report(st, bid)
+    report.snapshot(ctx, applied[0], applied[1], final=True)
     merge.prune_local(ctx, bid, run.get("touched") or [])
     if tree_pause or extra_pause or outcome.get("pause"):
         raise Pause(tree_pause or extra_pause or outcome.get("pause"))
@@ -139,7 +141,9 @@ def commit_outcome(ctx: Ctx, outcome: dict) -> dict:
         run["outcome"] = outcome
         run["phase"] = "decided"
         run["intent"] = None
-        return outcome
+        snap = dict(run)
+    report.snapshot(ctx, snap, outcome, final=False)        # Sol SM8: the evidence outlives running
+    return outcome
 
 
 def forward(ctx: Ctx, local_only: bool = False) -> str:
@@ -215,6 +219,8 @@ def finish_merged(ctx: Ctx) -> None:
         st["last_fail"] = None
         st["running"] = None
         S.add_report(st, bid)
+        done = dict(r)
+    report.snapshot(ctx, done, dict(done.get("outcome") or {"class": O.PASS}, merged=True), final=True)
     merge.prune_local(ctx, bid, run["touched"])
     retention(ctx)
 
@@ -440,8 +446,13 @@ def cleanup_items(ctx: Ctx) -> None:
             with S.transaction("cleanup-refused", batch=bid) as st2:
                 it = next((c for c in st2["cleanup"] if c["batch"] == bid), None)
                 if it is not None:
-                    it["refusals"] = it.get("refusals", 0) + 1 if it.get("last_refusal") == str(e) else 1
+                    same = it.get("last_refusal") == str(e)
+                    # Sol SM8: one count per tick, however often the entry
+                    # point runs cleanup within it.
+                    if not (same and ctx.tick_id and it.get("refusal_tick") == ctx.tick_id):
+                        it["refusals"] = it.get("refusals", 0) + 1 if same else 1
                     it["last_refusal"] = str(e)
+                    it["refusal_tick"] = ctx.tick_id
                     if it["refusals"] >= 3:
                         third = True
                         S.set_pause(st2, f"cleanup of {bid}: the same refusal three ticks in a row: {e}",

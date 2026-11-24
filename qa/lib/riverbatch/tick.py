@@ -322,6 +322,7 @@ def clear_blocker() -> None:
 
 def tick(ctx: Ctx, max_batches: int) -> tuple[int, dict]:
     summary = {"ran": [], "state": "idle"}
+    ctx.tick_id = ctx.tick_id or f"{now_iso()}-{os.getpid()}"
     st = S.read()
     report.flush(ctx)                                                          # 1
     if st.get("halt"):

@@ -221,10 +221,11 @@ class BlockedTick(unittest.TestCase):
         with bench_home():
             with S.transaction() as st:
                 S.set_pause(st, "two voids in a row", step="void")
+            before = S.read()["reports_pending"]                      # the first pause's own report (Sol SM8)
             tick.commit_stop(C.Pause("a later reason"))
             st = S.read()
             self.assertEqual(st["pause"]["reason"], "two voids in a row")
-            self.assertEqual(st["reports_pending"], [])
+            self.assertEqual(st["reports_pending"], before)
 
 
 class Settle(unittest.TestCase):
