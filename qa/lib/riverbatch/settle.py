@@ -76,12 +76,14 @@ def settle(ctx: Ctx, bid: str) -> dict:
         b = ctx.batch_json(bid) or {}
         frozen = (b.get("merge_started") or {}).get("expected_prs") or {}
         sl = merge.slugs()
-        open_prs = {}
+        open_prs, merged_prs = {}, {}
         for p, e in frozen.items():
             if e.get("number") is not None:
                 v = ctx.gh.pr_view(e["repo"], e["number"])
                 if v.get("state") == "OPEN":
                     open_prs[p] = {"repo": e["repo"], "number": e["number"]}
+                elif v.get("state") == "MERGED":
+                    merged_prs[p] = {"repo": e["repo"], "number": e["number"]}
         branches = {}
         for p in run.get("touched") or []:
             sha = run["composed"][p]["sha"]
@@ -102,7 +104,13 @@ def settle(ctx: Ctx, bid: str) -> dict:
                 if how == "none":
                     e = S.entry(st, name)
                     rec, errs = records.load_bundle(name, e["record_sha256"])
-                    elig[name] = commands.eligibility_of(ctx, rec, errs)
+                    try:
+                        elig[name] = commands.eligibility_of(ctx, rec, errs)
+                    except Refused as ex:
+                        # Gemini GM6: river-22.2's camera set changed (or the
+                        # base cannot be read as one): the member waits for
+                        # Zak; the settle still finishes and owes the re-baseline.
+                        elig[name] = eligibility.Outcome(eligibility.WAITING, f"after the settle of {bid}: {ex}")
         anything_landed = any(how != "none" for how, _ in landed.values())
         rebaseline = (not promoted) and (anything_landed or bool(drifted))
         with S.transaction("settle", batch=bid) as st2:
@@ -132,8 +140,16 @@ def settle(ctx: Ctx, bid: str) -> dict:
                                      by="zak", action="settle")
             st2["cleanup"] = [c for c in st2["cleanup"] if c["batch"] != bid]
             if branches or open_prs:
-                st2["cleanup"].append({"batch": bid, "branch": f"batch/{bid}", "branch_repos": branches,
-                                       "pr_repos": open_prs})
+                # Sol M4: after a partial merge the open batch PRs and their
+                # tested branches are Zak's repair (merge them at their tested
+                # heads); nothing is closed or deleted while the re-baseline
+                # is owed. The ones that landed are expected (Opus OM3); every
+                # touched repo keeps its tested head (Sol M5).
+                hold = ({"settle": bid, "why": "partial merge: the open batch PRs are kept for Zak's repair until "
+                                               "the re-baseline"} if rebaseline and merged_prs and open_prs else None)
+                st2["cleanup"].append(S.cleanup_item(
+                    bid, {p: run["composed"][p]["sha"] for p in run.get("touched") or []}, branch_repos=branches,
+                    pr_repos=open_prs, expected_merged=merged_prs, hold=hold))
             if rebaseline:
                 st2["rebaseline"] = {"settle": bid, "at": now_iso(), "drifted": drifted,
                                      "landed": {k: v[0] for k, v in landed.items()}}

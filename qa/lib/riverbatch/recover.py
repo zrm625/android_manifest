@@ -198,7 +198,12 @@ def finish_merged(ctx: Ctx) -> None:
                 S.set_status(e, "merged", f"merged in {bid}")
         st["cleanup"] = [c for c in st["cleanup"] if c["batch"] != bid]
         if left:
-            st["cleanup"].append({"batch": bid, "branch": f"batch/{bid}", "branch_repos": left, "pr_repos": {}})
+            # Opus OM3: its batch PRs merged through the runner; cleanup must
+            # not take them for unexpected merges.
+            sl2 = merge.slugs()
+            landed = {p: {"repo": sl2[p], "number": n} for p, n in ((r.get("merge") or {}).get("prs") or {}).items()}
+            st["cleanup"].append(S.cleanup_item(bid, {p: r["composed"][p]["sha"] for p in r["touched"]},
+                                                branch_repos=left, expected_merged=landed))
             S.set_pause(st, f"batch/{bid} branch not at the composed SHA in {', '.join(left)}", step="cleanup")
         st["voids_in_a_row"] = 0
         st["last_fail"] = None
@@ -347,22 +352,43 @@ def paused_pass(ctx: Ctx) -> None:
 # --- R13.3 cleanup items (I12) -----------------------------------------------------------------
 
 def cleanup_items(ctx: Ctx) -> None:
+    """R13.3, I12: close the batch PRs found by exact head branch in every
+    touched repo, at the tested head recorded for that repo (Sol M5), and
+    delete the batch branches at their composed SHAs. A batch PR that
+    landed through the runner or a settle is expected (Opus OM3); a held
+    item waits for Zak's repair (Sol M4); after the hold, a batch PR that
+    was open at the settle and is now merged is Zak's repair."""
     st = S.read()
     sl = merge.slugs()
     for item in list(st["cleanup"]):
         bid = item["batch"]
+        hold = item.get("hold")
+        if hold and (st.get("rebaseline") or {}).get("settle") == hold.get("settle"):
+            ctx.note(f"cleanup of {bid} held: {hold.get('why')}")
+            continue
+        tested = item.get("tested") or {}
+        expected = dict(item.get("expected_merged") or {})
+        if hold:
+            expected.update(item.get("pr_repos") or {})
         problems, done = [], True
-        touched = sorted(set(item.get("branch_repos") or {}) | set(item.get("pr_repos") or {}))
+        touched = sorted(set(tested) | set(item.get("branch_repos") or {}) | set(item.get("pr_repos") or {})
+                         | set(item.get("expected_merged") or {}))
         try:
             for p in touched:                       # I12: by exact head branch in every touched repo
                 for pr in ctx.gh.pr_list(sl[p], f"batch/{bid}", "all"):
                     if pr.get("state") == "MERGED":
-                        raise Pause(f"batch PR {sl[p]}#{pr['number']} merged without the runner")
+                        if expected.get(p) == {"repo": sl[p], "number": pr.get("number")}:
+                            continue
+                        raise Pause(f"batch PR {sl[p]}#{pr['number']} merged without the runner", step="cleanup")
                     if pr.get("state") != "OPEN":
                         continue
-                    sha = (item.get("branch_repos") or {}).get(p)
+                    sha = tested.get(p)
+                    if not sha:
+                        problems.append(f"{sl[p]}#{pr['number']}: no tested head recorded for {p}; not closing it")
+                        done = False
+                        continue
                     if pr.get("headRefName") != f"batch/{bid}" or pr.get("baseRefName") != "river-22.2" \
-                            or pr.get("isCrossRepository") is not False or (sha and pr.get("headRefOid") != sha):
+                            or pr.get("isCrossRepository") is not False or pr.get("headRefOid") != sha:
                         problems.append(f"{sl[p]}#{pr['number']} does not match batch/{bid} at its composed head")
                         done = False
                         continue
@@ -375,16 +401,20 @@ def cleanup_items(ctx: Ctx) -> None:
                     problems.append(f"{sl[p]} batch/{bid} is not at the composed SHA {sha[:12]}")
                     done = False
         except AuthRefused as e:
-            raise Pause(f"GitHub auth: {e.repo}: {e.status}")
+            raise Pause(f"GitHub auth: {e.repo}: {e.status}", step="auth")
         except Refused as e:
+            third = False
             with S.transaction("cleanup-refused", batch=bid) as st2:
                 it = next((c for c in st2["cleanup"] if c["batch"] == bid), None)
                 if it is not None:
                     it["refusals"] = it.get("refusals", 0) + 1 if it.get("last_refusal") == str(e) else 1
                     it["last_refusal"] = str(e)
                     if it["refusals"] >= 3:
+                        third = True
                         S.set_pause(st2, f"cleanup of {bid}: the same refusal three ticks in a row: {e}",
                                     step="cleanup")
+            if third:                       # Gemini minor: the pause stops the tick
+                raise Pause(f"cleanup of {bid}: the same refusal three ticks in a row: {e}", step="cleanup")
             continue
         with S.transaction("cleanup", batch=bid, done=done) as st2:
             if done:
@@ -392,7 +422,7 @@ def cleanup_items(ctx: Ctx) -> None:
             elif problems:
                 S.set_pause(st2, f"cleanup of {bid}: " + "; ".join(problems[:4]), step="cleanup")
         if problems:
-            raise Pause(f"cleanup of {bid}: " + "; ".join(problems[:4]))
+            raise Pause(f"cleanup of {bid}: " + "; ".join(problems[:4]), step="cleanup")
 
 
 # --- R15.2 retention (I17) ------------------------------------------------------------------------

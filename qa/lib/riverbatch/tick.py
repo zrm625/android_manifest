@@ -252,9 +252,8 @@ def merge_path(ctx: Ctx) -> None:
         st["running"]["phase"] = "prs-open"
         st["running"]["reached_prs_open"] = True
         st["cleanup"] = [c for c in st["cleanup"] if c["batch"] != bid]
-        st["cleanup"].append({"batch": bid, "branch": f"batch/{bid}",
-                              "branch_repos": {p: run["composed"][p]["sha"] for p in run["touched"]},
-                              "pr_repos": {}})
+        tested = {p: run["composed"][p]["sha"] for p in run["touched"]}
+        st["cleanup"].append(S.cleanup_item(bid, tested, branch_repos=tested))
     merge.push_branches(ctx, run)
     commit_intent("open-prs", "no batch PRs", "one open batch PR per touched fork at the tested head")
     prs = merge.open_prs(ctx, run)

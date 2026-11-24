@@ -243,6 +243,39 @@ class Settle(unittest.TestCase):
             self.assertEqual(st["entries"][0]["status"], "merged")
             self.assertIsNone(st["rebaseline"])
 
+    def test_i11_promotion_record_is_the_local_proof(self):
+        """Opus (I11 gap): the merge commit is not in running.merge (flash
+        --promote ran by hand); the promotion record flash wrote into
+        batch.json is enough to write known-good.json before any GitHub call."""
+        import json
+        with bench_home() as h:
+            self.setup_run(h)
+            with S.transaction() as st:
+                st["running"]["merge"]["merged"] = {}
+            b = json.loads((h / "batches/b0001/batch.json").read_text())
+            b["promotion"] = {"at": "t", "merge_commits": {P: "9" * 40}}
+            (h / "batches/b0001/batch.json").write_text(json.dumps(b))
+            write_json(h / "slot-state.json", {"known_good": {"batch": "b0001"},
+                                               "history": [{"event": "promote", "batch": "b0001"}]})
+            write_json(h / "qa/known-good.json", {"latest": {"batch": "base", "commit_set": self.kg_commitset(h)},
+                                                  "ram_reference": {"median_mb": 900.0}})
+            gh = self.gh()
+            seen = []
+            orig = gh._f
+
+            def spy(name, *a):
+                if not seen:
+                    seen.append(json.loads((h / "qa/known-good.json").read_text())["latest"])
+                return orig(name, *a)
+            gh._f = spy
+            l1, l2 = self.locks()
+            rows = [{"run_id": "r1", "host_boot_seconds": "30", "system_used_kb": "1", "vendor_used_kb": "1",
+                     "used_ram_kb": str(900 * 1024)}]
+            with l1, l2, mock.patch("riverqa.bench.attempt_rows", return_value=rows):
+                settle.settle(mk_ctx(gh=gh), "b0001")
+            self.assertEqual(seen[0]["batch"], "b0001")
+            self.assertEqual(seen[0]["commit_set"][P], "9" * 40)
+
     def test_not_promoted_landed_owes_a_rebaseline(self):
         with bench_home() as h:
             self.setup_run(h)

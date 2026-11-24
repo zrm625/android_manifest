@@ -339,8 +339,65 @@ class Cleanup(unittest.TestCase):
 
     def item(self, h, **kw):
         with S.transaction() as st:
-            st["cleanup"] = [{"batch": "b0001", "branch": "batch/b0001", "branch_repos": {P: TESTED},
-                              "pr_repos": {}, **kw}]
+            st["cleanup"] = [dict(S.cleanup_item("b0001", {P: TESTED}, branch_repos={P: TESTED}), **kw)]
+
+    def test_pr_only_item_still_checks_the_tested_head(self):
+        """Sol M5, Gemini GM4: the branch is already gone (no branch_repos)
+        but the PR is open; it is closed only at the tested head."""
+        with bench_home() as h:
+            self.item(h, branch_repos={}, pr_repos={P: {"repo": R, "number": 8}})
+            gh = FakeGH()
+            gh.prs[(R, 8)] = {"state": "OPEN", "headRefName": "batch/b0001", "headRefOid": OTHER,
+                              "baseRefName": "river-22.2", "isCrossRepository": False}
+            with self.assertRaises(C.Pause):
+                recover.cleanup_items(mk_ctx(gh=gh))
+            self.assertEqual(gh.prs[(R, 8)]["state"], "OPEN")
+            gh.prs[(R, 8)]["headRefOid"] = TESTED
+            with S.transaction() as st:
+                st["pause"] = None
+            recover.cleanup_items(mk_ctx(gh=gh))
+            self.assertEqual(gh.prs[(R, 8)]["state"], "CLOSED")
+
+    def test_no_tested_head_never_closes(self):
+        with bench_home() as h:
+            self.item(h, tested={}, branch_repos={}, pr_repos={P: {"repo": R, "number": 8}})
+            gh = FakeGH()
+            gh.prs[(R, 8)] = {"state": "OPEN", "headRefName": "batch/b0001", "headRefOid": TESTED,
+                              "baseRefName": "river-22.2", "isCrossRepository": False}
+            with self.assertRaises(C.Pause) as cm:
+                recover.cleanup_items(mk_ctx(gh=gh))
+            self.assertIn("no tested head", cm.exception.message)
+            self.assertEqual(gh.prs[(R, 8)]["state"], "OPEN")
+
+    def test_expected_merged_batch_pr_is_not_a_pause(self):
+        """Opus OM3: the batch PR merged through the runner; its branch is
+        deleted, nothing pauses."""
+        with bench_home() as h:
+            self.item(h, expected_merged={P: {"repo": R, "number": 8}})
+            gh = FakeGH()
+            gh.prs[(R, 8)] = {"state": "MERGED", "headRefName": "batch/b0001", "headRefOid": TESTED,
+                              "baseRefName": "river-22.2", "isCrossRepository": False}
+            gh.tips[(R, "refs/heads/batch/b0001")] = TESTED
+            deleted = []
+            with mock.patch.object(merge, "remote_git", lambda ctx, path, *a: deleted.append(a)):
+                recover.cleanup_items(mk_ctx(gh=gh))
+            self.assertEqual(S.read()["cleanup"], [])
+            self.assertTrue(any(a[0] == "push" for a in deleted))
+
+    def test_third_same_refusal_pauses_and_stops(self):
+        with bench_home() as h:
+            self.item(h)
+            gh = FakeGH()
+            gh.prs[(R, 8)] = {"state": "OPEN", "headRefName": "batch/b0001", "headRefOid": TESTED,
+                              "baseRefName": "river-22.2", "isCrossRepository": False}
+            gh.fail["close_pr"] = C.Refused("pr close", R, 403, "nope")
+            recover.cleanup_items(mk_ctx(gh=gh))
+            gh.fail["close_pr"] = C.Refused("pr close", R, 403, "nope")
+            recover.cleanup_items(mk_ctx(gh=gh))
+            gh.fail["close_pr"] = C.Refused("pr close", R, 403, "nope")
+            with self.assertRaises(C.Pause):                        # Gemini minor: the tick stops here
+                recover.cleanup_items(mk_ctx(gh=gh))
+            self.assertIn("three ticks", S.read()["pause"]["reason"])
 
     def test_discovers_unsaved_pr_and_deletes_branch(self):
         with bench_home() as h:
