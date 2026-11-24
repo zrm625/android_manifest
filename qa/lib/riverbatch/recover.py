@@ -492,9 +492,10 @@ def retention(ctx: Ctx, now: float | None = None) -> list[str]:
     if root.is_dir():
         for d in sorted(root.iterdir()):
             img = d / "images"
-            if d.name in keep or not img.is_dir():
-                continue
-            if now - img.stat().st_mtime > 7 * 86400:
+            # Sol SM7: the exclusions (protected batches, no images left)
+            # apply to image deletion only; the log policy runs for every
+            # batch directory.
+            if d.name not in keep and img.is_dir() and now - img.stat().st_mtime > 7 * 86400:
                 shutil.rmtree(img, ignore_errors=True)
                 removed.append(str(img))
             logs = d / "runner-logs"

@@ -1599,7 +1599,9 @@ against known-good; the phone's known-good slot, tag and any pair; the queue
 R15.2. **Retention**, at finish: delete `batches/<id>/images/` older than 7
 days, except batches named by `known-good.json` `latest`, `slot-state.json`,
 `running` or a `failed` entry's newest evidence. Keep `batch.json`,
-`results.json` and all reports; build logs 30 days.
+`results.json` and all reports; build logs 30 days, for every batch
+directory, whether or not its images are gone or the batch is protected
+(those exclusions apply to images only; Sol SM7).
 
 ## 16. The tester thread
 

@@ -911,3 +911,30 @@ class ChangeMergeBranch(unittest.TestCase):
         self.assertNotIn("Merge these together with", body)
         self.assertNotIn('echo "Merge them all with: change merge', body)
         self.assertIn("batch enqueue --record", body)
+
+
+# --- Sol SM7: build logs go after 30 days, images or not -------------------------------------------
+
+class LogRetention(unittest.TestCase):
+    def test_old_build_logs_go_even_without_images_and_for_protected_batches(self):
+        from batchfakes import mk_ctx, write_json
+        from riverbatch import recover
+        with bench_home() as h:
+            write_json(h / "slot-state.json", {"known_good": {"batch": "kg-1"}})
+            write_json(h / "qa/known-good.json", {"latest": {"batch": "kg-1"}})
+            old = time.time() - 31 * 86400
+            logs = []
+            for b in ("b0001", "kg-1"):                      # b0001: images already gone; kg-1: protected
+                d = h / f"batches/{b}/runner-logs"
+                d.mkdir(parents=True)
+                f = d / "build-1.log"
+                f.write_text("x")
+                os.utime(f, (old, old))
+                logs.append(f)
+            (h / "batches/kg-1/images").mkdir()
+            fresh = h / "batches/b0001/runner-logs/build-2.log"
+            fresh.write_text("y")
+            recover.retention(mk_ctx())
+            self.assertEqual([f.exists() for f in logs], [False, False])
+            self.assertTrue(fresh.exists())
+            self.assertTrue((h / "batches/kg-1/images").exists())      # images of a protected batch stay
