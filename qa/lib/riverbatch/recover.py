@@ -389,17 +389,29 @@ def cleanup_items(ctx: Ctx) -> None:
         expected = dict(item.get("expected_merged") or {})
         if hold:
             expected.update(item.get("pr_repos") or {})
-        problems, done = [], True
+        problems, done, waiting = [], True, set()
+        landed_open = item.get("landed_open") or {}
         touched = sorted(set(tested) | set(item.get("branch_repos") or {}) | set(item.get("pr_repos") or {})
                          | set(item.get("expected_merged") or {}))
         try:
             for p in touched:                       # I12: by exact head branch in every touched repo
                 for pr in ctx.gh.pr_list(sl[p], f"batch/{bid}", "all"):
+                    ident = {"repo": sl[p], "number": pr.get("number")}
                     if pr.get("state") == "MERGED":
-                        if expected.get(p) == {"repo": sl[p], "number": pr.get("number")}:
+                        # Sol SM1: an expected merge counts only at the tested
+                        # head, into river-22.2, from the repo itself.
+                        if expected.get(p) == ident and pr.get("headRefOid") == tested.get(p) \
+                                and pr.get("baseRefName") == "river-22.2" and pr.get("isCrossRepository") is False:
                             continue
-                        raise Pause(f"batch PR {sl[p]}#{pr['number']} merged without the runner", step="cleanup")
+                        raise Pause(f"batch PR {sl[p]}#{pr['number']} merged without the runner (or not at its "
+                                    "tested head into river-22.2)", step="cleanup")
                     if pr.get("state") != "OPEN":
+                        continue
+                    if landed_open.get(p) == ident:
+                        # Landed, GitHub still says OPEN: wait for MERGED;
+                        # never close it or delete its branch (Sol SM1).
+                        waiting.add(p)
+                        done = False
                         continue
                     sha = tested.get(p)
                     if not sha:
@@ -415,6 +427,8 @@ def cleanup_items(ctx: Ctx) -> None:
                                         f"Batch {bid} did not merge; closing its PR.")
                     ctx.gh.close_pr(sl[p], pr["number"])
             for p, sha in sorted((item.get("branch_repos") or {}).items()):
+                if p in waiting:
+                    continue
                 res = merge.delete_branch(ctx, p, sl[p], bid, sha)
                 if res == "other":
                     problems.append(f"{sl[p]} batch/{bid} is not at the composed SHA {sha[:12]}")

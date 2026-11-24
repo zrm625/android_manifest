@@ -628,19 +628,23 @@ lock fds and `start_new_session=True`. The holder:
    blocks reading the pipe; on one byte it `exec`s the real command, so pid,
    pgid and start time do not change; on EOF (the holder died) it exits 1
    without `exec`;
-2. writes `runner/children/<pid>.json` (`cmd`, `pid`, `pgid`, host
+2. writes `runner/children/<pid>.json` (`cmd`, `pid`, `pgid`, `sid`, host
    `boot_id` from `/proc/sys/kernel/random/boot_id`, start time from
    `/proc/<pid>/stat` field 22) through a temp file named `.<pid>.tmp` and
    rename, and fsyncs it and the directory (readers list only names matching
    `^[0-9]+\.json$`, so a temp file never counts or blocks);
 3. writes one byte to the pipe, releasing the stub;
-4. waits for it, then SIGTERMs whatever is left in its process group,
-   SIGKILLs it after 10 s, reaps, deletes its file and exits with the child's
-   status. On SIGTERM it does the same at once.
+4. waits for it, then SIGTERMs whatever is left in its **session** (every
+   process group in it: GNU `timeout` without `--foreground` makes one),
+   SIGKILLs it after 10 s, reaps, and deletes its file only once no process
+   of the session is left (Sol SB2); it exits with the child's status. On
+   SIGTERM it does the same at once. `phone-setup` runs adb under
+   `timeout --foreground`, so adb stays in the tool's own group.
 
 **Live child records** (`riverqa.children`, H15): a file counts only if its
 `boot_id` is the current host boot and its pid's start time matches (or, with
-the leader gone, a live process still has that pgid). Others are deleted. A
+the leader gone, a live process still has that pgid as its group or that
+`sid` as its session). Others are deleted. A
 tick exits 75 while any counted file remains or while a podman container named
 `lineageos-build` is running. A `lineageos-build` container in any other state
 (created, exited, dead) is removed with `podman rm lineageos-build` (never
@@ -1427,8 +1431,15 @@ nothing landed. Then:
   landed, `river-22.2` is still the known-good base and nothing is owed.
 - One transaction: the above, the batch's `cleanup` item **replaced** by one
   whose `branch_repos` are only the branches still present and whose
-  `pr_repos` are only the batch PRs still open, `running` and `halt`
-  cleared, the report added to `reports_pending`. KW for a promoted batch is
+  `pr_repos` are only the batch PRs still open whose tested head is not in
+  `river-22.2`. A batch PR still OPEN whose tested head is already in
+  `river-22.2` (GitHub lag) goes in `landed_open` and `expected_merged`:
+  cleanup never closes it and keeps its branch until GitHub shows it MERGED
+  (Sol SM1). Whenever a re-baseline is owed the item is **held** (nothing
+  closed or deleted) until the re-baseline closes, whether or not any PR
+  reads MERGED (Gemini GM2-4). An expected or held PR found MERGED counts
+  only at its tested head, into `river-22.2`, not cross-repository; any
+  other merge pauses. `running` and `halt` cleared, the report added to `reports_pending`. KW for a promoted batch is
   written before this transaction (R10.6 step 3).
 
 The report says which changes landed fully, partly or not at all, which repos

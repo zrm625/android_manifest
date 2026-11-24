@@ -32,6 +32,8 @@ A cleanup item (R13.3, I12)::
      "branch_repos": {path: sha},    # batch branches still to delete, at that SHA only
      "pr_repos": {path: {"repo", "number"}},       # batch PRs known open
      "expected_merged": {path: {"repo", "number"}},  # batch PRs that landed through the runner or a settle
+     "landed_open": {path: {"repo", "number"}},      # landed (ancestry) but GitHub still says OPEN: wait,
+                                                     # never close, keep the branch (Sol SM1)
      "hold": null | {"settle": "b0007", "why": ...}}   # Zak's repair first (R13.4): nothing is closed
                                                        # or deleted while that re-baseline is owed
 """
@@ -134,10 +136,12 @@ def transaction(event: str | None = None, **info):
 
 
 def cleanup_item(bid: str, tested: dict, branch_repos: dict | None = None, pr_repos: dict | None = None,
-                 expected_merged: dict | None = None, hold: dict | None = None) -> dict:
+                 expected_merged: dict | None = None, hold: dict | None = None,
+                 landed_open: dict | None = None) -> dict:
     return {"batch": bid, "branch": f"batch/{bid}", "tested": dict(tested),
             "branch_repos": dict(branch_repos or {}), "pr_repos": dict(pr_repos or {}),
-            "expected_merged": dict(expected_merged or {}), "hold": hold}
+            "expected_merged": dict(expected_merged or {}), "hold": hold,
+            "landed_open": dict(landed_open or {})}
 
 
 # --- entries -------------------------------------------------------------------

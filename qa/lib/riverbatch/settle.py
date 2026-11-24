@@ -84,6 +84,13 @@ def settle(ctx: Ctx, bid: str) -> dict:
                     open_prs[p] = {"repo": e["repo"], "number": e["number"]}
                 elif v.get("state") == "MERGED":
                     merged_prs[p] = {"repo": e["repo"], "number": e["number"]}
+        # Sol SM1, Gemini GM2-4: a batch PR GitHub still reports OPEN whose
+        # tested head is already in river-22.2 landed (GitHub lag): it is
+        # expected to show MERGED, never closed, and its branch is kept.
+        landed_open = {}
+        for p, x in sorted(open_prs.items()):
+            if is_ancestor(ctx, x["repo"], run["composed"][p]["sha"]):
+                landed_open[p] = x
         branches = {}
         for p in run.get("touched") or []:
             sha = run["composed"][p]["sha"]
@@ -144,16 +151,19 @@ def settle(ctx: Ctx, bid: str) -> dict:
                                      by="zak", action="settle")
             st2["cleanup"] = [c for c in st2["cleanup"] if c["batch"] != bid]
             if branches or open_prs:
-                # Sol M4: after a partial merge the open batch PRs and their
-                # tested branches are Zak's repair (merge them at their tested
-                # heads); nothing is closed or deleted while the re-baseline
-                # is owed. The ones that landed are expected (Opus OM3); every
-                # touched repo keeps its tested head (Sol M5).
-                hold = ({"settle": bid, "why": "partial merge: the open batch PRs are kept for Zak's repair until "
-                                               "the re-baseline"} if rebaseline and merged_prs and open_prs else None)
+                # Sol M4, SM1, Gemini GM2-4: while a re-baseline is owed
+                # (anything landed, drift, or GitHub lagging past I5) the open
+                # batch PRs and their tested branches are Zak's repair (merge
+                # them at their tested heads): nothing is closed or deleted.
+                # The ones that landed are expected (Opus OM3), the ones
+                # landed but still OPEN too; every touched repo keeps its
+                # tested head (Sol M5).
+                hold = ({"settle": bid, "why": "the open batch PRs and branches are kept for Zak's repair until "
+                                               "the re-baseline"} if rebaseline else None)
                 st2["cleanup"].append(S.cleanup_item(
                     bid, {p: run["composed"][p]["sha"] for p in run.get("touched") or []}, branch_repos=branches,
-                    pr_repos=open_prs, expected_merged=merged_prs, hold=hold))
+                    pr_repos={p: x for p, x in open_prs.items() if p not in landed_open},
+                    expected_merged=dict(merged_prs, **landed_open), hold=hold, landed_open=landed_open))
             if rebaseline:
                 st2["rebaseline"] = {"settle": bid, "at": now_iso(), "drifted": drifted,
                                      "landed": {k: v[0] for k, v in landed.items()}}

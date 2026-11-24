@@ -44,6 +44,8 @@ def world(h, cameras_changed=False):
     for repo, head, landed in ((RIVER, H_R, True), (VENDOR, H_V, False), ("zrm625/android_build", H_G, False)):
         gh.raw[("gh", "api", f"repos/{repo}/compare/river-22.2...{head}", "--jq", ".status")] = \
             "behind" if landed else "ahead"
+    # the open batch PR's tested head is not in river-22.2 (Sol SM1 asks)
+    gh.raw[("gh", "api", f"repos/{VENDOR}/compare/river-22.2...{T_V}", "--jq", ".status")] = "ahead"
     if cameras_changed:
         gh.files[(RIVER, "qa/cameras", M_R)] = ("blob", "0 2\n")   # river-22.2's camera set moved
     write_json(h / "batches/b0001/batch.json", {

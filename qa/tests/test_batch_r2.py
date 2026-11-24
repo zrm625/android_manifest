@@ -634,3 +634,71 @@ class ForwardRefusalHalts(unittest.TestCase):
             with mock.patch.object(recover, "forward", side_effect=C.Refused("pr close", "x", 403, "locked")):
                 with self.assertRaises(C.Halt):
                     recover.recover_running(mk_ctx())
+
+
+# --- Sol SM1, Gemini GM2-4: settle holds while landed or ambiguous ----------------------------------
+
+class SettleHolds(unittest.TestCase):
+    """settle.settle, then recover.cleanup_items, in test_batch_settle's world."""
+
+    def settle_then_cleanup(self, gh, clear_rebaseline=False):
+        from test_batch_settle import PartialSettle
+        from riverbatch import state as S
+        t = PartialSettle()
+        out = t.settle(gh)
+        if clear_rebaseline:
+            with S.transaction() as st:
+                st["rebaseline"] = None
+        return out, t.cleanup(gh)
+
+    def test_landed_but_open_is_never_closed_and_its_branch_kept(self):
+        """GitHub lag: vendor/lineage #8's tested head is in river-22.2 but
+        the PR still reads OPEN. Even after the re-baseline, it is expected,
+        never closed, and its branch stays until GitHub shows it MERGED."""
+        import test_batch_settle as ts
+        from riverbatch import state as S
+        with bench_home() as h:
+            gh = ts.world(h)
+            gh.raw[("gh", "api", f"repos/{ts.VENDOR}/compare/river-22.2...{ts.T_V}", "--jq", ".status")] = "behind"
+            out, deleted = self.settle_then_cleanup(gh, clear_rebaseline=True)
+            (item,) = S.read()["cleanup"]
+            self.assertEqual(item["landed_open"], {ts.PV: {"repo": ts.VENDOR, "number": 8}})
+            self.assertEqual(gh.prs[(ts.VENDOR, 8)]["state"], "OPEN")
+            self.assertIn((ts.VENDOR, "refs/heads/batch/b0001"), gh.tips)
+            self.assertNotIn(ts.PV, [p for p, _ in deleted])
+            self.assertIsNone(S.read()["pause"])
+            gh.prs[(ts.VENDOR, 8)].update(state="MERGED", mergeCommit={"oid": "8" * 40})
+            from test_batch_settle import PartialSettle
+            PartialSettle().cleanup(gh)
+            self.assertEqual(S.read()["cleanup"], [])
+            self.assertIsNone(S.read()["pause"])
+
+    def test_rebaseline_owed_without_a_merged_pr_still_holds(self):
+        """Gemini GM2-4: nothing reads MERGED (I5 lag past 24 h, or drift),
+        yet a re-baseline is owed: the open PRs and branches are held."""
+        import test_batch_settle as ts
+        from riverbatch import state as S
+        with bench_home() as h:
+            gh = ts.world(h)
+            gh.prs[(ts.RIVER, 7)].update(state="OPEN", mergeCommit=None)          # still reads OPEN
+            gh.raw[("gh", "api", f"repos/{ts.RIVER}/compare/river-22.2...{ts.T_R}", "--jq", ".status")] = "behind"
+            out, deleted = self.settle_then_cleanup(gh)
+            self.assertTrue(out["rebaseline"])
+            (item,) = S.read()["cleanup"]
+            self.assertTrue(item["hold"])
+            self.assertEqual(deleted, [])
+            self.assertEqual((gh.prs[(ts.RIVER, 7)]["state"], gh.prs[(ts.VENDOR, 8)]["state"]), ("OPEN", "OPEN"))
+
+    def test_a_held_pr_merged_at_another_head_is_not_accepted(self):
+        import test_batch_settle as ts
+        from riverbatch import ctx as C
+        from riverbatch import state as S
+        with bench_home() as h:
+            gh = ts.world(h)
+            self.settle_then_cleanup(gh)
+            gh.prs[(ts.VENDOR, 8)].update(state="MERGED", headRefOid="5" * 40, mergeCommit={"oid": "8" * 40})
+            with S.transaction() as st:
+                st["rebaseline"] = None
+            from test_batch_settle import PartialSettle
+            with self.assertRaises(C.Pause):
+                PartialSettle().cleanup(gh)
