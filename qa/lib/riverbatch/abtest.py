@@ -9,10 +9,15 @@ kernel is read from the staged ``boot.img``. After each build:
 - every file under ``product/system`` and ``product/vendor`` is hashed, with
   the ``build.prop`` lines of ``abtest_masks.json`` removed and the files of
   ``abtest_allowlist.json`` skipped;
-- **I8:** ``system/product/etc/build-manifest.xml`` (``repo manifest -r``)
-  names each project's HEAD. Its fork and manifest revisions are checked
-  against that build's commit set, and only those expected revision values
-  are blanked before the content comparison;
+- **I8, Sol B1:** ``system/product/etc/build-manifest.xml`` names each
+  project's HEAD. Its producer (vendor/lineage
+  ``build/tasks/build-manifest_xml.mk``) is ``repo manifest -r`` piped
+  through ``grep -Ev "proprietary_$(MANIFEST_EXCLUDES)"``, so the
+  ``proprietary_*`` projects (the two Motorola vendor forks) are never in
+  it. Each fork the producer emits must be there at its commit-set
+  revision, and only those expected values are blanked before the content
+  comparison; a filtered fork must be absent, and its HEAD is checked in
+  the trial checkout instead; a missing XML fails the trial;
 - the product ``dtbo.img``, every river overlay ``.dtbo`` under
   ``DTBO_OBJ``, and ``stage.boot_info`` of the staged ``boot.img``;
 - the kernel extracted from the staged ``boot.img`` (header kernel section,
@@ -37,10 +42,11 @@ from riverqa import children as rchildren, stage as rstage
 from riverqa.core import now_iso
 
 from . import compose, outcomes as O, paths, phases, state as S
-from .ctx import Abort, Ctx, commit_phase
+from .ctx import Abort, Busy, Ctx, children_and_container, commit_phase, head
 
 MANIFEST = compose.MANIFEST
 BUILD_MANIFEST = "system/product/etc/build-manifest.xml"
+STOP_WAIT_S = 600
 
 
 def load(name: str) -> dict | list:
@@ -50,13 +56,34 @@ def load(name: str) -> dict | list:
 # --- pure measurement ---------------------------------------------------------------
 
 def mask_prop(text: str, masks: list[str]) -> str:
+    """Drop the build.prop lines whose key fully matches a mask (Opus
+    minor: ``ro.build.host`` must not mask ``ro.build.hostname``)."""
     rx = [re.compile(m) for m in masks]
-    return "\n".join(ln for ln in text.splitlines() if not any(r.match(ln.split("=", 1)[0].strip()) for r in rx))
+    return "\n".join(ln for ln in text.splitlines()
+                     if not any(r.fullmatch(ln.split("=", 1)[0].strip()) for r in rx))
 
 
-def normalize_build_manifest(text: str, commit_set: dict[str, str]) -> tuple[str, list[str]]:
-    """I8: check each fork's and the manifest's recorded revision against
-    the build's commit set, and blank exactly those expected values."""
+PRODUCER_DROPS = re.compile(r"proprietary_")      # build-manifest_xml.mk's grep -Ev (MANIFEST_EXCLUDES unset)
+
+
+def producer_excluded(paths_: list[str], manifest: Path | None = None) -> set[str]:
+    """The commit-set projects whose default.xml ``<project`` line the
+    producer's ``grep -Ev "proprietary_"`` drops from build-manifest.xml."""
+    import xml.etree.ElementTree as ET
+    root = ET.parse(manifest or paths.MANIFEST_DIR / "default.xml").getroot()
+    out = set()
+    for pj in root.iter("project"):
+        path = pj.get("path") or pj.get("name")
+        if path in paths_ and PRODUCER_DROPS.search(f'name="{pj.get("name")}" path="{path}"'):
+            out.add(path)
+    return out
+
+
+def normalize_build_manifest(text: str, commit_set: dict[str, str],
+                             excluded: set[str] = frozenset()) -> tuple[str, list[str]]:
+    """I8, Sol B1: check each emitted fork's recorded revision against the
+    build's commit set and blank exactly those expected values. A fork the
+    producer filters (``excluded``) must not appear; every other fork must."""
     errs, seen = [], set()
 
     def fix(m: re.Match) -> str:
@@ -64,6 +91,9 @@ def normalize_build_manifest(text: str, commit_set: dict[str, str]) -> tuple[str
         pm = re.search(r'\bpath="([^"]+)"', tag) or re.search(r'\bname="([^"]+)"', tag)
         rv = re.search(r'\brevision="([0-9a-f]{40})"', tag)
         path = pm.group(1) if pm else None
+        if path in excluded:
+            errs.append(f"build-manifest.xml names {path}, which its producer filters out: the producer changed")
+            return tag
         if path in commit_set:
             seen.add(path)
             if not rv or rv.group(1) != commit_set[path]:
@@ -74,13 +104,14 @@ def normalize_build_manifest(text: str, commit_set: dict[str, str]) -> tuple[str
         return tag
 
     out = re.sub(r"<project\b[^>]*>", fix, text)
-    missing = sorted(p for p in commit_set if p != MANIFEST and p not in seen)
+    missing = sorted(p for p in commit_set if p != MANIFEST and p not in seen and p not in excluded)
     if missing:
         errs.append("build-manifest.xml lacks " + ", ".join(missing))
     return out, errs
 
 
-def hash_tree(product: Path, masks: list[str], allow: list[str], commit_set: dict[str, str]) -> tuple[dict, list]:
+def hash_tree(product: Path, masks: list[str], allow: list[str], commit_set: dict[str, str],
+              excluded: set[str] = frozenset()) -> tuple[dict, list]:
     files, errs = {}, []
     for part in ("system", "vendor"):
         root = product / part
@@ -98,10 +129,12 @@ def hash_tree(product: Path, masks: list[str], allow: list[str], commit_set: dic
                 if n == "build.prop":
                     data = mask_prop(data.decode(errors="replace"), masks).encode()
                 if rel == BUILD_MANIFEST:
-                    text, e = normalize_build_manifest(data.decode(errors="replace"), commit_set)
+                    text, e = normalize_build_manifest(data.decode(errors="replace"), commit_set, excluded)
                     errs += e
                     data = text.encode()
                 files[rel] = hashlib.sha256(data).hexdigest()
+    if BUILD_MANIFEST not in files and BUILD_MANIFEST not in allow:
+        errs.append(f"{BUILD_MANIFEST} is missing: the build's revisions cannot be checked (I8)")
     return files, errs
 
 
@@ -120,9 +153,18 @@ def boot_kernel(img: Path) -> bytes | None:
     return image
 
 
-def measure(product: Path, staged: Path, cfg: dict, commit_set: dict[str, str]) -> dict:
+def measure(product: Path, staged: Path, cfg: dict, commit_set: dict[str, str],
+            checkout_heads: dict[str, str] | None = None) -> dict:
+    """``checkout_heads``: HEAD of each producer-filtered fork in the trial
+    checkout, read right after the build (Sol B1)."""
+    excluded = producer_excluded(list(commit_set))
     files, errs = hash_tree(product, load("abtest_masks.json")["props"], load("abtest_allowlist.json")["files"],
-                            commit_set)
+                            commit_set, excluded)
+    for p in sorted(excluded):
+        got = (checkout_heads or {}).get(p)
+        if got != commit_set[p]:
+            errs.append(f"{p} (not in build-manifest.xml): the trial checkout was at {str(got)[:12]}, built from "
+                        f"{commit_set[p][:12]}")
     dtbo = product / "dtbo.img"
     ovl_dir = product / "obj" / "DTBO_OBJ" / "arch/arm64/boot/dts/qcom"
     overlays = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
@@ -220,15 +262,24 @@ def _run_for(ctx: Ctx, bid: str, base: dict, commits: dict, pin: str) -> dict:
     return run
 
 
-def delete_abtest_branches(ctx: Ctx) -> None:
+def delete_abtest_branches(ctx: Ctx) -> list[str]:
+    """Delete every local batch/abtest-* branch; returns the ones git kept
+    (a checked-out branch is never deleted)."""
+    kept = []
     for p in compose.forks():
         rc, out = ctx.git.try_(p, "for-each-ref", "--format=%(refname:short)", "refs/heads/batch/abtest-*")
         for b in out.split() if rc == 0 else []:
-            ctx.git.try_(p, "branch", "-q", "-D", b)
+            if ctx.git.try_(p, "branch", "-q", "-D", b)[0] != 0:
+                kept.append(f"{p}: {b}")
+    return kept
 
 
 def one_build(ctx: Ctx, qid: str, label: str, base: dict, commits: dict, pin: str, cfg: dict,
               interrupt: dict | None = None) -> dict | None:
+    """One trial build. A failure (Abort) ends the run the normal way while
+    ``running`` is still set: R11.2 step 2 restores the tree from the lease
+    and clears both (Sol M8, Gemini GB3, Opus OB1). Any other interruption
+    leaves running and the lease for the next entry point."""
     bid = f"{qid}-ab-{label}"
     for p, c in commits.items():
         ctx.git.out(p, "branch", "-f", f"batch/abtest-{label}", c)
@@ -247,21 +298,25 @@ def one_build(ctx: Ctx, qid: str, label: str, base: dict, commits: dict, pin: st
             finished = interrupted_build(ctx, run, pin, interrupt)
             if not finished:
                 phases.restore_or_void(ctx)
-                with S.transaction() as st:
+                with S.transaction("abtest-done", batch=bid) as st:
                     st["running"] = None
                 return None
         else:
             phases.build(ctx, run)
+        cs = phases.expected_heads(run)
+        heads = {p: head(ctx, p) for p in producer_excluded(list(cs))}
         phases.stage_run(ctx, run, "calibration", False, None)
         commit_phase("restoring")
         phases.restore_or_void(ctx)
-        cs = phases.expected_heads(run)
-        meas = measure(paths.product_dir(), paths.batch_dir(bid), cfg, cs)
-    finally:
-        st = S.read()
-        if st.get("running") and st["running"]["id"] == bid:
-            with S.transaction() as st2:
-                st2["running"] = None
+        meas = measure(paths.product_dir(), paths.batch_dir(bid), cfg, cs, heads)
+    except Abort as a:
+        with S.transaction("decided", batch=bid) as st:
+            st["running"]["outcome"] = a.outcome
+        from . import recover
+        recover.abort(ctx)                     # restore from the lease, then clear running (may Pause)
+        raise
+    with S.transaction("abtest-done", batch=bid) as st:
+        st["running"] = None
     return meas
 
 
@@ -291,8 +346,19 @@ def interrupted_build(ctx: Ctx, run: dict, pin: str, spec: dict) -> bool:
             pass
         ctx.sleep(1)
     proc.wait()
-    while rchildren.live_children(paths.home()) or _container_running(ctx):
+    for _ in range(STOP_WAIT_S):
+        if not rchildren.live_children(paths.home()) and not _container_running(ctx):
+            break
         ctx.sleep(1)
+    else:
+        raise Abort({"class": O.VOID, "reason": f"B4: the build's holder, child or container is still alive after "
+                                                 f"{STOP_WAIT_S} s"})
+    # Gemini GB3: an exited lineageos-build container would collide with
+    # A4's; remove it (never --force), or stop if one still runs.
+    try:
+        children_and_container(ctx)
+    except Busy as e:
+        raise Abort({"class": O.VOID, "reason": f"B4: {e.message}"}) from e
     if stopped:
         return False
     if proc.returncode != 0:
@@ -329,8 +395,11 @@ def run(ctx: Ctx, base: dict, pin: str) -> dict:
         failures += compare(m, cfg)
     except Abort as a:
         failures.append(f"a build failed: {a.outcome.get('reason') or a.outcome.get('checks')}")
-    finally:
-        delete_abtest_branches(ctx)
+    # Not in a finally (Sol M8): an interrupted run leaves its branches for
+    # the recovery that restores the tree; a finished or failed one cleans up.
+    kept = delete_abtest_branches(ctx)
+    if kept:
+        failures.append("abtest branches left: " + "; ".join(kept))
     from . import version
     return {"passed": not failures, "failures": failures, "at": now_iso(), "qid": qid,
             "runner_build": version.runner_build(), "image_id": pin,

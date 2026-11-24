@@ -205,6 +205,143 @@ class ABTest(unittest.TestCase):
         self.assertEqual(cfg["B4"]["string"], cfg["B1"]["kernel"]["new"])
 
 
+def repo_manifest_r(revs: dict) -> str:
+    """What `repo manifest -r` prints for default.xml: one <project> line per
+    project at its revision, annotations on their own lines."""
+    import xml.etree.ElementTree as ET
+    from riverbatch import paths
+    out = ['<?xml version="1.0" encoding="UTF-8"?>', "<manifest>"]
+    for pj in ET.parse(paths.MANIFEST_DIR / "default.xml").getroot().iter("project"):
+        path = pj.get("path") or pj.get("name")
+        rev = revs.get(path, "7" * 40)
+        anns = pj.findall("annotation")
+        out.append(f'  <project name="{pj.get("name")}" path="{path}" revision="{rev}" '
+                   f'upstream="refs/heads/river-22.2"' + (">" if anns else "/>"))
+        for a in anns:
+            out.append(f'    <annotation name="{a.get("name")}" value="{a.get("value")}"/>')
+        if anns:
+            out.append("  </project>")
+    return "\n".join(out + ["</manifest>", ""])
+
+
+def produced(revs: dict) -> str:
+    """build-manifest_xml.mk: repo manifest -r | grep -Ev "proprietary_"."""
+    return "\n".join(ln for ln in repo_manifest_r(revs).split("\n") if "proprietary_" not in ln)
+
+
+class BuildManifestProducer(unittest.TestCase):
+    """Sol B1: the producer filters the proprietary_* forks out."""
+
+    CS = dict({p: f"{i:x}" * 40 for i, p in enumerate(sorted(merge.slugs()), start=1)})
+    VENDOR = {"vendor/motorola/river", "vendor/motorola/sdm632-common"}
+
+    def product(self, t, xml):
+        prod = Path(t) / "product"
+        (prod / "system/product/etc").mkdir(parents=True)
+        (prod / "vendor").mkdir()
+        if xml is not None:
+            (prod / "system/product/etc/build-manifest.xml").write_text(xml)
+        return prod
+
+    def test_the_producer_drops_exactly_the_two_vendor_forks(self):
+        self.assertEqual(abtest.producer_excluded(list(self.CS)), self.VENDOR)
+        text = produced(self.CS)
+        for p in self.VENDOR:
+            self.assertNotIn(f'path="{p}"', text)
+
+    def test_producer_shaped_xml_measures_clean(self):
+        cfg = abtest.load("abtest_config.json")
+        heads = {p: self.CS[p] for p in self.VENDOR}
+        with tempfile.TemporaryDirectory() as t:
+            m = abtest.measure(self.product(t, produced(self.CS)), Path(t) / "staged", cfg, self.CS, heads)
+            self.assertEqual(m["errors"], [])
+            # The excluded forks are checked against the trial checkout.
+            bad = dict(heads, **{"vendor/motorola/river": "e" * 40})
+            m = abtest.measure(self.product(t + "/2", produced(self.CS)), Path(t) / "staged", cfg, self.CS, bad)
+            self.assertTrue(any("vendor/motorola/river (not in build-manifest.xml)" in e for e in m["errors"]))
+
+    def test_a_missing_build_manifest_fails(self):
+        cfg = abtest.load("abtest_config.json")
+        with tempfile.TemporaryDirectory() as t:
+            m = abtest.measure(self.product(t, None), Path(t) / "staged", cfg, self.CS,
+                               {p: self.CS[p] for p in self.VENDOR})
+            self.assertTrue(any("build-manifest.xml is missing" in e for e in m["errors"]), m["errors"])
+
+    def test_an_emitted_fork_still_needs_its_revision(self):
+        cfg = abtest.load("abtest_config.json")
+        wrong = dict(self.CS, **{"device/motorola/river": "e" * 40})
+        with tempfile.TemporaryDirectory() as t:
+            m = abtest.measure(self.product(t, produced(wrong)), Path(t) / "staged", cfg, self.CS,
+                               {p: self.CS[p] for p in self.VENDOR})
+            self.assertTrue(any("device/motorola/river at eeeeeeeeeeee" in e for e in m["errors"]), m["errors"])
+
+    def test_mask_is_a_full_match(self):
+        text = "ro.build.host=a\nro.build.hostname=b\n"
+        self.assertEqual(abtest.mask_prop(text, ["ro\\.build\\.host"]), "ro.build.hostname=b")
+
+
+class OneBuild(unittest.TestCase):
+    """Sol M8, Gemini GB3, Opus OB1: a failed B restores the tree."""
+
+    BASE = BuildManifestProducer.CS
+    COMMITS = {"device/motorola/river": "e" * 40}
+
+    def setUp(self):
+        from batchfakes import FakeTree
+        self.tree = FakeTree(self.BASE)
+        self.cfg = abtest.load("abtest_config.json")
+
+    def build(self, exc):
+        from batchfakes import mk_ctx
+        ctx = mk_ctx(tree=self.tree)
+        with mock.patch.object(abtest.phases, "build", side_effect=exc):
+            abtest.one_build(ctx, "q0001", "B1", dict(self.BASE), dict(self.COMMITS), "img", self.cfg)
+        return ctx
+
+    def test_failed_b_after_checkout_restores_and_clears(self):
+        with bench_home():
+            with self.assertRaises(C.Abort):
+                self.build(C.Abort({"class": O.VOID, "reason": "build infrastructure failure"}))
+            st = S.read()
+            self.assertIsNone(st["running"])
+            self.assertIsNone(st["lease"])
+            self.assertEqual(self.tree.head["device/motorola/river"], "river-22.2")
+            from batchfakes import mk_ctx
+            self.assertEqual(abtest.delete_abtest_branches(mk_ctx(tree=self.tree)), [])
+            self.assertNotIn("batch/abtest-B1", self.tree.branches["device/motorola/river"])
+
+    def test_an_interrupt_leaves_running_and_the_lease_for_recovery(self):
+        with bench_home():
+            with self.assertRaises(KeyboardInterrupt):
+                self.build(KeyboardInterrupt())
+            st = S.read()
+            self.assertEqual(st["running"]["id"], "q0001-ab-B1")
+            self.assertEqual(st["lease"]["batch"], "q0001-ab-B1")
+            self.assertEqual(self.tree.head["device/motorola/river"], "batch/abtest-B1")
+
+    def test_b4_removes_the_exited_container(self):
+        from batchfakes import FakePodman, mk_ctx
+
+        class Proc:
+            returncode = 0
+
+            def poll(self):
+                return 0
+
+            def wait(self):
+                return 0
+        with bench_home():
+            pod = FakePodman(image="img", ps="exited\n")
+            ctx = mk_ctx(podman=pod)
+            ctx.tools.start = lambda *a, **k: Proc()
+            with S.transaction() as st:
+                st["running"] = {"id": "q0001-ab-B4", "phase": "claimed"}
+            run = {"id": "q0001-ab-B4"}
+            done = abtest.interrupted_build(ctx, run, "img", {"object": "x.o", "string": "s"})
+            self.assertTrue(done)
+            self.assertIn(("rm", "lineageos-build"), pod.calls)
+
+
 class Versions(unittest.TestCase):
     def test_runner_build_counts_tracked_package_files_only(self):
         files = version.package_files()
