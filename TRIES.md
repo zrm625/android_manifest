@@ -5,7 +5,7 @@ a stack that passes is kept whole, a stack that fails is split.
 How a try runs and when it is kept: [CHARTER.md](CHARTER.md#pipeline-tries).
 
 RAM reference: baseline-2, 1,266 MB (median of 3 boots, 2026-11-23).
-Target: 1,000 MB. Now: 1,122 MB (stack C, kept; stack D checks the combined tree).
+Target: 1,000 MB. Now: 1,104 MB (stack D, kept).
 
 ## Kept
 
@@ -19,6 +19,7 @@ Target: 1,000 MB. Now: 1,122 MB (stack C, kept; stack D checks the combined tree
 | f2fs bitmaps in one block | kernel #2 | 105k 64-byte kmallocs (rounded to 128 on arm64) became two blocks; SUnreclaim 127 → 115 MB. |
 | Two SurfaceFlinger framebuffers | sdm632-common #6 | `max_frame_buffer_acquired_buffers` 3 → 2; SurfaceFlinger 87 → 77 MB. |
 | No ClearKey DRM service | sdm632-common #7 | Test DRM scheme; Widevine stays. |
+| Tiny default wallpaper | vendor_lineage #6 | 32×32 dark image; the wallpaper surface shrank and SurfaceFlinger went 77 → 63 MB. |
 | No CAS HIDL service, traced off | build #3 | Broadcast-TV CAS service and Perfetto daemons not resident. `setprop persist.traced.enable 1` for a trace. |
 
 **Stack A** (Perch, zygote64, lazy camera): 1,144 MB (−122 MB), boot 49.7 s.
@@ -41,6 +42,21 @@ with the flash off, so its lens is against the desk; the camera daemon turned
 the flash on and the LED driver was set. No stack C change touches the camera.
 Zak: please check what the rear of the phone rests on.
 
+**Stack D** (river-22.2 with stacks A to C merged, plus the tiny wallpaper):
+1,104 MB (−18 MB), boot 49.7 s. This is the first image with stacks B and C
+together. `phone-qa --probe`: 39 pass; GPS and the rear-flash check fail as
+before.
+
+## Testing
+
+**Stack E**: on river-22.2.
+
+| Try | Branch | Why |
+| --- | --- | --- |
+| No ftrace | kernel `ftrace-off` | 1,700 trace events are 20,800 pinned tracefs files (about 16 MB of inodes and dentries). |
+| No debugfs | kernel `debugfs-off` | 7,400 pinned debugfs files (about 6 MB). Some Qualcomm drivers may mind. |
+| No SecureElement | build `drop-secure-element` | Persistent OMAPI app (6.7 MB). No NFC or eSE on the test phone; the NFC stack stays. |
+
 ## Open problems
 
 - **GPS** (must-work). `radios.gps` gets 0 status callbacks in 120 s with
@@ -56,7 +72,6 @@ Zak: please check what the rear of the phone rests on.
 
 | Try | Why |
 | --- | --- |
-| Default wallpaper (stack D) | Perch is opaque and there is no lock screen, but SystemUI decodes the 1920×1920 default wallpaper. 32×32 dark image instead (vendor_lineage `small-wallpaper`). |
 | Rest of `kmalloc-128` | kernfs names 21k objects (2.6 MB), ASoC DAPM paths 17.6k (2.2 MB). arm64 has no kmalloc cache below 128 bytes. |
 | 32-bit media processes | mediaserver (23 MB) and the audio HAL are 32-bit; with no 32-bit zygote their libraries are private (.so 20 MB, 16 MB private clean). mediaserver's bitness is set in frameworks/av: a fork needs Zak. |
 | media.swcodec (22 MB) | Loads every software codec at start (.so 19 MB, 13 MB private). Trimming the APEX needs a frameworks/av fork. |
