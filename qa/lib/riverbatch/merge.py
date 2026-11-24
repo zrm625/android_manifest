@@ -136,6 +136,7 @@ def record_prs(ctx: Ctx, run: dict, prs: dict[str, int]) -> None:
     b["no_pr"] = sorted(p for p in cs if p not in prs)
     b["tag"] = f"known-good-{run['id']}"
     b["tag_repos"] = [url(sl[p]) for p in sorted(cs)]
+    b["base"] = {p: run["base"][p] for p in sorted(cs)}        # frozen by flash --merge-started (Sol B2)
     write_json(paths.batch_dir(run["id"]) / "batch.json", b)
 
 
@@ -381,12 +382,15 @@ def kw_holds(ctx: Ctx, run: dict | None) -> bool:
 
 
 def kw_commit_set(ctx: Ctx, run: dict, local_only: bool) -> dict[str, str] | None:
-    """I7: merge commits for PR repos (from running.merge, else resolved
-    from GitHub) and batch.json commit_set for no_pr repos; never a
-    batch-branch SHA. None if a merge commit is missing and ``local_only``."""
+    """I7: merge commits for PR repos (from running.merge, else from the
+    promotion record flash --promote wrote into batch.json (I11), else
+    resolved from GitHub) and batch.json commit_set for no_pr repos; never
+    a batch-branch SHA. None if a merge commit is missing locally and
+    ``local_only``."""
     b = ctx.batch_json(run["id"])
     frozen = (b.get("merge_started") or {}).get("expected_prs") or {}
-    merged = (run.get("merge") or {}).get("merged") or {}
+    merged = dict(((b.get("promotion") or {}).get("merge_commits") or {}),
+                  **((run.get("merge") or {}).get("merged") or {}))
     out = {}
     for p, sha in (b.get("commit_set") or {}).items():
         e = frozen.get(p) or {}

@@ -42,6 +42,8 @@ def run_recover(ctx: Ctx, why: str) -> None:
     r = ctx.tool("flash", ["--recover"], None)
     if r.rc == 3:
         raise Halt(f"flash --recover halted ({why})")
+    if r.rc == 75:                       # a lagging or failed GitHub read: retry, never a strike (Sol B2)
+        raise Unknown("flash --recover", None, None, f"no answer yet ({why})")
     strike("recover", r.rc == 0, "flash --recover")
 
 

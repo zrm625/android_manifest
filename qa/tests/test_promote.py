@@ -10,6 +10,7 @@ from unittest import mock
 import _path  # noqa: F401
 from benchhome import bench_home
 from fakes import FakeShell
+from ghworld import GHWorld
 from riverqa import core, flashing, recovery, slots, stage
 
 REPOS = {"build/make", "vendor/lineage", ".repo/manifests"}
@@ -31,29 +32,43 @@ def phone(slot="b", build_id=BID):
     return dev
 
 
+MERGES = {0: "4" * 40, 1: "5" * 40}
+BASES = {0: "6" * 40, 1: "7" * 40}
+TREES = {"zrm625/r0": "8" * 40, "zrm625/r1": "9" * 40, "zrm625/r2": "a" * 40}
+
+
+def world(merged, tagged, cross=(False, False)):
+    """A recorded GitHub (ghworld.GHWorld): PR n of zrm625/r<n> at the tested
+    head; a merged one is river-22.2's tip, a merge [base, head] with the
+    tested tree. r2 (the manifest) has no PR and stays at its tested commit.
+    Tags (kg-1) at the merge commit, or r2's tested commit."""
+    w = GHWorld()
+    for n in (0, 1):
+        slug = f"zrm625/r{n}"
+        w.repo(slug, tip=BASES[n])
+        w.commits[(slug, HEADS[n])] = {"tree": TREES[slug], "parents": [BASES[n]]}
+        w.commits[(slug, BASES[n])] = {"tree": "b" * 40, "parents": []}
+        w.pr(slug, n, HEADS[n], cross=cross[n])
+        if merged[n]:
+            w.merge(slug, n, BASES[n], MERGES[n], TREES[slug])
+        if tagged[n]:
+            w.repos[slug]["tags"]["kg-1"] = MERGES[n]
+    w.repo("zrm625/r2", tip=COMMITS[".repo/manifests"])
+    w.commits[("zrm625/r2", COMMITS[".repo/manifests"])] = {"tree": TREES["zrm625/r2"], "parents": []}
+    if tagged[2]:
+        w.repos["zrm625/r2"]["tags"]["kg-1"] = COMMITS[".repo/manifests"]
+    return w
+
+
 def runner(merged, tagged):
-    def run(cmd):
-        if cmd[:2] == ["gh", "api"]:
-            return subprocess.CompletedProcess(cmd, 0, "1" * 40 + "\n", "")   # merges into an unmoved branch
-        if cmd[0] == "gh":
-            n = int(cmd[3])
-            return subprocess.CompletedProcess(cmd, 0, json.dumps({"state": "MERGED" if merged[n] else "OPEN",
-                                                                   "number": n, "url": f"u{n}",
-                                                                   "headRefOid": HEADS[n],
-                                                                   "baseRefName": "river-22.2",
-                                                                   "mergeCommit": {"oid": f"m{n}"}}), "")
-        n = int(cmd[3][-1])
-        at = f"m{n}" if n < 2 else COMMITS[".repo/manifests"]
-        out = f"{at}\trefs/tags/kg-1\n" if tagged[n] else ""
-        return subprocess.CompletedProcess(cmd, 0, out, "")
-    return run
+    return world(merged, tagged)
 
 
 EXPECTED = {"build/make": {"repo": "zrm625/r0", "number": 0}, "vendor/lineage": {"repo": "zrm625/r1", "number": 1},
             ".repo/manifests": {"repo": "zrm625/r2", "number": None}}
 
 
-def setup(home, kind="batch", build_id=BID, commit_set=None, started=True):
+def setup(home, kind="batch", build_id=BID, commit_set=None, started=True, base=None):
     st = slots.first_run("a", "f" * 64, "t0")
     st["baseline_closed"] = {"batch": "base", "build_id": None, "at": "t0", "seed": None, "seed_written": True}
     slots.reserve(st, "b1", kind, "f" * 64, "t1")
@@ -66,6 +81,9 @@ def setup(home, kind="batch", build_id=BID, commit_set=None, started=True):
                        "https://github.com/zrm625/r2"]}
     if started:
         b["merge_started"] = {"at": "t3", "expected_prs": EXPECTED}
+        if base:
+            b["base"] = dict(base)
+            b["merge_started"]["base"] = dict(base)
     core.write_json(core.batch_dir("b1") / "batch.json", b)
 
 
@@ -129,7 +147,7 @@ class PromoteCommand(unittest.TestCase):
         for bid, cs in (("unstamped", None), ("b1-0000000000", None), (BID, dict(COMMITS, **{"build/make": "1" * 40 + "+dirty"}))):
             with bench_home() as h:
                 setup(h, build_id=bid, commit_set=cs)
-                rc, err, st = promote([True, True], [True, True], dev=phone(build_id=bid))
+                rc, err, st = promote([True, True], [True, True, True], dev=phone(build_id=bid))
             self.assertEqual(rc, flashing.EXIT_ERROR, bid)
             self.assertEqual(st["known_good_slot"], "a")
 
@@ -171,6 +189,19 @@ class MergeStartedCommand(unittest.TestCase):
             core.write_json(core.batch_dir("b1") / "batch.json", b)
             self.assertEqual(self.merge_started(), flashing.EXIT_ERROR)
             self.assertEqual(self.batch()["merge_started"]["expected_prs"], EXPECTED)
+
+    def test_base_is_frozen_with_the_pr_set(self):
+        with bench_home() as h:
+            setup(h, started=False)
+            b = self.batch()
+            b["base"] = {p: "6" * 40 for p in COMMITS}
+            core.write_json(core.batch_dir("b1") / "batch.json", b)
+            self.assertEqual(self.merge_started(), flashing.EXIT_OK)
+            self.assertEqual(self.batch()["merge_started"]["base"], b["base"])
+            b = self.batch()
+            b["base"] = {p: "7" * 40 for p in COMMITS}                 # rewritten afterwards
+            core.write_json(core.batch_dir("b1") / "batch.json", b)
+            self.assertEqual(self.merge_started(), flashing.EXIT_ERROR)
 
     def test_recover_with_marker_and_nothing_merged_halts(self):
         with bench_home() as h:

@@ -43,7 +43,7 @@ from typing import NamedTuple
 from .core import run
 from .stage import SHA_RE
 
-PR_FIELDS = "number,state,mergedAt,url,mergeCommit,headRefOid,baseRefName"
+PR_FIELDS = "number,state,mergedAt,url,mergeCommit,headRefOid,baseRefName,isCrossRepository"
 
 OK, TRANSPORT, REFUSED, MALFORMED = "ok", "transport", "refused", "malformed"
 AUTH = "auth"      # classify() only: a refusal that is HTTP 401, or 403 without rate-limit evidence
@@ -162,18 +162,52 @@ def tree_of(runner, repo: str, commit: str) -> str:
     return t
 
 
+def commit_of(runner, repo: str, commit: str) -> dict:
+    """{"tree", "parents"} of ``commit`` in ``repo``. Raises _Failed;
+    anything but a 40-hex tree and 40-hex parents is malformed."""
+    r = _call(runner, ["gh", "api", f"repos/{repo}/git/commits/{commit}", "--jq",
+                       "{tree: .tree.sha, parents: [.parents[].sha]}"], repo)
+    try:
+        d = json.loads(r.stdout)
+        tree, parents = d["tree"], d["parents"]
+    except (ValueError, KeyError, TypeError) as e:
+        raise _Failed(MALFORMED, {"repo": repo, "status": None, "line": f"commit {commit[:12]}: {e}"[:300]}) from e
+    if not isinstance(tree, str) or not SHA_RE.match(tree) or not isinstance(parents, list) \
+            or not all(isinstance(x, str) and SHA_RE.match(x) for x in parents):
+        raise _Failed(MALFORMED, {"repo": repo, "status": None, "line": f"commit {commit[:12]}: not SHAs"})
+    return {"tree": tree, "parents": parents}
+
+
+def branch_tip(runner, repo: str, branch: str = "river-22.2") -> str | None:
+    """The SHA of ``branch`` on GitHub, or None if it does not exist."""
+    ref = f"refs/heads/{branch}"
+    r = _call(runner, ["git", "ls-remote", f"https://github.com/{repo}", ref], repo)
+    for line in r.stdout.splitlines():
+        sha, _, name = line.partition("\t")
+        if name.strip() == ref:
+            if not SHA_RE.match(sha):
+                raise _Failed(MALFORMED, {"repo": repo, "status": None, "line": f"ls-remote: {line[:80]!r}"})
+            return sha
+    return None
+
+
 def lookup(batch: dict, runner=None, slugs: dict[str, str] | None = None) -> Lookup:
     """The batch's merge and tag state, typed (H11).
 
-    data: {"prs": [{"repo", "number", "url", "state", "merged", "merge_commit", "head", "base"}],
+    data: {"prs": [{"repo", "number", "url", "state", "merged", "merge_commit", "head", "base", "cross"}],
            "tags": [{"repo", "present", "commit", "tree"}],   # commit: what the tag points at
-           "tested_trees": {"<owner/name>": tree}}            # tree of each tested commit
+           "tested_trees": {"<owner/name>": tree},            # tree of each tested commit
+           "tips": {"<owner/name>": sha | None},              # river-22.2 now, every commit-set repo
+           "tip_commits": {"<owner/name>": {"tree", "parents"}}}   # of the tip, for PR repos
 
-    ``slugs`` maps commit_set paths to owner/name, for the tested trees.
+    ``slugs`` maps commit_set paths to owner/name, for the tested trees and
+    the tips. The tips and their parents are what the batch runner's own
+    landed check reads (R10.4a, Sol B2), so flash --promote and --recover
+    prove promotion exactly as the runner does.
     """
     runner = runner or default_runner
     slugs = slugs or {}
-    prs, tags, tested = [], [], {}
+    prs, tags, tested, tips, tip_commits = [], [], {}, {}, {}
     tag = batch.get("tag")
     try:
         for pr in prs_to_look_up(batch):
@@ -192,7 +226,8 @@ def lookup(batch: dict, runner=None, slugs: dict[str, str] | None = None) -> Loo
             prs.append({"repo": repo, "number": data.get("number", pr["number"]),
                         "url": data.get("url"), "state": state, "merged": merged,
                         "merge_commit": commit if merged else None,
-                        "head": data.get("headRefOid"), "base": data.get("baseRefName")})
+                        "head": data.get("headRefOid"), "base": data.get("baseRefName"),
+                        "cross": data.get("isCrossRepository")})
         for repo in batch.get("tag_repos") or []:
             if not tag:
                 raise _Failed(MALFORMED, {"repo": slug(repo), "status": None, "line": "tag_repos without a tag"})
@@ -204,12 +239,19 @@ def lookup(batch: dict, runner=None, slugs: dict[str, str] | None = None) -> Loo
             tree = tree_of(runner, slug(repo), commit) if commit else None
             tags.append({"repo": slug(repo), "present": ref in refs, "commit": commit, "tree": tree})
         tagged = {t["repo"] for t in tags if t["commit"]}
+        with_pr = {p["repo"] for p in prs}
         for path, sha in sorted((batch.get("commit_set") or {}).items()):
             s = slugs.get(path)
-            if s and s in tagged:
+            if not s:
+                continue
+            if s in tagged or s in with_pr:
                 tested[s] = tree_of(runner, s, sha)
+            tips[s] = branch_tip(runner, s)
+            if s in with_pr and tips[s]:
+                tip_commits[s] = commit_of(runner, s, tips[s])
     except _Failed as f:
         return Lookup(f.outcome, None, f.evidence)
     except (ValueError, KeyError, AttributeError, TypeError) as e:
         return Lookup(MALFORMED, None, {"repo": None, "status": None, "line": str(e)[:300]})
-    return Lookup(OK, {"prs": prs, "tags": tags, "tested_trees": tested}, None)
+    return Lookup(OK, {"prs": prs, "tags": tags, "tested_trees": tested, "tips": tips,
+                       "tip_commits": tip_commits}, None)

@@ -774,36 +774,6 @@ def finish_checkpoint(st: dict) -> bool:
     return True
 
 
-def github_lag(look: dict, batch: dict, runner=None) -> list[str] | None:
-    """Expected PRs that GitHub still reports OPEN at the tested head on
-    river-22.2 although their merge has landed (I4): the repo's tag is
-    present (the runner tags only after it saw the PR MERGED) and the tagged
-    commit is a merge whose parents include the tested head. Returns the
-    lagging PRs, or None if a parent read failed (also a transport case)."""
-    frozen = slots.frozen_pr_set(batch) or {}
-    cs = batch.get("commit_set") or {}
-    want = {(e["repo"], e["number"]): cs.get(path) for path, e in frozen.items() if e.get("number") is not None}
-    tags = {t.get("repo"): t for t in look.get("tags") or []}
-    runner = runner or recovery.default_runner
-    out = []
-    for p in look.get("prs") or []:
-        sha = want.get((p.get("repo"), p.get("number")))
-        t = tags.get(p.get("repo")) or {}
-        if not (sha and p.get("state") == "OPEN" and p.get("head") == sha and p.get("base") == slots.BRANCH
-                and t.get("present") and t.get("commit")):
-            continue
-        try:
-            r = runner(["gh", "api", f"repos/{p['repo']}/git/commits/{t['commit']}", "--jq", "[.parents[].sha]"])
-            parents = json.loads(r.stdout) if r.returncode == 0 else None
-        except (OSError, TimeoutError, ValueError):
-            parents = None
-        if not isinstance(parents, list):
-            return None
-        if len(parents) == 2 and parents[1] == sha:
-            out.append(f"{p['repo']}#{p['number']}")
-    return out
-
-
 def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
     """flash --promote: make a merged and tagged batch's slot known-good.
 
@@ -840,16 +810,13 @@ def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
         return EXIT_ERROR
     decision, why = slots.decide_recovery(pair, look.data, batch, slugs)
     if decision != slots.PROMOTE:
-        lag = github_lag(look.data, batch, runner)
-        if lag is None:
-            log(f"error: {batch_id}: a PR is still reported open and the tag's parents could not be read; "
-                "nothing touched the phone. Run flash --promote again later.")
-            return EXIT_RESUMABLE
+        lag = slots.landed_but_open(batch, look.data, slugs)
         if lag:
-            # I4: GitHub still reports a PR open whose merge the runner saw
-            # land: a lagging read, retried later, never a halt.
-            log(f"error: {batch_id}: GitHub still reports {', '.join(lag)} open at the tested head; not proven "
-                "yet. Nothing touched the phone; run flash --promote again later.")
+            # I4, Sol B2: GitHub still reports a PR open although river-22.2
+            # is at its merge ([base, tested head], tested tree): a lagging
+            # read, retried later, never a halt, tag or no tag.
+            log(f"error: {batch_id}: GitHub still reports {', '.join(lag)} open although its merge is on "
+                "river-22.2; not proven yet. Nothing touched the phone; run flash --promote again later.")
             return EXIT_RESUMABLE
         log(f"error: {batch_id} is not proven merged and tagged ({why}). The fallback slot stays reserved.")
         return EXIT_HALT if decision == slots.HALT else EXIT_ERROR
@@ -870,6 +837,14 @@ def promote_batch(batch_id: str, runner=None, dev: Device | None = None) -> int:
                                want=fbmode.Want(target, (bid, bid), hash_boot=True)).proof
     except (RuntimeError, TimeoutError) as e:
         return promote_halt(e, batch_id, target, pair["fallback"])
+    # I11: the merge commits this proof read go into batch.json first, so
+    # known-good.json can be written later from local files alone.
+    rec = read_json(batch_dir(batch_id) / "batch.json") or {}
+    rec["promotion"] = {"at": now_iso(), "merge_commits": {
+        path: p["merge_commit"] for path, e in sorted((slots.frozen_pr_set(batch) or {}).items())
+        if e.get("number") is not None
+        for p in look.data["prs"] if (p["repo"], p["number"]) == (e["repo"], e["number"])}}
+    write_json(batch_dir(batch_id) / "batch.json", rec)
     slots.promote(st, batch_id, proof.build_ids[0], proof.boot_sha, now_iso())
     save_state(st)
     log(f"Promoted {batch_id} ({why}): known_good_slot is now {target}")
@@ -903,9 +878,9 @@ def merge_started(batch_id: str) -> int:
         if not frozen:
             log(f"error: {batch_id}'s merge_started has no expected PR set; recovery will halt")
             return EXIT_ERROR
-        if expected != frozen:
+        if expected != frozen or (batch.get("base") and ms.get("base") != batch["base"]):
             log(f"error: {batch_id}'s PR record changed after merge_started: "
-                + ("; ".join(errs) if errs else "a different PR set"))
+                + ("; ".join(errs) if errs else "a different PR set or base"))
             return EXIT_ERROR
     else:
         if expected is None:
@@ -913,6 +888,9 @@ def merge_started(batch_id: str) -> int:
                 "or no_pr before merging: " + "; ".join(errs[:8]))
             return EXIT_ERROR
         batch["merge_started"] = {"at": now_iso(), "expected_prs": expected}
+        if batch.get("base"):
+            # Sol B2: the base each merge commit's first parent must be.
+            batch["merge_started"]["base"] = dict(batch["base"])
         write_json(path, batch)
     n = sum(1 for e in batch["merge_started"]["expected_prs"].values() if e["number"] is not None)
     log(f"merge_started for {batch_id} at {batch['merge_started'].get('at')} ({n} PRs expected)")
@@ -1004,6 +982,13 @@ def recover(runner=None, dev: Device | None = None) -> int:
         # Any outcome but ok is today's failed lookup (H11): it halts.
         look = typed.data if typed.outcome == recovery.OK else None
     decision, why = slots.decide_recovery(pair, look, batch, slugs)
+    if decision == slots.HALT and look is not None:
+        lag = slots.landed_but_open(batch, look, slugs)
+        if lag:
+            # Sol B2: the same lag rule as flash --promote: retry later, never halt.
+            log(f"Recovery for {pair['batch']}: GitHub still reports {', '.join(lag)} open although its merge "
+                "is on river-22.2; nothing touched the phone. Run flash --recover again later.")
+            return EXIT_RESUMABLE
     log(f"Recovery for {pair['batch']} ({pair['kind']}): {decision}: {why}")
     st.setdefault("history", []).append({"event": "recovery-decision", "at": now_iso(),
                                          "batch": pair["batch"], "decision": decision, "why": why})

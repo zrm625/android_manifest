@@ -326,7 +326,7 @@ class TypedLookup(unittest.TestCase):
         self.assertEqual(recovery.classify(1, "", "HTTP 403 x-ratelimit-remaining: 0")[0], recovery.TRANSPORT)
 
 
-from test_promote import COMMITS, SLUGS, phone, setup  # noqa: E402
+from test_promote import BASES, COMMITS, MERGES, SLUGS, TREES, phone, setup, world  # noqa: E402
 
 
 def promote_with(runner):
@@ -368,36 +368,107 @@ class PromoteTyped(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertEqual(json.loads(out.strip().splitlines()[-1])["lookup"], "malformed")
 
-    def lag_runner(self, parents_ok=True):
-        tested = COMMITS["vendor/lineage"]
-
-        def run(cmd):
-            if cmd[:2] == ["gh", "api"] and cmd[-1] == "[.parents[].sha]":
-                if not parents_ok:
-                    return subprocess.CompletedProcess(cmd, 1, "", "HTTP 502")
-                return subprocess.CompletedProcess(cmd, 0, json.dumps(["9" * 40, tested]), "")
-            if cmd[:2] == ["gh", "api"]:
-                return subprocess.CompletedProcess(cmd, 0, "1" * 40 + "\n", "")
-            if cmd[0] == "gh":
-                n = int(cmd[3])
-                st = "MERGED" if n == 0 else "OPEN"
-                return subprocess.CompletedProcess(cmd, 0, json.dumps({
-                    "state": st, "number": n, "url": "u", "headRefOid": "1" * 40 if n == 0 else tested,
-                    "baseRefName": "river-22.2", "mergeCommit": {"oid": "m0"} if n == 0 else None}), "")
-            n = int(cmd[3][-1])
-            at = {0: "m0", 1: "m1", 2: COMMITS[".repo/manifests"]}[n]
-            return subprocess.CompletedProcess(cmd, 0, f"{at}\trefs/tags/kg-1\n", "")
-        return run
+    def lag(self, tagged=(True, True, True)):
+        # r0 merged; r1 landed on river-22.2 ([base, head], tested tree) but
+        # GitHub still reports its PR OPEN (I4).
+        w = world([True, False], tagged)
+        w.merge("zrm625/r1", 1, "7" * 40, MERGES[1], TREES["zrm625/r1"])
+        w.prs[("zrm625/r1", 1)].update(state="OPEN", mergeCommit=None)
+        if tagged[1]:
+            w.repos["zrm625/r1"]["tags"]["kg-1"] = MERGES[1]
+        return w
 
     def test_pr_still_open_with_its_merge_tagged_is_75(self):
         with bench_home() as h:
             setup(h)
-            rc, err, _ = promote_with(self.lag_runner())
+            rc, err, _ = promote_with(self.lag())
             self.assertEqual(rc, 75, err)
-            self.assertIn("still reports", err)
+            self.assertIn("still reports zrm625/r1#1 open", err)
             self.assertEqual(flashing.load_state()["pair"]["batch"], "b1")
-            rc, err, _ = promote_with(self.lag_runner(parents_ok=False))
+
+    def test_open_at_landed_tip_before_any_tag_is_75(self):
+        # Sol B2: the runner tags only after it saw MERGED, so a lag before
+        # the first tag must also wait (75), never halt.
+        with bench_home() as h:
+            setup(h)
+            rc, err, _ = promote_with(self.lag(tagged=(False, False, False)))
             self.assertEqual(rc, 75, err)
+            self.assertEqual(flashing.load_state()["pair"]["batch"], "b1")
+            with mock.patch.object(stage, "repo_slugs", lambda manifest=None: dict(SLUGS)), \
+                    redirect_stderr(io.StringIO()):
+                rc = flashing.recover(runner=self.lag(tagged=(False, False, False)), dev=phone())
+            self.assertEqual(rc, 75)                                  # flash --recover: the same rule
+            self.assertEqual(flashing.load_state()["pair"]["batch"], "b1")
+
+    def test_lag_next_to_another_mismatch_halts(self):
+        # Opus minor: one PR lags and another is wrong: not a lag, a HALT.
+        with bench_home() as h:
+            setup(h)
+            w = self.lag(tagged=(False, False, False))
+            w.prs[("zrm625/r0", 0)]["isCrossRepository"] = True
+            rc, err, _ = promote_with(w)
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+
+    def test_a_pending_pr_is_not_a_lag(self):
+        with bench_home() as h:
+            setup(h)
+            rc, err, _ = promote_with(world([True, False], (False, False, False)))   # r1 still at its base
+            self.assertEqual(rc, flashing.EXIT_HALT, err)
+
+    def test_failed_tip_read_is_75(self):
+        with bench_home() as h:
+            setup(h)
+            w = self.lag()
+            w.fail = lambda cmd: (subprocess.CompletedProcess(cmd, 1, "", "HTTP 502")
+                                  if cmd[:2] == ["gh", "api"] and "parents" in cmd[-1] else None)
+            rc, err, _ = promote_with(w)
+            self.assertEqual(rc, 75, err)
+
+
+class PromoteProof(unittest.TestCase):
+    """Sol B2: flash --promote accepts exactly the runner's landed proof."""
+
+    def promote(self, w, **kw):
+        with bench_home() as h:
+            setup(h, **kw)
+            rc, err, _ = promote_with(w)
+            return rc, err, flashing.load_state(), core.read_json(core.batch_dir("b1") / "batch.json")
+
+    def test_clean_merge_promotes_and_records_the_merge_commits(self):
+        rc, err, st, b = self.promote(world([True, True], (True, True, True)))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(st["known_good_slot"], "b")
+        # I11: the proven merge commits, durable and local
+        self.assertEqual(b["promotion"]["merge_commits"], {"build/make": MERGES[0], "vendor/lineage": MERGES[1]})
+
+    def test_cross_repository_merged_pr_is_never_promoted(self):
+        rc, err, st, _ = self.promote(world([True, True], (True, True, True), cross=(False, True)))
+        self.assertEqual(rc, flashing.EXIT_HALT, err)
+        self.assertIn("isCrossRepository", err)
+        self.assertEqual(st["known_good_slot"], "a")
+
+    def test_river_22_2_moved_past_the_merge_halts(self):
+        w = world([True, True], (True, True, True))
+        w.repos["zrm625/r1"]["tip"] = "c" * 40                     # someone merged on top
+        w.commits[("zrm625/r1", "c" * 40)] = {"tree": "d" * 40, "parents": [MERGES[1]]}
+        rc, err, st, _ = self.promote(w)
+        self.assertEqual(rc, flashing.EXIT_HALT, err)
+        self.assertIn("not the merge commit", err)
+
+    def test_merge_parents_must_be_the_frozen_base_and_the_tested_head(self):
+        b0 = {"build/make": BASES[0], "vendor/lineage": BASES[1], ".repo/manifests": COMMITS[".repo/manifests"]}
+        rc, err, _, _ = self.promote(world([True, True], (True, True, True)), base=b0)
+        self.assertEqual(rc, 0, err)                                  # parents [frozen base, tested]
+        other = dict(b0, **{"vendor/lineage": "e" * 40})
+        rc, err, st, _ = self.promote(world([True, True], (True, True, True)), base=other)
+        self.assertEqual(rc, flashing.EXIT_HALT, err)
+        self.assertIn("parents", err)
+
+    def test_repo_without_a_pr_must_still_be_at_its_tested_commit(self):
+        w = world([True, True], (True, True, True))
+        w.repos["zrm625/r2"]["tip"] = "c" * 40
+        rc, err, _, _ = self.promote(w)
+        self.assertEqual(rc, flashing.EXIT_HALT, err)
 
 
 class H12(unittest.TestCase):

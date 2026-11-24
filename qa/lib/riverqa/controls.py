@@ -272,18 +272,29 @@ def host_control(name: str) -> tuple[bool, str]:
             wj(core.batch_dir("ctl") / "batch.json", batch)
             merge = {p["repo"]: f"{0xabc0 + p['number']:040x}" for p in prs}
 
+            base = {p["repo"]: f"{0xba5e0 + p['number']:040x}" for p in prs}
+
             def stub(cmd):
                 if cmd[:2] == ["gh", "api"]:
                     # Each merge went into an unmoved river-22.2: the merge
-                    # commit's tree is the tested commit's tree.
+                    # commit's tree is the tested commit's tree, its parents
+                    # [base, tested head], and river-22.2 is at it.
                     repo = cmd[2].split("/")[1] + "/" + cmd[2].split("/")[2]
                     tree = hashlib.sha1(f"tree-{repo}".encode()).hexdigest()
-                    return subprocess.CompletedProcess(cmd, 0, tree + "\n", "")
+                    if cmd[-1] == ".tree.sha":
+                        return subprocess.CompletedProcess(cmd, 0, tree + "\n", "")
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps(
+                        {"tree": tree, "parents": [base[repo], commits[by_slug[repo]]]}), "")
+                if cmd[:2] == ["git", "ls-remote"] and cmd[2] != "--tags":
+                    repo = cmd[2].removeprefix("https://github.com/")
+                    tip = merge.get(repo) or commits[by_slug[repo]]
+                    return subprocess.CompletedProcess(cmd, 0, f"{tip}\t{cmd[3]}\n", "")
                 if cmd[0] == "gh":
                     repo = cmd[cmd.index("--repo") + 1]
                     return subprocess.CompletedProcess(cmd, 0, json.dumps(
                         {"state": "MERGED", "url": f"https://github.com/{repo}/pull/x", "baseRefName": "river-22.2",
-                         "headRefOid": commits[by_slug[repo]], "mergeCommit": {"oid": merge[repo]}}), "")
+                         "isCrossRepository": False, "headRefOid": commits[by_slug[repo]],
+                         "mergeCommit": {"oid": merge[repo]}}), "")
                 repo = cmd[3].removeprefix("https://github.com/")
                 at = merge.get(repo) or commits[by_slug[repo]]
                 return subprocess.CompletedProcess(
