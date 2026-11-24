@@ -854,3 +854,60 @@ class TreeBeforeRollback(unittest.TestCase):
             self.assertIn("vendor/lineage is dirty", str(cm.exception))
             self.assertEqual((tools.calls, dev.cmds), ([], []))           # no flash --rollback, no phone read
             self.assertEqual(S.read()["running"]["id"], "q0003")
+
+
+# --- Sol SM6: change merge deletes the local topic branch only if its tip landed --------------------
+
+class ChangeMergeBranch(unittest.TestCase):
+    def run_merge(self, extra_local_commit: bool):
+        with tempfile.TemporaryDirectory() as t:
+            t = Path(t)
+            m = t / "top/.repo/manifests"
+            shutil.copytree(paths.SCRIPTS, m / "scripts", symlinks=True)
+            shutil.copytree(paths.SCRIPTS.parent / "qa/lib", m / "qa/lib",
+                            ignore=shutil.ignore_patterns("__pycache__"))
+            (m / "qa/lib/riverbatch/tooling.py").write_text("import sys\nsys.exit(0)\n")   # the checks pass
+            env = dict(os.environ, BENCH_HOME=str(t / "home"), GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL="/dev/null")
+
+            def git(*a, cwd=m):
+                return subprocess.run(["git", *a], cwd=cwd, env=env, check=True, capture_output=True,
+                                      text=True).stdout.strip()
+            git("init", "-q", "-b", "default")
+            git("add", "-A")
+            git("commit", "-q", "-m", "base")
+            subprocess.run(["git", "init", "-q", "--bare", str(t / "origin.git")], check=True, env=env)
+            git("remote", "add", "origin", str(t / "origin.git"))
+            git("push", "-q", "origin", "default:river-22.2")
+            git("checkout", "-q", "-b", "tool-x")
+            (m / "qa/NOTE.md").write_text("reviewed\n")
+            git("add", "-A")
+            git("commit", "-q", "-m", "reviewed head")
+            git("push", "-q", "origin", "tool-x:river-22.2")            # the reviewed head merged
+            if extra_local_commit:
+                (m / "qa/NOTE.md").write_text("later, unreviewed\n")
+                git("commit", "-q", "-am", "later local work")
+            git("checkout", "-q", "default")
+            r = subprocess.run(["bash", str(m / "scripts/change"), "merge", "tool-x", "--record", str(t / "r.json")],
+                               capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            left = git("branch", "--list", "tool-x")
+            return left, r.stderr
+
+    def test_a_merged_topic_branch_is_deleted(self):
+        left, _ = self.run_merge(extra_local_commit=False)
+        self.assertEqual(left, "")
+
+    def test_later_local_commits_keep_the_branch(self):
+        left, err = self.run_merge(extra_local_commit=True)
+        self.assertIn("tool-x", left)
+        self.assertIn("kept the local branch tool-x", err)
+
+    def test_change_pr_points_image_changes_at_batch_enqueue(self):
+        """Sol and Gemini minor: `change pr` no longer says to merge with
+        `change merge NAME`."""
+        text = (paths.SCRIPTS / "change").read_text()
+        body = text[text.index("cmd_pr()"):text.index("cmd_merge()")]
+        self.assertNotIn("Merge these together with", body)
+        self.assertNotIn('echo "Merge them all with: change merge', body)
+        self.assertIn("batch enqueue --record", body)
