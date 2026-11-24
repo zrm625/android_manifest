@@ -105,7 +105,53 @@ class Reconcile(unittest.TestCase):
             self.assertTrue(S.read()["running"]["reconcile_unknown_since"])      # I5: the 24 h clock
 
 
+class ReconcileClock(unittest.TestCase):
+    def test_a_failed_read_starts_the_i5_clock(self):
+        # Sol M2, Gemini minor: a transport exception is an unknown too.
+        with bench_home() as h:
+            setup_batch(h)
+            gh = gh_with()
+            gh.fail["pr_view"] = C.Unknown("pr view", R, None, "timeout")
+            with self.assertRaises(C.Unknown):
+                merge.reconcile(mk_ctx(gh=gh), S.read()["running"])
+            first = S.read()["running"]["reconcile_unknown_since"]
+            self.assertTrue(first)
+            gh.fail["pr_view"] = C.Unknown("pr view", R, None, "timeout")
+            with self.assertRaises(C.Unknown):
+                merge.reconcile(mk_ctx(gh=gh), run_dict())          # a stale copy never restarts the clock
+            self.assertEqual(S.read()["running"]["reconcile_unknown_since"], first)
+
+    def test_lag_that_clears_on_the_second_read_is_landed(self):
+        def land(gh):
+            gh.prs[(R, 7)].update(state="MERGED", mergeCommit={"oid": M})
+        ctx = mk_ctx(gh=gh_with("OPEN", M))
+        ctx.sleep = lambda s: land(ctx.gh)
+        self.assertEqual(merge.reconcile_one(ctx, run_dict(), P, R, 7)[0], merge.LANDED)
+
+
 class MergeAll(unittest.TestCase):
+    def test_merged_after_the_pending_read_is_reconciled_not_halted(self):
+        """Sol M2, Gemini GM3: reconciliation saw it pending, the final read
+        sees MERGED: reconcile again, record it, no merge call, no HALT."""
+        with bench_home() as h:
+            setup_batch(h)
+            write_json(h / "slot-state.json", {"pair": {"batch": "b0001", "attempts": ["fa-1"]}})
+            gh = gh_with()
+            orig = gh.pr_view
+            seen = {"n": 0}
+
+            def view(repo, n):
+                seen["n"] += 1
+                if seen["n"] == 2:                    # someone merged it right after the first reconcile
+                    gh.prs[(R, 7)].update(state="MERGED", mergeCommit={"oid": M})
+                    gh.tips[(R, "refs/heads/river-22.2")] = M
+                return orig(repo, n)
+            gh.pr_view = view
+            merge.merge_all(mk_ctx(gh=gh), S.read()["running"])
+            self.assertEqual(S.read()["running"]["merge"]["merged"], {P: M})
+            self.assertFalse(any(c[0] == "merge_pr" for c in gh.calls))
+
+
     def test_unexpected_merged_goes_through_reconciliation(self):
         """I4: a PR found MERGED is recorded only through R10.4a; no merge call."""
         with bench_home() as h:
@@ -228,6 +274,56 @@ class ChangePRs(unittest.TestCase):
             self.assertIn(("reopen_pr", R, 6), gh.calls)
             self.assertEqual(len(gh.comments_by[(R, 6)]), 2)
             self.assertIn("perch", S.read()["running"]["followups"])
+
+    def change_world(self, h):
+        setup_batch(h)
+        gh = FakeGH()
+        gh.prs[(R, 6)] = {"state": "OPEN", "headRefOid": TESTED, "baseRefName": "river-22.2",
+                          "isCrossRepository": False, "headRefName": "perch"}
+        st = S.read()
+        st["entries"] = [{"name": "perch", "prs": [{"key": f"{R}#6", "path": P, "head": TESTED}]}]
+        return gh, st
+
+    def test_interrupted_close_is_checked_again(self):
+        """Sol M6: the runner died after closing; a push landed during the
+        close. The next pass sees CLOSED with the intent and reopens."""
+        with bench_home() as h:
+            gh, st = self.change_world(h)
+
+            def close_then_die(repo, n):
+                gh.prs[(R, 6)].update(state="CLOSED", headRefOid="f" * 40)
+                raise C.Unknown("pr close", R, None, "timed out")
+            gh.close_pr = close_then_die
+            with self.assertRaises(C.Unknown):
+                merge.change_prs(mk_ctx(gh=gh), st["running"], st)
+            self.assertEqual(S.read()["running"]["closing"], {f"{R}#6": TESTED})
+            gh2 = FakeGH()
+            gh2.prs, gh2.comments_by = gh.prs, gh.comments_by
+            st = S.read()
+            st["entries"] = [{"name": "perch", "prs": [{"key": f"{R}#6", "path": P, "head": TESTED}]}]
+            merge.change_prs(mk_ctx(gh=gh2), st["running"], st)
+            self.assertIn(("reopen_pr", R, 6), gh2.calls)
+            run = S.read()["running"]
+            self.assertIn("perch", run["followups"])
+            self.assertEqual(run["closing"], {})
+
+    def test_closed_at_the_approved_head_clears_the_intent(self):
+        with bench_home() as h:
+            gh, st = self.change_world(h)
+
+            def close_then_die(repo, n):
+                gh.prs[(R, 6)]["state"] = "CLOSED"
+                raise C.Unknown("pr close", R, None, "timed out")
+            gh.close_pr = close_then_die
+            with self.assertRaises(C.Unknown):
+                merge.change_prs(mk_ctx(gh=gh), st["running"], st)
+            gh2 = FakeGH()
+            gh2.prs, gh2.comments_by = gh.prs, gh.comments_by
+            st = S.read()
+            st["entries"] = [{"name": "perch", "prs": [{"key": f"{R}#6", "path": P, "head": TESTED}]}]
+            merge.change_prs(mk_ctx(gh=gh2), st["running"], st)
+            self.assertNotIn(("reopen_pr", R, 6), gh2.calls)
+            self.assertEqual(S.read()["running"]["closing"], {})
 
     def test_comment_once(self):
         gh = FakeGH()

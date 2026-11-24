@@ -223,7 +223,7 @@ def apply(st: dict, running: dict, outcome: dict) -> None:
         if running.get("reached_prs_open"):
             st["strikes"]["transport_prs"] += 1
             if st["strikes"]["transport_prs"] >= 2:
-                S.set_pause(st, "GitHub failed twice after batch PRs opened", step="transport")
+                S.set_pause(st, "GitHub failed twice after batch PRs opened", step="transport_prs")
         return
     # void, an aborted pass that never reached merge_started, anything else
     return_members(st, running, f"{rid} void: {outcome.get('reason') or 'aborted'}")

@@ -189,6 +189,8 @@ def reconcile_one(ctx: Ctx, run: dict, path: str, repo: str, number: int) -> tup
     ctx.sleep(30)
     o2 = _with_commit(ctx, repo, observe(ctx, repo, number), base)
     if o1 != o2:
+        if classify(o2, base, t, tt) == LANDED:
+            return LANDED, o2                   # a lag that cleared: landed on this read (Opus minor)
         return UNKNOWN, o2
     if c1 == "lag":
         return UNKNOWN, o1
@@ -205,9 +207,13 @@ def reconcile(ctx: Ctx, run: dict) -> dict[str, str]:
     for path, e in sorted(frozen.items()):
         if e.get("number") is None or path in merged:
             continue
-        cls, obs = reconcile_one(ctx, run, path, e["repo"], e["number"])
+        try:
+            cls, obs = reconcile_one(ctx, run, path, e["repo"], e["number"])
+        except Unknown:
+            unknown_started()                   # a failed read starts the I5 clock too (Sol M2)
+            raise
         if cls == UNKNOWN:
-            update_running(reconcile_unknown_since=(run.get("reconcile_unknown_since") or now_iso()))
+            unknown_started()
             raise Unknown("reconcile", e["repo"], None, f"#{e['number']}: observations disagree or GitHub lags "
                                                         f"(state {obs['state']}, tip {str(obs['tip'])[:12]})")
         if cls == MISMATCH:
@@ -220,6 +226,14 @@ def reconcile(ctx: Ctx, run: dict) -> dict[str, str]:
     update_running(merge=dict(run.get("merge") or {}, merged=merged), reconcile_unknown_since=None)
     run["merge"] = dict(run.get("merge") or {}, merged=merged)
     return out
+
+
+def unknown_started() -> None:
+    """Record when reconciliation first had no answer (I5's 24 h), from the
+    state file, never from a stale copy of running."""
+    cur = (S.read().get("running") or {}).get("reconcile_unknown_since")
+    if not cur:
+        update_running(reconcile_unknown_since=now_iso())
 
 
 def commit_set_check(ctx: Ctx, run: dict, need_all_merged: bool = False) -> list[str]:
@@ -271,8 +285,15 @@ def merge_all(ctx: Ctx, run: dict) -> None:
         if bad:
             raise Halt("commit-set check failed before a merge: " + "; ".join(bad[:4]))
         v = ctx.gh.pr_view(e["repo"], e["number"])
+        if v.get("state") != "OPEN":
+            # I4, Sol M2, Gemini GM3: a PR that turned MERGED (or anything)
+            # since the reconciliation above goes through R10.4a again.
+            reconcile(ctx, run)
+            if path in run["merge"]["merged"]:
+                continue
+            raise Halt(f"{e['repo']}#{e['number']} is {v.get('state')} without a landed merge")
         if v.get("isCrossRepository") is not False or v.get("baseRefName") != BRANCH \
-                or v.get("headRefOid") != tested(run, path) or v.get("state") != "OPEN":
+                or v.get("headRefOid") != tested(run, path):
             raise Halt(f"{e['repo']}#{e['number']} is not open at the tested head on {BRANCH}")
         if not pair_is_ours(ctx, run):
             raise Halt(f"slot-state.json no longer reserves {run['id']}'s pair")
@@ -280,7 +301,7 @@ def merge_all(ctx: Ctx, run: dict) -> None:
                                        f"base tip {run['base'][path][:12]}",
                       f"merged, merge commit parents [{run['base'][path][:12]}, {tested(run, path)[:12]}]")
         try:
-            ctx.gh.merge_pr(e["repo"], e["number"], tested(run, path))
+            ctx.gh.merge_pr(e["repo"], e["number"], tested(run, path))     # synchronous, never queued (Sol B4)
         except Refused as ex:
             raise Halt(f"GitHub refused the merge of {e['repo']}#{e['number']}: {ex.line}") from ex
         except Unknown:
@@ -353,12 +374,12 @@ def promote(ctx: Ctx, run: dict) -> None:
     if r.rc == 1 and isinstance(line, dict) and "lookup" in line:
         ev = line.get("evidence") or {}
         if ev.get("status") in (401, 403):
-            raise Pause(f"GitHub auth: {line.get('repo')}: {ev.get('status')}")
+            raise Pause(f"GitHub auth: {line.get('repo')}: {ev.get('status')}", step="auth")
         with S.transaction() as st:
             st["strikes"]["lookup"] += 1
             n = st["strikes"]["lookup"]
         if n >= 2:
-            raise Pause(f"flash --promote lookup {line['lookup']} twice: {ev}")
+            raise Pause(f"flash --promote lookup {line['lookup']} twice: {ev}", step="lookup")   # Sol M7
         raise Unknown("flash --promote", line.get("repo"), ev.get("status"), f"lookup {line['lookup']}; retry")
     raise Halt(f"flash --promote {run['id']} exited {r.rc}",
                advice="Zak resolves the pair, then `batch settle <id> --zak`")
@@ -430,14 +451,37 @@ def write_known_good(ctx: Ctx, run: dict, local_only: bool = False) -> bool:
 # --- R10.7 change PRs, R10.8 finish ---------------------------------------------------------------
 
 def change_prs(ctx: Ctx, run: dict, st: dict) -> None:
+    """R10.7. Before closing a change PR the approved head is recorded as a
+    close intent (Sol M6); a PR found closed with an intent outstanding is
+    checked again, so a close that was interrupted, or raced a push, still
+    gets its reopen and follow-up."""
     bid = run["id"]
     tag = f"known-good-{bid}"
     mark = MARK.format(bid=bid)
-    followups = {}
+
+    def followup(name: str, why: str) -> None:
+        with S.transaction() as st2:
+            st2["running"].setdefault("followups", {})[name] = why
+
+    def closing(key: str, head: str | None) -> None:
+        with S.transaction() as st2:
+            c = st2["running"].setdefault("closing", {})
+            if head is None:
+                c.pop(key, None)
+            else:
+                c[key] = head
+
+    def reopen(repo: str, n: int, pr: dict, name: str) -> None:
+        ctx.gh.reopen_pr(repo, n)
+        ctx.gh.comment_once(repo, n, mark + " reopen", f"Approved head {pr['head']} landed in {bid}; later "
+                                                       "commits need a new council round.")
+        followup(name, f"{pr['key']}: head moved during close; reopened")
+
     for m in run["members"]:
         e = S.entry(st, m["name"])
         for pr in e["prs"]:
             repo, n = records.split_key(pr["key"])
+            intent = ((S.read().get("running") or {}).get("closing") or {}).get(pr["key"])
             v = None
             for _ in range(12):
                 v = ctx.gh.pr_view(repo, n)
@@ -445,25 +489,25 @@ def change_prs(ctx: Ctx, run: dict, st: dict) -> None:
                     break
                 ctx.sleep(5)
             if v.get("state") != "OPEN":
+                if intent is not None:
+                    if v.get("state") == "CLOSED" and v.get("headRefOid") != intent:
+                        reopen(repo, n, pr, m["name"])
+                    closing(pr["key"], None)
                 continue
             batch_pr = (run["merge"].get("prs") or {}).get(pr["path"])
             ref = f"{repo}#{batch_pr}" if batch_pr else "the batch PR"
             if v.get("headRefOid") == pr["head"]:
                 ctx.gh.comment_once(repo, n, mark, f"Merged through {ref} (batch {bid}), tagged `{tag}`.")
+                closing(pr["key"], pr["head"])
                 ctx.gh.close_pr(repo, n)
                 again = ctx.gh.pr_view(repo, n)
                 if again.get("headRefOid") != pr["head"]:
-                    ctx.gh.reopen_pr(repo, n)
-                    ctx.gh.comment_once(repo, n, mark + " reopen",
-                                        f"Approved head {pr['head']} landed in {bid}; later commits need a new "
-                                        "council round.")
-                    followups[m["name"]] = f"{pr['key']}: head moved during close; reopened"
+                    reopen(repo, n, pr, m["name"])
+                closing(pr["key"], None)
             else:
                 ctx.gh.comment_once(repo, n, mark, f"Approved head {pr['head']} landed in {bid}; later commits "
                                                    "need a new council round.")
-                followups[m["name"]] = f"{pr['key']}: head moved past the approved head"
-    if followups:
-        update_running(followups=followups)
+                followup(m["name"], f"{pr['key']}: head moved past the approved head")
 
 
 def delete_branch(ctx: Ctx, path: str, repo: str, bid: str, sha: str) -> str:

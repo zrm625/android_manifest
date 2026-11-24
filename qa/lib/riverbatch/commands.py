@@ -203,18 +203,17 @@ def tried(name: str, reason: str) -> None:
 
 def resume() -> dict:
     """Clear a HALT or a pause; reset what R9.1, R9.5 and R11.6 say resume
-    resets."""
+    resets, and every strike (Sol M7, Gemini GM5): Zak resolved what caused
+    them, and a strike left at its limit would refuse stage and qualify
+    forever."""
     with S.transaction("resume") as st:
         was = {"halt": st.get("halt"), "pause": st.get("pause")}
         if not was["halt"] and not was["pause"]:
             raise Refused("nothing to resume: no HALT and no pause")
-        step = (st.get("pause") or {}).get("step")
         st["halt"] = st["pause"] = None
         st["voids_in_a_row"] = 0
         st["last_fail"] = None
-        st["strikes"]["transport_prs"] = 0
-        if step in st["strikes"]:
-            st["strikes"][step] = 0
+        st["strikes"] = {k: 0 for k in S.STRIKES}
         return was
 
 

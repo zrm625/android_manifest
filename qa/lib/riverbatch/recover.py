@@ -157,6 +157,12 @@ def forward(ctx: Ctx, local_only: bool = False) -> str:
         if bad:
             raise Halt("untested content reached river-22.2: " + "; ".join(bad[:4]),
                        advice="Zak: `batch settle <id> --zak`")
+        # Sol M3: no tag before the pair is proven ours (batch and attempt),
+        # even when every merge was already recorded; promotion is the only
+        # durable proof that skips this.
+        if not merge.pair_is_ours(ctx, run):
+            raise Halt(f"slot-state.json no longer reserves {run['id']}'s pair at attempt {run.get('attempt_id')}; "
+                       "nothing was tagged", advice="Zak resolves the pair, then `batch settle <id> --zak`")
         commit_phase("tagging")
         merge.push_tags(ctx, run)
         merge.promote(ctx, run)

@@ -200,6 +200,81 @@ class MergePath(unittest.TestCase):
             self.assertEqual(sum(1 for c in gh.calls if c[0] == "merge_pr"), 1)
             self.assertEqual(seq["n"], 2)
 
+    def patches(self, rgit):
+        return [mock.patch.object(merge, "remote_git", rgit), mock.patch.object(tick, "remote_git", rgit),
+                mock.patch.object(tick.version, "current", return_value=dict(VERS)),
+                mock.patch.object(recover.version, "current", return_value=dict(VERS)),
+                mock.patch("riverqa.bench.attempt_rows", return_value=ROWS)]
+
+    def test_pair_lost_after_the_final_merge_halts_before_any_tag(self):
+        """Sol M3: every merge recorded, the pair gone: no tag, a HALT."""
+        from riverbatch import ctx as C
+        with bench_home() as h:
+            gh, git, tools, rgit = world(h)
+            effect = gh.merge_effect
+
+            def merge_and_lose_pair(repo, n, sha):
+                effect(repo, n, sha)
+                ss = json.loads((h / "slot-state.json").read_text())
+                ss["pair"] = {"batch": "b0001", "kind": "batch", "target": "b", "attempts": ["fa-other"]}
+                (h / "slot-state.json").write_text(json.dumps(ss))
+            gh.merge_effect = merge_and_lose_pair
+            ctx = mk_ctx(gh=gh, tools=tools)
+            ctx.git = git
+            ps = self.patches(rgit)
+            for x in ps:
+                x.start()
+            try:
+                with self.assertRaises(C.Halt) as cm:
+                    tick.merge_path(ctx)
+                self.assertIn("no longer reserves", cm.exception.message)
+                # resumed with every merge already recorded: still no tag
+                with self.assertRaises(C.Halt):
+                    recover.recover_running(ctx)
+            finally:
+                mock.patch.stopall()
+            self.assertEqual(S.read()["running"]["merge"]["merged"], {P: M})
+            self.assertFalse(any(k[1].startswith("refs/tags/") for k in gh.tips))
+            self.assertFalse(any(c[0] == "flash" and c[1][0] == "--promote" for c in tools.calls))
+
+    def test_lookup_pause_has_its_strike_key_and_resume_clears_it(self):
+        """Sol M7, Gemini GM5: promote's lookup pause names the strike;
+        resume clears every strike, so stage and qualify are not refused
+        forever afterwards."""
+        from riverbatch import commands, ctx as C, qualify
+        with bench_home() as h:
+            gh, git, tools, rgit = world(h)
+            promote = tools.script["flash"]
+            fail = {"n": 2}
+
+            def flash(args):
+                if args[0] == "--promote" and fail["n"]:
+                    fail["n"] -= 1
+                    return 1, json.dumps({"lookup": "refused", "repo": "zrm625/x",
+                                          "evidence": {"status": 404}})
+                return promote(args)
+            tools.script["flash"] = flash
+            ctx = mk_ctx(gh=gh, tools=tools)
+            ctx.git = git
+            ps = self.patches(rgit)
+            for x in ps:
+                x.start()
+            try:
+                with self.assertRaises(C.Unknown):
+                    tick.merge_path(ctx)
+                with self.assertRaises(C.Pause) as cm:
+                    recover.recover_running(ctx)
+                tick.commit_stop(cm.exception)
+                st = S.read()
+                self.assertEqual((st["pause"]["step"], st["strikes"]["lookup"]), ("lookup", 2))
+                commands.resume()                                    # Zak
+                self.assertEqual(set(S.read()["strikes"].values()), {0})
+                self.assertEqual(recover.recover_running(ctx), "finished")
+            finally:
+                mock.patch.stopall()
+            qualify.refusals(ctx, "qualify")                         # not refused by a strike
+            qualify.refusals(ctx, "stage")
+
 
 if __name__ == "__main__":
     unittest.main()
