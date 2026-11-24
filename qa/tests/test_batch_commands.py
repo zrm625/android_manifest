@@ -130,6 +130,41 @@ class Enqueue(unittest.TestCase):
             self.assertEqual((st["pause"], st["strikes"]["setup"], st["voids_in_a_row"]), (None, 0, 0))
 
 
+class Migrate(unittest.TestCase):
+    """R5.7 with normal admission (Sol M13)."""
+
+    def queue(self, h, names):
+        q = h / "queue/approved.jsonl"
+        q.parent.mkdir(parents=True, exist_ok=True)
+        q.write_text("".join(json.dumps({"change": n, "status": "queued"}) + "\n" for n in names))
+        return q
+
+    def test_two_names_with_the_same_pr_reject_the_whole_migration(self):
+        with bench_home() as h, tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
+            r1 = make_record(Path(t1), name="perch-launcher")
+            make_record(Path(t2), name="perch-again", branch="perch-launcher")   # the same two PRs
+            gh = FakeGH()
+            world(h, gh, r1)
+            q = self.queue(h, ["perch-launcher", "perch-again"])
+            with self.assertRaises(S.Refused) as cm:
+                commands.migrate(mk_ctx(gh=gh), [Path(t1) / "record.json", Path(t2) / "record.json"])
+            self.assertIn("belong to another change", str(cm.exception))
+            st = S.read()
+            self.assertEqual((st["entries"], st["aliases"], st.get("migrated")), ([], {}, None))
+            self.assertTrue(q.exists())                               # not renamed: nothing migrated
+
+    def test_one_record_migrates(self):
+        with bench_home() as h, tempfile.TemporaryDirectory() as t1:
+            r1 = make_record(Path(t1), name="perch-launcher")
+            gh = FakeGH()
+            world(h, gh, r1)
+            q = self.queue(h, ["perch-launcher"])
+            out = commands.migrate(mk_ctx(gh=gh), [Path(t1) / "record.json"])
+            self.assertEqual(out["migrated"], ["perch-launcher"])
+            self.assertEqual(S.read()["entries"][0]["status"], "queued")
+            self.assertFalse(q.exists())
+
+
 class Eligibility(unittest.TestCase):
     def base(self):
         return {p: "b" * 40 for p in merge.slugs()}

@@ -106,6 +106,7 @@ def enqueue(ctx: Ctx, record_file: Path) -> str:
                      prs=[{"key": p["key"], "path": p["path"], "head": heads[p["key"]]} for p in rec["prs"]])
             e["flags"]["solo"] = True
             e["flags"]["alone"] = bool(rec.get("alone"))
+            e["flags"]["upstream"] = rec["branch"].startswith("upstream-")      # Gemini minor
             action = "replace"
         else:
             e = new_entry(st, rec, sha)
@@ -225,6 +226,17 @@ def cleanup_drop(ctx: Ctx, bid: str) -> None:
             st["cleanup"] = [c for c in st["cleanup"] if c["batch"] != bid]
 
 
+def _migrate_admission(st: dict, rec: dict) -> None:
+    """R5.5 and I13 for one migrated record: a new name whose PRs belong to
+    no other change. Any refusal rejects the whole migration."""
+    keys = [p["key"] for p in rec["prs"]]
+    bad = S.alias_conflicts(st, rec["name"], keys)
+    if bad:
+        raise Refused(f"{rec['name']}: these PRs already belong to another change (I13): " + "; ".join(bad))
+    if S.live_entry(st, rec["name"]):
+        raise Refused(f"{rec['name']} is already an entry")
+
+
 def status(as_json: bool) -> str:
     from riverqa import runnerstate
     st = runnerstate.read_shared(paths.home()) or S.empty()
@@ -279,6 +291,9 @@ def migrate(ctx: Ctx, record_files: list[Path]) -> dict:
     missing = [n for n in names if n not in by_name]
     if missing:
         raise Refused("no council record for " + ", ".join(missing) + " (a missing reply needs a new round)")
+    dup = sorted({n for n in names if names.count(n) > 1})
+    if dup:
+        raise Refused(f"queue/approved.jsonl names {', '.join(dup)} more than once")
     prepared = []
     for n in names:
         rec, raw, f = by_name[n]
@@ -289,11 +304,16 @@ def migrate(ctx: Ctx, record_files: list[Path]) -> dict:
         if out.kind in (eligibility.REFUSED, eligibility.REAPPROVE):
             raise Refused(f"{n}: {out.kind}: {out.reason}")
         prepared.append((rec, raw, f, out))
+    trial = S.empty()                     # Sol M13: normal admission, before anything is written
+    for rec, _raw, _f, _out in prepared:
+        _migrate_admission(trial, rec)
+        S.link_aliases(trial, rec["name"], [p["key"] for p in rec["prs"]])
     shas = [records.store_bundle(rec, raw, f.parent) for rec, raw, f, _ in prepared]
     with S.transaction("migrate", names=names) as st:
         if st.get("migrated") or st["entries"]:
             raise Refused("the state file already has entries; migration runs once, on an empty queue")
         for (rec, _raw, _f, out), sha in zip(prepared, shas):
+            _migrate_admission(st, rec)        # again, inside the transaction: a refusal writes nothing
             e = new_entry(st, rec, sha)
             st["entries"].append(e)
             S.link_aliases(st, rec["name"], [p["key"] for p in rec["prs"]])
