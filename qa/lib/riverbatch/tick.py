@@ -215,11 +215,23 @@ def run_batch(ctx: Ctx, run: dict, kg: dict) -> None:
             why = merge.merge_rule(run, ctx.batch_json(run["id"]) or {}, outcome, version.current(),
                                    not qualification_problems(ctx))
             if not why:
-                merge_path(ctx)
-                return
-            with S.transaction() as st:
-                st["running"]["outcome"] = {"class": O.VOID, "reason": "merge rule: " + "; ".join(why),
-                                            "pause": "gate not qualified"}
+                try:
+                    merge_path(ctx)
+                    return
+                except Abort as a:
+                    # Sol M1, Gemini GB1, Opus OM2: R10.2-R10.3 refused before
+                    # merge_started (a stale base, a conflict, a PR at another
+                    # head, the pair or versions changed): the batch is void
+                    # and ends here, through R11.2 step 2, in this tick.
+                    if (ctx.batch_json(run["id"]) or {}).get("merge_started"):
+                        raise Halt(f"{run['id']}: the merge path aborted after merge_started: {a}",
+                                   advice="Zak: `batch settle <id> --zak`") from a
+                    with S.transaction("decided", batch=run["id"], cls=a.outcome.get("class")) as st:
+                        st["running"]["outcome"] = dict(a.outcome, pause=a.pause or a.outcome.get("pause"))
+            else:
+                with S.transaction() as st:
+                    st["running"]["outcome"] = {"class": O.VOID, "reason": "merge rule: " + "; ".join(why),
+                                                "pause": "gate not qualified"}
         recover.abort(ctx)
     except (Unknown, AuthRefused) as e:
         b = ctx.batch_json(run["id"]) or {}

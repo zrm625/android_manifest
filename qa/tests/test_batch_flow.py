@@ -153,6 +153,141 @@ class Flow(unittest.TestCase):
             self.assertIn("GitHub auth: zrm625/x: 401", S.read()["pause"]["reason"])
 
 
+    def test_auth_names_the_pause_over_the_transport_strike(self):
+        # Gemini minor: the second failure after PRs opened is an auth
+        # refusal; the pause says so, not "GitHub failed twice".
+        with bench_home() as h:
+            run = claim(["a"])
+            with S.transaction() as st:
+                st["strikes"]["transport_prs"] = 1
+                st["running"]["reached_prs_open"] = True
+            write_json(h / "batches/b0001/batch.json", {"kind": "batch", "experiment": False})
+            ps = steps() + [mock.patch.object(tick, "merge_path",
+                                              side_effect=C.AuthRefused("push", "zrm625/x", 401, "bad")),
+                            mock.patch.object(tick.version, "current",
+                                              return_value={"harness": "h", "runner_build": "rb", "runner_tools": "rt"}),
+                            mock.patch.object(tick, "qualification_problems", return_value=[])]
+            with self.assertRaises(C.Pause):
+                self.run_batch(h, run, ps)
+            self.assertIn("GitHub auth: zrm625/x: 401", S.read()["pause"]["reason"])
+
+
+class MergePathAbort(unittest.TestCase):
+    """Sol M1, Gemini GB1, Opus OM2: an R10.2-R10.3 refusal before
+    merge_started ends the batch in the same tick, through tick.run_batch."""
+
+    def test_stale_base_rolls_back_voids_reports_and_releases_the_pair(self):
+        import test_batch_mergepath as mp
+        with bench_home() as h:
+            gh, git, tools, rgit = mp.world(h)
+            gh.tips[(mp.merge.slugs()["vendor/lineage"], "refs/heads/river-22.2")] = "f" * 40   # base moved
+            flash = tools.script["flash"]
+
+            def flash2(args):
+                if args[0] == "--rollback":
+                    import json
+                    ss = json.loads((h / "slot-state.json").read_text())
+                    ss["pair"] = None
+                    (h / "slot-state.json").write_text(json.dumps(ss))
+                    return 0, ""
+                return flash(args)
+            tools.script["flash"] = flash2
+            ctx = mk_ctx(gh=gh, tools=tools)
+            ctx.git = git
+            run = S.read()["running"]
+            ps = steps() + [mock.patch.object(mp.merge, "remote_git", rgit),
+                            mock.patch.object(tick, "remote_git", rgit),
+                            mock.patch.object(tick.version, "current", return_value=dict(mp.VERS)),
+                            mock.patch.object(tick, "qualification_problems", return_value=[])]
+            for x in ps:
+                x.start()
+            try:
+                tick.run_batch(ctx, run, {"latest": {"cameras": [0, 1, 2]}})     # returns: no runner error
+            finally:
+                mock.patch.stopall()
+            st = S.read()
+            self.assertIn(("flash", ("--rollback",), "b0001"), tools.calls)
+            self.assertIsNone(json_load(h / "slot-state.json")["pair"])        # ownership released
+            self.assertIsNone(st["running"])
+            e = st["entries"][0]
+            self.assertEqual(e["status"], "queued")
+            self.assertIn("stale-base", e["reason"])
+            self.assertEqual(st["voids_in_a_row"], 1)
+            self.assertIn("b0001", st["reports_pending"])
+            self.assertEqual([c["batch"] for c in st["cleanup"]], ["b0001"])    # its PRs and branches
+            self.assertFalse(any(c[0] == "merge_pr" for c in gh.calls))
+
+
+def json_load(path):
+    import json
+    return json.loads(path.read_text())
+
+
+class RealQA(unittest.TestCase):
+    """phases.test for real (Gemini minor): exact gate reasons (Opus minor),
+    and an experiment's clean run is a pass that reaches Zak (Opus OM1,
+    Gemini GM8)."""
+
+    def results(self, h, purpose, rc=0, reasons=(), states=None):
+        import json
+        states = states or {"apps.camera": "PASS", "boot": "PASS"}
+        res = {"mode": "batch", "batch": "b0001", "run_id": "qa-1", "flash_attempt": "fa-1",
+               "harness_version": "h", "serial": "ZY225DPT7F", "eligible": not reasons and purpose == "batch",
+               "not_eligible_because": list(reasons), "required": sorted(states),
+               "results": {k: {"state": v} for k, v in states.items()}}
+        f = h / "qa/runs/qa-1/results.json"
+        write_json(f, res)
+        line = json.dumps({"run_id": "qa-1", "results": str(f)})
+        return FakeTools({"phone-qa": [(rc, line)]})
+
+    def run_qa(self, h, purpose, **kw):
+        run = claim(["a"], purpose=purpose)
+        tools = self.results(h, purpose, **kw)
+        names = ["checkout", "build", "stage_run", "restore_or_void", "flash", "bench", "setup_candidate"]
+        ps = [mock.patch.object(phases, n) for n in names] + [mock.patch.object(tick, "commit_phase")]
+        return self_run(h, run, ps, tools)
+
+    def test_experiment_clean_run_reaches_waiting_zak_with_evidence(self):
+        with bench_home() as h:
+            self.run_qa(h, "experiment", reasons=["experiment batch"])
+            e = S.read()["entries"][0]
+            self.assertEqual(e["status"], "waiting-zak")
+            self.assertIn("experiment b0001: pass", e["reason"])
+            self.assertEqual(e["experiment_result"]["run_ids"], ["qa-1"])
+            self.assertEqual(S.read()["voids_in_a_row"], 0)
+
+    def test_experiment_with_a_failing_check_is_a_fail_for_zak(self):
+        with bench_home() as h:
+            self.run_qa(h, "experiment", rc=1, reasons=["experiment batch", "apps.camera: FAIL"],
+                        states={"apps.camera": "FAIL", "boot": "PASS"})
+            e = S.read()["entries"][0]
+            self.assertEqual(e["status"], "waiting-zak")
+            self.assertIn("experiment b0001: fail", e["reason"])
+
+    def test_gate_reasons_are_whole_reasons(self):
+        with bench_home() as h:
+            with self.assertRaises(C.Pause):
+                self.run_qa(h, "batch", reasons=["2/3 clean --calibrate runs for this harness version"])
+            self.assertEqual(S.read()["entries"][0]["status"], "queued")       # void, not the change's fault
+        with bench_home() as h:
+            # A check whose name mentions calibration is a check, not the gate.
+            self.run_qa(h, "batch", rc=1, reasons=["apps.calibration_view: FAIL"],
+                        states={"apps.calibration_view": "FAIL"})
+            self.assertEqual(S.read()["entries"][0]["status"], "failed")
+
+
+def self_run(h, run, patches, tools):
+    write_json(h / "slot-state.json", {"pair": {"batch": "b0001", "attempts": ["fa-1"]}})
+    ctx = mk_ctx(tools=tools)
+    for p in patches:
+        p.start()
+    try:
+        tick.run_batch(ctx, run, {"latest": {"cameras": [0, 1, 2]}})
+    finally:
+        mock.patch.stopall()
+    return tools
+
+
 class Crash(unittest.TestCase):
     """R11.2 step 2a: a crash after a completed rescue is a fail, not a void."""
 

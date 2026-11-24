@@ -363,7 +363,9 @@ class Versions(unittest.TestCase):
 
 class Outcome(unittest.TestCase):
     def test_qa_gate_state_pauses(self):
-        self.assertIn("calibrat", " ".join(phases.GATE_WORDS))
+        self.assertEqual(phases.gate_reasons({"not_eligible_because": [
+            "thresholds.json is not calibrated", "controls not qualified (2 not run)", "apps.calibration: FAIL"]}),
+            ["thresholds.json is not calibrated", "controls not qualified (2 not run)"])
         self.assertEqual(O.PASS, "pass")
 
 

@@ -297,6 +297,7 @@ def run_part2(ctx: Ctx, base: dict, kg: dict, pin: str, changes: list[str]) -> d
     with S.transaction("decided", batch=qid) as st2:
         st2["running"]["outcome"] = outcome
         st2["running"]["phase"] = "decided"
+        qa = dict(st2["running"].get("qa") or {})  # before abort clears running (Gemini minor)
     try:
         recover.abort(ctx)                           # phase 11: rollback; nothing applied to entries
     except (Pause, Halt) as e:
@@ -321,6 +322,5 @@ def run_part2(ctx: Ctx, base: dict, kg: dict, pin: str, changes: list[str]) -> d
         owed.append(f"KB after the run: {c.message}")
     if owed:
         failed.append("derived obligations pending: " + "; ".join(owed))
-    qa = (run.get("qa") or S.read().get("last_qa") or {})
     return {"passed": not failed, "failed": failed, "id": qid, "at": now_iso(),
             "borrowed": [e["name"] for e in members], "qa": qa}

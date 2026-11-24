@@ -99,14 +99,21 @@ def abort(ctx: Ctx, extra_pause: str | None = None) -> None:
     with S.transaction("abort", batch=bid) as st:
         run = st["running"]
         outcome = run.get("outcome") or {"class": O.VOID, "reason": f"aborted in phase {run.get('phase')}"}
-        if outcome.get("class") == O.PASS:
+        if outcome.get("class") == O.PASS and run.get("purpose") == "batch":
+            # Only a batch's pass is a merge that did not happen; an
+            # experiment's pass goes to Zak (R9.2, Opus OM1, Gemini GM8).
             outcome = {"class": O.VOID, "reason": "passed but never reached merge_started"}
         if tree_pause and outcome.get("class") not in (O.FAIL, O.DESK):
             outcome = {"class": O.VOID, "reason": tree_pause}
+        before = st.get("pause")
         O.apply(st, run, outcome)
+        # A cause this abort knows (a disturbed tree, a GitHub auth refusal)
+        # names the pause, over a generic one apply() set in this same
+        # transaction (Gemini minor); a pause from before is never replaced.
         for p in (tree_pause, extra_pause, outcome.get("pause")):
-            if p and not st.get("pause"):
+            if p and (not st.get("pause") or (st["pause"] is not before and p in (tree_pause, extra_pause))):
                 S.set_pause(st, p, step="abort")
+                break
         st["running"] = None
         S.add_report(st, bid)
     merge.prune_local(ctx, bid, run.get("touched") or [])

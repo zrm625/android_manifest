@@ -6,6 +6,7 @@ with its outcome class; the caller ends the run through R11.2 step 2."""
 from __future__ import annotations
 
 import json
+import re
 import shutil
 
 from riverqa import bench as rbench, regression, stage
@@ -411,7 +412,15 @@ def setup_candidate(ctx: Ctx, run: dict) -> None:
 
 # --- phase 9: QA (R8.5) ---------------------------------------------------------------------------
 
-GATE_WORDS = ("controls not qualified", "calibrat", "thresholds")
+# The gate-state reasons of results.eligibility, matched whole (Opus minor):
+# the harness itself is not ready, so the run is void, never the change's fault.
+GATE_REASONS = (re.compile(r"thresholds\.json is not calibrated"),
+                re.compile(r"\d+/\d+ clean --calibrate runs for this harness version"),
+                re.compile(r"controls not qualified( \(.*\))?"))
+
+
+def gate_reasons(results: dict) -> list[str]:
+    return [r for r in results.get("not_eligible_because") or [] if any(g.fullmatch(r) for g in GATE_REASONS)]
 
 
 def test(ctx: Ctx, run: dict) -> dict:
@@ -433,17 +442,21 @@ def test(ctx: Ctx, run: dict) -> dict:
                        "bound": bound})
     if not bound:
         return {"class": O.VOID, "reason": f"QA result {why}"}
+    evidence = {"step": "qa", "run_ids": [h6["run_id"]], "results": h6.get("results"),
+                "report": str(paths.home() / "qa" / "runs" / h6["run_id"] / "report.html"),
+                "attempt_id": run["attempt_id"], "not_eligible_because": results.get("not_eligible_because")}
     if r.rc == 0 and results.get("eligible") is True:
         return {"class": O.PASS}
-    reasons = " ".join(results.get("not_eligible_because") or []).lower()
-    if r.rc == 0 and any(w in reasons for w in GATE_WORDS):
-        return {"class": O.VOID, "reason": "gate not qualified", "pause": "gate not qualified"}
+    gate = gate_reasons(results)
+    if r.rc == 0 and gate:
+        return {"class": O.VOID, "reason": "gate not qualified: " + "; ".join(gate), "pause": "gate not qualified"}
+    if r.rc == 0 and run.get("purpose") == "experiment" and not O.failing_checks(results):
+        # An experiment is never merge-eligible (results.eligibility says
+        # "experiment batch"); a clean run is its pass, for Zak (R9.2).
+        return {"class": O.PASS, "evidence": evidence}
     if r.rc in (0, 1, 2):
         checks = O.failing_checks(results) or ["qa"]
-        return {"class": O.FAIL, "checks": checks,
-                "evidence": {"step": "qa", "run_ids": [h6["run_id"]], "results": h6.get("results"),
-                             "report": str(paths.home() / "qa" / "runs" / h6["run_id"] / "report.html"),
-                             "attempt_id": run["attempt_id"]}}
+        return {"class": O.FAIL, "checks": checks, "evidence": evidence}
     return {"class": O.VOID, "reason": f"phone-qa exited {r.rc}"}
 
 
