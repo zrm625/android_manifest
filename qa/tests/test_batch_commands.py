@@ -202,6 +202,18 @@ class CLI(unittest.TestCase):
                 self.assertEqual(self.run_cli(["withdraw", "x"])[0], 3)
             self.assertIn("second runner error", S.read()["halt"]["reason"])
 
+    def test_a_bad_record_is_a_refusal_not_a_runner_error(self):
+        with bench_home(), tempfile.TemporaryDirectory() as t:
+            f = Path(t) / "record.json"
+            f.write_text("not json")
+            for _ in range(2):                                       # twice: still no HALT
+                code, last = self.run_cli(["enqueue", "--record", str(f)])
+                self.assertEqual(code, 1)
+                self.assertIn("not JSON", last["refused"])
+            st = S.read()
+            self.assertIsNone(st["halt"])
+            self.assertIsNone(st["last_error"])
+
 
 if __name__ == "__main__":
     unittest.main()

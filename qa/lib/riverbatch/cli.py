@@ -17,7 +17,7 @@ import sys
 import traceback
 from pathlib import Path
 
-from . import commands, ctx as C, paths, report, state as S
+from . import commands, ctx as C, paths, records, report, state as S
 
 USAGE = """\
 batch: the river batch runner (qa/RUNNER.md).
@@ -145,7 +145,7 @@ def main(argv: list[str], ctx: C.Ctx | None = None) -> int:
             summary["written"] = report.flush(ctx) + ([a.id] if a.id else [])
     except C.ReExec:
         raise
-    except S.Refused as e:
+    except (S.Refused, records.RecordError) as e:            # a bad record is a refusal, never a runner error
         code, summary["refused"] = C.EXIT_ERROR, str(e)
         print(f"error: {e}", file=sys.stderr)
     except C.Busy as e:

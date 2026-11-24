@@ -19,16 +19,20 @@ Record (version 2)::
        {"scope": "delta", ..., "heads": {"<key>": {"from": "<40-hex>", "to": "<40-hex>"}}, ...}],
      "prior": []}
 
-**Evidence binding** (R5.2 item 5 as tightened by I14). For every round:
+**Evidence binding** (R5.2 item 5 as tightened by I14, Sol B3). For every
+round, the brief and each reply carry the round's **scope block**:
 
-- the brief has a line ``Scope: full`` or ``Scope: delta`` equal to the
-  round's scope, and every head the round names in full 40-hex form (a full
-  round's heads; a delta round's ``from`` and ``to``);
-- each reply has the same scope line, a verdict line ``Verdict: APPROVE``
-  (optionally with the score) equal to the provider's recorded verdict, and
-  cites every head of the round's scope in full 40-hex form (a full round's
-  heads; a delta round's ``from`` and ``to``). A reply about other heads,
-  another scope, or with another verdict does not count.
+- a line ``Scope: full`` or ``Scope: delta`` equal to the round's scope;
+- for a full round, one line per PR ``Head: <owner/name#N> <40-hex head>``;
+- for a delta round, one line per PR ``Delta: <owner/name#N> <40-hex from>
+  -> <40-hex to>`` (in that order).
+
+The PR-to-head lines must be exactly the round's ``heads``: every PR once,
+with its own head (or its own from and to, not reversed), and no other PR.
+A SHA merely mentioned somewhere does not bind anything. Each reply also has
+a verdict line ``Verdict: APPROVE`` (optionally with the score) equal to the
+provider's recorded verdict. A reply about other heads, another scope, a
+reversed delta, swapped PRs or another verdict does not count.
 """
 
 from __future__ import annotations
@@ -82,14 +86,54 @@ def _basename(name, what: str) -> str:
     return name
 
 
-def round_heads(rnd: dict) -> tuple[list[str], list[str]]:
-    """(heads the brief must list, heads each reply must cite) of a round,
-    all full 40-hex (I14)."""
-    if rnd.get("scope") == "full":
-        hs = list(rnd["heads"].values())
-        return hs, hs
-    hs = [h for v in rnd["heads"].values() for h in (v["from"], v["to"])]
-    return hs, hs
+SCOPE_KEY = r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*)"
+_SEP = r"[\s*_`]"
+BIND_ANY_RE = re.compile(r"(?im)^[\s>*#_-]*(head|delta)[\s*_]*[:=](.*)$")
+HEAD_RE = re.compile(rf"^{_SEP}*{SCOPE_KEY}{_SEP}+([0-9a-f]{{40}}){_SEP}*$")
+DELTA_RE = re.compile(rf"^{_SEP}*{SCOPE_KEY}{_SEP}+([0-9a-f]{{40}}){_SEP}*(?:->|\u2192){_SEP}*([0-9a-f]{{40}}){_SEP}*$")
+
+
+def scope_block(text: str) -> tuple[dict, dict, list[str]]:
+    """The ``Head:`` and ``Delta:`` lines of a brief or reply: ({key:
+    head}, {key: {"from", "to"}}, errors). A line that starts like one but
+    is not exactly ``<key> <40-hex>`` (or ``<key> <from> -> <to>``), or a
+    key given twice, is an error."""
+    heads, deltas, errs = {}, {}, []
+    for kind, rest in BIND_ANY_RE.findall(text):
+        kind = kind.lower()
+        m = (HEAD_RE if kind == "head" else DELTA_RE).match(rest)
+        if not m:
+            errs.append(f"malformed {kind.capitalize()} line {rest.strip()[:100]!r}")
+            continue
+        key = m.group(1)
+        val = m.group(2) if kind == "head" else {"from": m.group(2), "to": m.group(3)}
+        into = heads if kind == "head" else deltas
+        if key in into and into[key] != val:
+            errs.append(f"{key} is bound twice, to different heads")
+        into[key] = val
+    return heads, deltas, errs
+
+
+def check_binding(text: str, rnd: dict, who: str) -> list[str]:
+    """Why ``text`` (a brief or a reply) does not bind exactly this round's
+    PRs to exactly its heads (Sol B3), or []."""
+    heads, deltas, errs = scope_block(text)
+    errs = [f"{who}: {e}" for e in errs]
+    want = rnd["heads"]
+    got, other = (heads, deltas) if rnd["scope"] == "full" else (deltas, heads)
+    word = "Head" if rnd["scope"] == "full" else "Delta"
+    if other:
+        errs.append(f"{who}: has {'Delta' if word == 'Head' else 'Head'} lines in a {rnd['scope']} round")
+    if got != want:
+        missing = sorted(k for k in want if k not in got)
+        extra = sorted(k for k in got if k not in want)
+        wrong = sorted(k for k in want if k in got and got[k] != want[k])
+        why = "; ".join(x for x in (
+            f"no {word} line for {', '.join(missing)}" if missing else "",
+            f"binds PRs outside the round: {', '.join(extra)}" if extra else "",
+            f"binds {', '.join(wrong)} to other heads than the round's" if wrong else "") if x)
+        errs.append(f"{who}: scope block does not bind the round's PRs to its heads ({why})")
+    return errs
 
 
 def _verdict(v) -> tuple[str, str | None]:
@@ -114,10 +158,7 @@ def check_reply(text: str, rnd: dict, provider: str, verdict: str) -> list[str]:
                 or (want_score is not None and not score):
             got = f"{word} {score}".strip()
             errs.append(f"{provider}: reply's verdict {got!r} differs from the recorded {verdict!r}")
-    _brief, cite = round_heads(rnd)
-    missing = [h for h in cite if h not in text]
-    if missing:
-        errs.append(f"{provider}: reply does not cite {', '.join(h[:12] for h in missing)} in full")
+    errs.extend(check_binding(text, rnd, f"{provider}: reply"))
     return errs
 
 
@@ -202,10 +243,7 @@ def validate(record: dict, directory: Path, kinds=KINDS) -> list[str]:
                 bscopes = {s.lower() for s in SCOPE_LINE_RE.findall(btext)}
                 if bscopes != {scope}:
                     errs.append(f"{where}: brief states scope {sorted(bscopes) or 'none'}, the round is {scope}")
-                want, _cite = round_heads(rnd)
-                miss = [h for h in want if h not in btext]
-                if miss:
-                    errs.append(f"{where}: brief does not list {', '.join(h[:12] for h in miss)} in full")
+                errs.extend(f"{where}: {e}" for e in check_binding(btext, rnd, "brief"))
             except RecordError as e:
                 errs.append(str(e))
             for prov in PROVIDERS:
@@ -242,8 +280,10 @@ def files_of(record: dict) -> list[str]:
         out.extend(r["file"] for r in (rnd.get("replies") or {}).values())
     for rnd in record.get("prior") or []:
         for f in [rnd.get("brief")] + [r.get("file") for r in (rnd.get("replies") or {}).values()]:
-            if isinstance(f, str) and f and "/" not in f and (f not in out):
-                out.append(f)
+            try:
+                out.append(_basename(f, "prior"))       # never '.', '..', a path or record.json
+            except RecordError:
+                continue
     return list(dict.fromkeys(out))
 
 
@@ -288,10 +328,15 @@ def store_bundle(record: dict, raw: bytes, src_dir: Path) -> str:
             if not (final / n).exists() or (final / n).read_bytes() != (src_dir / n).read_bytes():
                 raise RecordError(f"bundle {final} exists and {n} differs; refusing")
         return sha
+    try:
+        contents = [("record.json", raw)] + [(n, (src_dir / n).read_bytes()) for n in names]
+    except OSError as e:
+        raise RecordError(f"{e.filename}: cannot be read ({e.strerror}); every brief and reply the record "
+                          "names, prior rounds included, must sit next to it") from e
     final.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix=f".{sha[:12]}.", dir=final.parent))
     try:
-        for n, data in [("record.json", raw)] + [(n, (src_dir / n).read_bytes()) for n in names]:
+        for n, data in contents:
             with open(tmp / n, "wb") as f:
                 f.write(data)
                 f.flush()
@@ -315,6 +360,11 @@ def load_bundle(name: str, sha: str) -> tuple[dict | None, list[str]]:
         return None, [f"bundle {name}/{sha[:12]} cannot be read: {e}"]
     if sha256_bytes(raw) != sha:
         return None, [f"bundle {name}/{sha[:12]}: record.json no longer hashes to its name"]
-    rec = json.loads(raw)
+    try:
+        rec = json.loads(raw)
+    except ValueError as e:
+        return None, [f"bundle {name}/{sha[:12]}: record.json does not parse: {e}"]
+    if not isinstance(rec, dict):
+        return None, [f"bundle {name}/{sha[:12]}: record.json is not an object"]
     errs = validate(rec, d)
     return (rec if not errs else None), errs
