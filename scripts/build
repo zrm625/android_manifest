@@ -72,6 +72,14 @@ commit_set() {
     done | LC_ALL=C sort
   printf '.repo/manifests %s%s\n' "$(git -C "$tree/.repo/manifests" rev-parse HEAD)" "$(dirty "$tree/.repo/manifests")"
 }
+# Sol M10: the build lock first, so a cooperating `change start` or
+# `setup-forks` (they take the same lock) cannot switch the tree between the
+# commit set recorded here and the build.
+acquire_build_lock
+out=$BENCH_HOME/out-$env_name
+# H1: a killed build must leave nothing a reader could trust: the previous
+# build's record and result go before anything else.
+rm -f "$out/river-build.json" "$out/.bench-result"
 commits=$(commit_set)
 commit_hash=$(sha256sum <<<"$commits" | cut -c1-10)
 if [[ -n "$batch" ]]; then
@@ -82,11 +90,6 @@ fi
 [[ "$build_id" =~ ^[A-Za-z0-9._-]{1,80}$ ]] || { echo "error: bad build ID '$build_id'" >&2; exit 1; }
 export RIVER_BUILD_ID=$build_id
 
-acquire_build_lock
-out=$BENCH_HOME/out-$env_name
-# H1: a killed build must leave nothing a reader could trust: the previous
-# build's record and result go before anything else.
-rm -f "$out/river-build.json" "$out/.bench-result"
 # Lowest CPU priority: the build and every compiler it starts yield to
 # anything interactive, but still use idle cores. (bench does not do this, so
 # its timings are not affected by the desktop.)
