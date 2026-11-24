@@ -14,7 +14,7 @@ it, edit it there and open a pull request (see [Rules](#rules)).
 | --- | --- | --- |
 | `tree/` | `~/git/lineageos-river` | The source tree you work in (manifest branch `river-22.2`) |
 | `baseline/` | `~/git/lineageos-river-baseline` | Frozen stock tree for comparison (locked branch `baseline-22.2`). Never edit it. |
-| `scripts/` | `tree/.repo/manifests/scripts` | `change`, `build`, `flash`, `phone-qa`, `phone-setup`, `device-lock`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
+| `scripts/` | `tree/.repo/manifests/scripts` | `change`, `batch`, `build`, `flash`, `phone-qa`, `phone-setup`, `device-lock`, `bench/bench`, `bench/device-bench`, `merge-upstream`, `setup-forks` |
 | `bench/` | `/mnt/storage/lineageos-bench` | Working build output (`out-stripped/`), benchmark output (`out-bench-*/`), `results/`, `logs/` |
 | `phone` | Moto G7, USB serial `ZY225DPT7F` | The only test phone |
 
@@ -215,14 +215,25 @@ The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
    off and no click sounds, and it never sends LineageOS stats. Extra dim has
    no image default, so the script sets it.
 
-7. **Open the pull requests and merge** them, one command each however many
-   repos the change touched. Paste the `phone-qa --quick` and `device-bench`
-   results into the description:
+7. **Return the phone, open the pull requests, and queue the change.** Paste
+   the `phone-qa --quick` and `device-bench` results into the description:
 
    ```sh
+   scripts/flash --rollback             # dev work on the phone is done: back to known-good (wipes data)
+   scripts/phone-setup --wifi SSID_FILE PSK_FILE
    scripts/change pr -t "<title>" -F notes.md
-   scripts/change merge
+   # the council reviews the exact PR heads; then:
+   scripts/batch enqueue --record <record.json>
    ```
+
+   **Every image change ends at `batch enqueue`.** The batch runner
+   (`tree/.repo/manifests/qa/RUNNER.md`) builds it with the other queued
+   changes, flashes, benches, sets up and QAs the batch on the phone, and
+   merges it through one batch PR per repo when everything passes. Never merge
+   an image change yourself, from the command line or the GitHub web UI.
+   `scripts/batch status` shows the queue, the running batch and what waits on
+   Zak. The runner refuses to start while the phone runs a dev build, so
+   always end dev work with `flash --rollback`.
 
 8. **Now and then**, mark a milestone with `scripts/change tag baseline-<n>`.
    The `device-bench` run of the merged change is its measurement; no cold
@@ -233,8 +244,23 @@ The whole loop, from an idea to merged. Steps 3 to 5 take about 10 minutes.
 - Pull requests go only to `zrm625` repos, base `river-22.2`. Never send one to
   LineageOS, TheMuppets, or AOSP. Details are in `tree/AGENTS.md`.
 - Do not edit `baseline/`.
-- Only one build at a time.
+- Only one build at a time. `build`, `change`, `merge-upstream` and
+  `setup-forks` wait (exit 1) while a build or a batch holds the build lock.
 - adb and fastboot only ever target `-s ZY225DPT7F`.
+- `change merge NAME --record FILE` merges only a council-reviewed,
+  tooling-only manifest PR (`qa/`, `scripts/`, `workspace/`, `*.md` other
+  than `CHARTER.md`), and only after charter PR #11 is merged. Without
+  `--record` it refuses.
+- While `scripts/batch status` shows a running batch or a tree lease: never
+  `repo sync`, never check out anything in a fork, never merge into
+  `river-22.2`. Leave every fork on `river-22.2` when you finish.
+- Never push `batch/*` branches. Never pass `--zak` to any command.
+- `failed` queue entries are decided by the tester thread with `batch
+  requeue` or `batch tried` and a reason that names the evidence.
+- Upstream merges: `change start upstream-YYYYMM`, `merge-upstream`, `change
+  pr`, the council, `batch enqueue`. `merge-upstream` never touches
+  `river-22.2`.
+- Never `podman image prune` the `lineageos-bench` images.
 
 ## Set up this directory on a new machine
 

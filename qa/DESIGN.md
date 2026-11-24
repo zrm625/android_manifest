@@ -2659,3 +2659,21 @@ follow-up: the boot-only final check reads slot and boot completion with
 `unauthorized` when `adb get-state` says so, and the dev flash then asks
 for the USB-debugging prompt instead of timing out; README and `phone-qa
 recover` help describe the boot-only path (exit 0, obligation pending).
+
+## The batch runner
+
+The runner that drives this harness (`scripts/batch`, `qa/lib/riverbatch/`)
+has its own design and rules: [RUNNER.md](RUNNER.md) (revision 6, approved by
+the council in round 6, with the binding implementation requirements I1-I21).
+It changed these harness interfaces (RUNNER.md section 17, README "Runner
+interfaces added with the batch runner"): the build lock in
+`scripts/common.sh` with tokens and the orphan check (H1, H2, H15,
+`riverqa/children.py`), `phone-qa qualified` (H3), the last-line JSON of a
+run (H6), `phone-qa journal --restore` (H10), the typed lookup and
+`flash --promote` exit 75 (H11, I4), `flash --rollback`/`--recover`
+refusing on the running batch's pair (H12), `stage.parse_camera_set` (H13),
+the kept RAM reference on a re-baseline (H14), `phone-setup` on the
+requested SSID (H16), the attempt ID on every rescue wipe (H17, I3),
+`features.SETUP_SETTINGS` (H18), and `phone-qa stage` under the build lock
+(I16). Each is a harness-version input except H1, H4 and H16, so the harness
+is qualified again after the runner PR, in README order.

@@ -7,7 +7,8 @@ round 11, is [DESIGN.md](DESIGN.md). This file covers how to use it.
 
 Stage 1 (this code) has `phone-qa`, the helper APK, the fixtures, and the
 `flash` and `device-bench` support. Stage 2 is the batch runner
-(`change batch`), the queue and the tester thread. See
+(`scripts/batch`, code in `qa/lib/riverbatch/`, design and rules in
+[RUNNER.md](RUNNER.md)), the queue and the tester thread. See
 [Interfaces for the batch runner](#interfaces-for-the-batch-runner).
 
 ## Day to day: `phone-qa --quick`
@@ -524,10 +525,69 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   known-good slot.
 - **`known-good.json`.** `phone-qa --baseline` seeds it, including the
   immutable `calibration_seed` that the harness version hashes. After a
-  clean tag, the tester updates it with `regression.update_on_tag()`.
+  clean tag and a promotion, the runner updates it with
+  `regression.update_on_tag()` (RUNNER.md R10.6 step 3).
 - **The target phone.** The serial `ZY225DPT7F` is fixed in the code;
   `BENCH_DEVICE` may only repeat it. Every reboot command checks the phone
   (adb) or bootloader (fastboot) reports `river` first.
-- **Rerun once.** A spurious extra-boot FAIL (this phone has reset on its
-  own) is settled by rerunning the batch once. That rule belongs to
-  `change batch`.
+- **Failures are decided by the tester thread, not the harness.** There is
+  no automatic rerun. A batch of several changes that fails is split into
+  solo runs; a solo failure becomes a `failed` queue entry, and the tester
+  thread reads the evidence and runs `batch requeue` (the phone, the desk or
+  the workstation caused it) or `batch tried` (the change caused it), with a
+  reason that names the evidence (RUNNER.md R9.4, R16.2).
+
+### Runner interfaces added with the batch runner (RUNNER.md section 17)
+
+- **The runner** is `scripts/batch`, code in `qa/lib/riverbatch/`. It imports
+  `riverqa` but is not part of it: nothing in it changes `phone-qa version`.
+- **The last stdout line of a `phone-qa` run** (H6) is one JSON object
+  `{"run_id", "results", "exit_code", "eligible", "halted"}`. The runner
+  binds the run by it and reads the verdict from `results.json`.
+- **`phone-qa qualified`** (H3), host-only: one JSON line `{"qualified",
+  "harness_version", "missing"}`; exit 0 only if `thresholds.json` is
+  calibrated, 5 clean `--calibrate` runs and every control are recorded for
+  the current harness version, `known-good.json` has `latest`,
+  `ram_reference` and `calibration_seed`, `slot-state.json` has a closed
+  baseline, and no baseline checkpoint is pending.
+- **`phone-qa journal --restore`** (H10): under the device lock, only the
+  preflight's journal recovery (fb_mode included), with `dev.guard()` before
+  any `dev.root()`. Exit 0 if the journal is then empty; 3 on a guard
+  failure, a halting failure or an fb_mode obligation still pending; 1
+  otherwise.
+- **`flash --recover`** is used by the runner only with no slot pair (a
+  baseline checkpoint or an fb_mode obligation).
+- **`flash --promote`** (H11): the lookup is typed (`transport`, `refused`,
+  `malformed`, `ok`). A transport failure exits **75** before the phone is
+  touched; so does a PR that GitHub still reports open although its tagged
+  merge commit already holds the tested head (I4: a lagging read, retried).
+  A refused or malformed lookup exits 1 with a last stdout line
+  `{"lookup": "refused"|"malformed", "repo", "evidence"}`. Exit 3 stays for a
+  proof that is not PROMOTE and for phone failures.
+- **Rescue wipes carry the flash attempt ID** (H17, I3): `device-bench`'s
+  bench-boot rescue and both exit-4 paths of `flash --batch` (a failed boot
+  and a bootloader fallback) go through `flashing.rescue()`, so the
+  `rolled-back` event's `how` starts with `rescue:` and names `wipe #<seq>`,
+  and that `wipes.jsonl` record has the attempt ID.
+- **`features.SETUP_SETTINGS`** (H18): the settings `final.settings`
+  compares, as (read command, expected value); the runner's setup readback
+  uses the same table.
+- **Refusals** (H12, H15): `flash --rollback` and `--recover` refuse (exit 1)
+  while the slot pair belongs to the batch the runner is running, unless the
+  runner itself calls them (`RIVER_BATCH_ID` and its lock token) or `--zak`
+  is given. Every lock (`DeviceLock`, the build lock in Python and shell,
+  `device_lock`) refuses, after `flock` and before writing its token, while a
+  live runner child record of another session exists
+  (`qa/lib/riverqa/children.py`).
+- **The build lock** (H1, H2): `acquire_build_lock` is in
+  `scripts/common.sh`; it writes a token and exports
+  `BENCH_BUILD_LOCK_TOKEN`. A build lock held under the caller's own token
+  counts as "no build", so device tools run inside the runner's batch.
+  `scripts/build` deletes `river-build.json` and `.bench-result` right after
+  taking the lock and records the build image ID in `river-build.json`.
+- **`phone-qa stage`** (I16) takes (or reuses) the build lock across staging
+  and refuses the runner's IDs (`bNNNN`, `qNNNN`) unless the runner itself
+  stages them.
+- **`known-good.json` on a re-baseline** (H14): `phone-qa --baseline` keeps
+  an existing lower `ram_reference` (value, tag, batch, run IDs; `seed`
+  cleared). The new `calibration_seed` is written as before.
