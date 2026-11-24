@@ -1,8 +1,6 @@
 """flash --promote and flash --recover through the public command, with a
 fake phone and stubbed gh / git ls-remote (C1, C2, A4). No adb."""
 import io
-import json
-import subprocess
 import unittest
 from contextlib import redirect_stderr
 from unittest import mock

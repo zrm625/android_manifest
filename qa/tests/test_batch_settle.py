@@ -5,7 +5,6 @@ eligibility check (Sol M4, M5, I9; Gemini GM4, GM6; Opus OM3).
 The batch b0001 changed device/motorola/river and vendor/lineage. Its river
 batch PR #7 merged; its vendor/lineage batch PR #8 did not (the Perch case
 of I9). A second member, gnss, has nothing landed."""
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,7 +13,9 @@ from unittest import mock
 import _path  # noqa: F401
 from batchfakes import FakeGH, mk_ctx, write_json
 from benchhome import bench_home
-from riverbatch import ctx as C, merge, records, recover, settle, state as S
+from riverbatch import ctx as C
+from riverbatch import merge, records, recover, settle
+from riverbatch import state as S
 from test_batch_records import make_record
 
 RIVER, VENDOR = "zrm625/android_device_motorola_river", "zrm625/android_vendor_lineage"

@@ -61,7 +61,7 @@ class LockBeforeProvenance(unittest.TestCase):
             (bin_ / "bench").mkdir(parents=True)
             shutil.copy(BUILD, bin_ / "build")
             (bin_ / "bench/lib.sh").write_text(FAKE_LIB.format(top=top, home=home))
-            git = lambda d, *a: subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c",  # noqa: E731
+            git = lambda d, *a: subprocess.run(["git", "-C", str(d), "-c", "user.name=t", "-c",
                                                 "user.email=t@t", "-c", "commit.gpgsign=false", *a],
                                                check=True, capture_output=True, text=True).stdout.strip()
             (top / ".repo/manifests").mkdir(parents=True)

@@ -7,7 +7,9 @@ import unittest
 import _path  # noqa: F401
 from batchfakes import FakeTree, mk_ctx, write_json
 from benchhome import bench_home
-from riverbatch import ctx as C, merge, phases, recover, state as S
+from riverbatch import ctx as C
+from riverbatch import merge, phases, recover
+from riverbatch import state as S
 
 BASE = {p: f"{i:x}" * 40 for i, p in enumerate(sorted(merge.slugs()), start=1)}
 LEASED = {"device/motorola/river": "a" * 40, "vendor/lineage": "c" * 40}

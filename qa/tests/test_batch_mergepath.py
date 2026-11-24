@@ -8,7 +8,8 @@ from unittest import mock
 import _path  # noqa: F401
 from batchfakes import FakeGH, FakeTools, mk_ctx, write_json
 from benchhome import bench_home
-from riverbatch import merge, recover, state as S, tick
+from riverbatch import merge, recover, tick
+from riverbatch import state as S
 
 P = "device/motorola/river"
 BASE = {p: f"{i:x}" * 40 for i, p in enumerate(sorted(merge.slugs()), start=1)}
@@ -245,7 +246,8 @@ class MergePath(unittest.TestCase):
         """Sol M7, Gemini GM5: promote's lookup pause names the strike;
         resume clears every strike, so stage and qualify are not refused
         forever afterwards."""
-        from riverbatch import commands, ctx as C, qualify
+        from riverbatch import commands, qualify
+        from riverbatch import ctx as C
         with bench_home() as h:
             gh, git, tools, rgit = world(h)
             promote = tools.script["flash"]

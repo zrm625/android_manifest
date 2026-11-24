@@ -451,7 +451,7 @@ class PromoteProof(unittest.TestCase):
         w = world([True, True], (True, True, True))
         w.repos["zrm625/r1"]["tip"] = "c" * 40                     # someone merged on top
         w.commits[("zrm625/r1", "c" * 40)] = {"tree": "d" * 40, "parents": [MERGES[1]]}
-        rc, err, st, _ = self.promote(w)
+        rc, err, _, _ = self.promote(w)
         self.assertEqual(rc, flashing.EXIT_HALT, err)
         self.assertIn("not the merge commit", err)
 
@@ -460,7 +460,7 @@ class PromoteProof(unittest.TestCase):
         rc, err, _, _ = self.promote(world([True, True], (True, True, True)), base=b0)
         self.assertEqual(rc, 0, err)                                  # parents [frozen base, tested]
         other = dict(b0, **{"vendor/lineage": "e" * 40})
-        rc, err, st, _ = self.promote(world([True, True], (True, True, True)), base=other)
+        rc, err, _, _ = self.promote(world([True, True], (True, True, True)), base=other)
         self.assertEqual(rc, flashing.EXIT_HALT, err)
         self.assertIn("parents", err)
 

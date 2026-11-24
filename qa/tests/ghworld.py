@@ -25,7 +25,7 @@ class GHWorld:
             r = self.fail(cmd)
             if r is not None:
                 return r
-        ok = lambda out: subprocess.CompletedProcess(cmd, 0, out, "")  # noqa: E731
+        ok = lambda out: subprocess.CompletedProcess(cmd, 0, out, "")
         if cmd[:3] == ["gh", "pr", "view"]:
             n, repo = int(cmd[3]), cmd[5]
             p = self.prs.get((repo, n))

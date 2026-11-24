@@ -13,7 +13,9 @@ from unittest import mock
 import _path  # noqa: F401
 from batchfakes import FakeTools, mk_ctx, write_json
 from benchhome import bench_home
-from riverbatch import cli, ctx as C, outcomes as O, paths, phases, ports, state as S, tick
+from riverbatch import cli, paths, ports, tick
+from riverbatch import ctx as C
+from riverbatch import state as S
 from riverqa import children
 from test_batch_flow import claim, steps
 

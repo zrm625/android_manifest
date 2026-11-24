@@ -180,7 +180,7 @@ class Checkout(unittest.TestCase):
         transport abort, 75), not a runner error."""
         from batchfakes import FakeTree
         from riverbatch.compose import GitError
-        with bench_home() as h:
+        with bench_home():
             base = {p: "b" * 40 for p in __import__("riverbatch.merge", fromlist=["x"]).slugs()}
             tree = FakeTree(base)
             tree.branches["vendor/lineage"]["batch/b0001"] = "c" * 40

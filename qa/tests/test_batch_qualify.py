@@ -9,8 +9,10 @@ from unittest import mock
 import _path  # noqa: F401
 from batchfakes import mk_ctx, write_json
 from benchhome import bench_home
-from riverbatch import abtest, ctx as C, merge, outcomes as O, phases, qualify, state as S, version
-
+from riverbatch import abtest, merge, phases, qualify, version
+from riverbatch import ctx as C
+from riverbatch import outcomes as O
+from riverbatch import state as S
 
 FULL = {p: "b" * 40 for p in merge.slugs()}
 
@@ -90,7 +92,8 @@ class TreeBeforePhone(unittest.TestCase):
     disturbed tree before any phone recovery, setup or tool."""
 
     def ctx(self, h):
-        from batchfakes import FakeDev, FakeTools, FakeTree, mk_ctx as mk
+        from batchfakes import FakeDev, FakeTools, FakeTree
+        from batchfakes import mk_ctx as mk
         tree = FakeTree(FULL)
         tree.dirty.add("vendor/lineage")
         self.dev, self.tools = FakeDev(), FakeTools()
@@ -125,7 +128,8 @@ class Part2(unittest.TestCase):
         """Gemini minor: run_part2 reported the QA result of a stale copy
         (None); it is read before abort clears running."""
         from batchfakes import mk_ctx as mk
-        from riverbatch import ctx as Cx, kb, recover
+        from riverbatch import ctx as Cx
+        from riverbatch import kb, recover
         with bench_home() as h:
             kg_files(h)
 
@@ -280,6 +284,7 @@ def repo_manifest_r(revs: dict) -> str:
     """What `repo manifest -r` prints for default.xml: one <project> line per
     project at its revision, annotations on their own lines."""
     import xml.etree.ElementTree as ET
+
     from riverbatch import paths
     out = ['<?xml version="1.0" encoding="UTF-8"?>', "<manifest>"]
     for pj in ET.parse(paths.MANIFEST_DIR / "default.xml").getroot().iter("project"):
@@ -303,7 +308,7 @@ def produced(revs: dict) -> str:
 class BuildManifestProducer(unittest.TestCase):
     """Sol B1: the producer filters the proprietary_* forks out."""
 
-    CS = dict({p: f"{i:x}" * 40 for i, p in enumerate(sorted(merge.slugs()), start=1)})
+    CS = {p: f"{i:x}" * 40 for i, p in enumerate(sorted(merge.slugs()), start=1)}
     VENDOR = {"vendor/motorola/river", "vendor/motorola/sdm632-common"}
 
     def product(self, t, xml):
@@ -425,8 +430,9 @@ class Versions(unittest.TestCase):
         self.assertNotEqual(version.runner_build(), version.runner_tools())
 
     def test_harness_version_ignores_the_runner(self):
-        from riverqa import qa
         import inspect
+
+        from riverqa import qa
         src = inspect.getsource(qa.harness_version)
         self.assertIn('"riverqa"', src)
         self.assertNotIn("riverbatch", src)
