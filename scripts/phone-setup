@@ -96,7 +96,11 @@ a shell am force-stop com.android.settings >/dev/null 2>&1 || true
 
 # A bench or boot-timing run leaves the screen asleep, and taps on a sleeping
 # screen do nothing. Wake it and confirm it is awake (mWakefulness=Awake)
-# before every tap, retrying.
+# before every tap, retrying. Lineage's pocket check (proximity_on_wake)
+# refuses to wake while the proximity sensor reads near, which happens on the
+# desk; the test phone doesn't need it.
+a shell content insert --uri content://lineagesettings/system \
+  --bind name:s:proximity_on_wake --bind value:s:0 >/dev/null 2>&1 || true
 awake() { [[ "$(sh_ dumpsys power)" == *mWakefulness=Awake* ]]; }
 wake() {
   local i
