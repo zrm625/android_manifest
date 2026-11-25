@@ -36,6 +36,9 @@ if ! "$SCRIPTS_DIR/phone-setup" --wifi "$keys/wifi-ssid" "$keys/wifi-psk"; then
   exit 1
 fi
 
+step settled-memory
+"$SCRIPTS_DIR/settled-memory" "$out" || echo "RESULT settled-memory-failed"
+
 step quick
 quick=0
 "$SCRIPTS_DIR/phone-qa" --quick || quick=$?
@@ -48,6 +51,6 @@ fi
 step qa
 rc=0
 "$SCRIPTS_DIR/phone-qa" --probe || rc=$?
-step done
+step 'done'
 echo "RESULT qa-exit=$rc"
 tail -n "$boots" "$BENCH_HOME/results/device.csv" | cut -d, -f1-9
