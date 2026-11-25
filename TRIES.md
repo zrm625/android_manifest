@@ -5,7 +5,7 @@ a stack that passes is kept whole, a stack that fails is split.
 How a try runs and when it is kept: [CHARTER.md](CHARTER.md#pipeline-tries).
 
 RAM reference: baseline-2, 1,266 MB (median of 3 boots, 2026-11-23).
-Target: 1,000 MB. Now: 1,053 MB (stack H, kept).
+Target: 1,000 MB. Now: 993.1 MB before setup (Stack I, kept).
 
 ## Kept
 
@@ -62,8 +62,21 @@ sdm632-common #9 and build #5. The three boots used 1,057.6, 1,042.2, and
 benchmark boot took 51.43 s. System used 7,720 KiB less. Quick QA passed and
 the probe passed 39 checks. The known GPS and rear-flash failures reproduced.
 Default NFC files and SKU rules were present on the phone. The audio probe
-measured 63.5 to 65.0 dB above silence. The isolated images are being measured
-against Stack F for comparison.
+measured 63.5 to 65.0 dB above silence. The isolated comparisons on Stack F
+are below.
+
+**Stack I** (the seven configuration changes from the live investigation):
+kept in [river #9](https://github.com/zrm625/android_device_motorola_river/pull/9)
+and [sdm632-common #10](https://github.com/zrm625/android_device_motorola_sdm632-common/pull/10).
+The median was 993.1 MB before setup, down 60.2 MB from Stack H. Individual
+boots used 1,002.5, 993.1, and 978.8 MB. The first benchmark boot took 51.87 s.
+The settled sample used 1,045.9 MB after five minutes on Perch.
+The phone ran mediaserver64 and used 1 GiB zram. It started with Bluetooth
+off and paired successfully when QA enabled it. Quick QA passed. The probe
+passed 40 checks, including Wi-Fi at 192.168.4.61, GPS without LOWI, and
+hardware H.264 playback. The known dark rear-flash check failed. The audio
+bursts measured 65.1–77.5 dB above silence at −42.5 to −35.0 dBFS. The
+default NFC APEX, Tag APK, HAL, vendor configs, and SKU files were present.
 
 ## Dropped
 
@@ -93,11 +106,14 @@ before setup (1,058.2, 1,043.1, and 1,029.5 MB), 1,133.6 MB after five
 minutes on Perch, and a 51.69 s first benchmark boot. Quick QA passed.
 The probe passed 40 checks, including GPS, and reproduced the known
 rear-flash failure. Wi-Fi used 192.168.4.61 after setup. Both isolated
-comparisons passed the try gate against Stack F. Stack H remains the
-kept build. The separate boots do not establish an additive RAM saving.
+comparisons passed the try gate against Stack F. Stack H included both
+changes. The separate boots do not establish an additive RAM saving.
 
-**Next:** profile the kept Stack F reference before and after setup to
-rank the next set of changes.
+**Stack F live profiling.** A matched boot used 1,057.2 MB before setup
+and 1,127.9 MB after five minutes on Perch. The persistent Bluetooth process
+accounted for 27.3–27.4 MB PSS. The 32-bit mediaserver's shared-library
+mappings accounted for 19.6 MB PSS. The live captures and the ranked plan
+are in the benchmark's `tries/investigations/` directory.
 
 **Low-RAM mode** (experiment on Stack D, branch `try-low-ram`): 1,076.2 MB
 median across three boots (1,076.2, 1,081.6, and 1,067.8 MB), with a 50.20 s
@@ -121,7 +137,7 @@ audio, and the core apps. The rear-flash check reproduced the dark frame.
 | Try | Why |
 | --- | --- |
 | Rest of `kmalloc-128` | kernfs names 21k objects (2.6 MB), ASoC DAPM paths 17.6k (2.2 MB). arm64 has no kmalloc cache below 128 bytes. |
-| 32-bit media processes | mediaserver (23 MB) and the audio HAL are 32-bit; with no 32-bit zygote their libraries are private (.so 20 MB, 16 MB private clean). mediaserver's bitness is set in frameworks/av: a fork needs Zak. |
+| 32-bit audio HAL | Stack I switched mediaserver to 64-bit using the existing device switch. The vendor audio HAL still runs in 32-bit mode. |
 | media.swcodec (22 MB) | Loads every software codec at start (.so 19 MB, 13 MB private). Trimming the APEX needs a frameworks/av fork. |
 | Kernel threads | 597 kernel threads: 97 bioset, 35 loop, 21 kverityd and 21 kdmflush (APEX loop mounts), 42 ext4 rsv-conver. Fewer preallocated loop devices. |
 | Process count | 60k of 100k `vm_area_struct` are copies of zygote's mappings in forked apps; each app that doesn't start saves its VMAs as well as its PSS. |
@@ -138,6 +154,10 @@ audio, and the core apps. The rear-flash check reproduced the dark frame.
   activating it took its reported retries from 0 to 7. Current kernels
   disable SLUB debugging, so the trial saves `slab-sysfs.tsv` when
   `/proc/slabinfo` is absent.
+
+- Manifest #36 records a second Used RAM reading five minutes after setup
+  with Perch visible and the display awake. The pre-setup median remains
+  the keep gate.
 
 - Stack F received `192.168.4.61` after a wipe, outside the documented
   Wi-Fi QA firewall rule. Manifest PR #28 makes `phone-setup` select the
