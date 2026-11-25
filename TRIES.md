@@ -5,7 +5,7 @@ a stack that passes is kept whole, a stack that fails is split.
 How a try runs and when it is kept: [CHARTER.md](CHARTER.md#pipeline-tries).
 
 RAM reference: baseline-2, 1,266 MB (median of 3 boots, 2026-11-23).
-Target: 1,000 MB. Now: 1,104 MB (stack D, kept).
+Target: 1,000 MB. Now: 1,059 MB (stack F, kept).
 
 ## Kept
 
@@ -47,6 +47,15 @@ Zak: please check what the rear of the phone rests on.
 together. `phone-qa --probe`: 39 pass; GPS and the rear-flash check fail as
 before.
 
+**Stack F** (no startup file pinning, no SecureElement): 1,059.2 MB, down
+44.3 MB from stack D, and a 51.73 s benchmark boot. Kept in sdm632-common #8
+and build #4. Pinner reported 0 pinned bytes and QA found no tombstones or
+LiveDisplay restart loop. The NFC APEX, Tag APK, and vendor NFC files were
+present. Quick QA passed. The full probe and targeted reruns passed Wi-Fi,
+GPS, audio, and the core apps. The rear flash reproduced the known dark
+frame. Settings launched cold in 838 ms median across three runs. There is
+no matching stack D launch measurement.
+
 ## Dropped
 
 | Try | Branch | Why dropped |
@@ -56,12 +65,14 @@ before.
 
 ## Testing
 
-**Stack F**: on river-22.2.
+**Stack G** (virtual-device manager and MIDI service disabled) is staged on
+Stack F for phone measurements.
 
-| Try | Branch | Why |
-| --- | --- | --- |
-| No PinnerService pinning | sdm632-common `no-pinning` | PinnerService locked 207 MB: framework.jar 40 MB, services.jar and odex 34 MB, SystemUI apk and odex 80 MB, surfaceflinger 8 MB, WebView 20 MB, Perch 8 MB. Locked pages count as used and can't be reclaimed. |
-| No SecureElement | build `drop-secure-element` | Carried over from stack E. If LiveDisplay crashes again in stack F, this is the cause, not ftrace. |
+**Low-RAM mode** (experiment on Stack D, branch `try-low-ram`): 1,076.2 MB
+median across three boots (1,076.2, 1,081.6, and 1,067.8 MB), with a 50.20 s
+first benchmark boot. The median is 27.3 MB below Stack D. Shipping this mode
+requires Zak's approval. The probe passed 40 checks, including Wi-Fi, GPS,
+audio, and the core apps. The rear-flash check reproduced the dark frame.
 
 ## Open problems
 
@@ -90,6 +101,12 @@ before.
 | Per-camera build switches | Charter item; changing the camera set needs Zak to merge. |
 
 ## Harness notes
+
+- Stack F received `192.168.4.61` after a wipe, outside the documented
+  Wi-Fi QA firewall rule. Manifest PR #28 makes `phone-setup` select the
+  factory MAC for the test SSID, but the phone still received `.61` after
+  the low-RAM wipe. The temporary `.61` firewall rule covers this lease.
+  Retest the `.60` reservation before removing that rule.
 
 - `hardware.cameras`: the rear flash check (`on >= 20`) fails now and then in
   a dark room. Consider a relative threshold.
