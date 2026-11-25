@@ -5,7 +5,7 @@ a stack that passes is kept whole, a stack that fails is split.
 How a try runs and when it is kept: [CHARTER.md](CHARTER.md#pipeline-tries).
 
 RAM reference: baseline-2, 1,266 MB (median of 3 boots, 2026-11-23).
-Target: 1,000 MB. Now: 993.1 MB before setup (Stack I, kept).
+Target: 1,000 MB. Current default: 989.8 MB before setup (Stack I rebuild).
 
 ## Kept
 
@@ -77,6 +77,27 @@ passed 40 checks, including Wi-Fi at 192.168.4.61, GPS without LOWI, and
 hardware H.264 playback. The known dark rear-flash check failed. The audio
 bursts measured 65.1–77.5 dB above silence at −42.5 to −35.0 dBFS. The
 default NFC APEX, Tag APK, HAL, vendor configs, and SKU files were present.
+
+**Opt-in NFC-off build.** The default includes NFC. For a stripped
+development build without NFC hardware support, run
+`scripts/build --without-nfc`. The opt-in image retains the standalone NFC
+framework jar that Android needs at startup. Run the build again without
+the flag to restore the default packages in the shared build output.
+Kept in [build #6](https://github.com/zrm625/android_build/pull/6),
+[river #10](https://github.com/zrm625/android_device_motorola_river/pull/10),
+and [manifest #39](https://github.com/zrm625/android_manifest/pull/39).
+
+| Build | Median RAM before setup | Settled RAM | First benchmark boot |
+| --- | ---: | ---: | ---: |
+| NFC off | 986.8 MB | 1,050.5 MB | 49.70 s |
+| Default restored after NFC-off build | 989.8 MB | 1,047.8 MB | 50.09 s |
+
+Both variants passed quick QA. Each probe passed 39 checks and reproduced
+the known intermittent GPS and dark rear-flash failures. The default
+passed the installed-file check. The phone had the mounted NFC APEX, Tag
+app, HAL, vendor configs, SKU files, and init rules. These checks cover
+build contents on the XT1962-1. Reading a tag requires an NFC-equipped SKU.
+Use the 989.8 MB default measurement as the next RAM reference.
 
 ## Dropped
 
