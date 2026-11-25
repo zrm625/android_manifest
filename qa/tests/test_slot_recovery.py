@@ -622,6 +622,25 @@ class ExhaustedTrialSlot(unittest.TestCase):
         self.assertIn("candidate never reached sys.boot_completed", err)
         self.assertEqual(phone.boots, ["a"])
 
+    def test_early_boot_loop_selects_fallback_before_reboot(self):
+        from riverqa import reboots
+
+        def loop_detected(dev, path, **kw):
+            self.assertEqual(kw["trial_slot"], "b")
+            kw["in_fastboot"]()
+            raise RuntimeError("trial returned to fastboot; slot b retry count fell from 7 to 6")
+
+        with bench_home():
+            state(pair_kind=None)
+            phone = SlotPhone(active="a")
+            with patches(dev_inputs()), mock.patch.object(reboots, "planned_reboot", loop_detected):
+                rc, err = run_flash(phone, "/nonexistent-product", "--wipe")
+
+        self.assertEqual(rc, flashing.EXIT_RESCUED, err)
+        self.assertIn("retry count fell", err)
+        self.assertIn(("fastboot", "--set-active=a"), phone.calls)
+        self.assertEqual(phone.boots, ["a"])
+
 
 class DevFlash(unittest.TestCase):
     def test_dev_flash_never_boots_before_writing(self):

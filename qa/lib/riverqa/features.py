@@ -349,9 +349,7 @@ NFC_BUILD = ["/system/apex/com.android.nfcservices.capex", "/system/priv-app/Tag
              "/vendor/lib64/nfc_nci_nxp.so"]
 
 
-def check_nfc(run) -> Result:
-    cid = "radios.nfc"
-    dev = run.dev
+def nfc_phone_missing(dev) -> list[str]:
     miss = []
     if "com.android.nfcservices" not in dev.sh("ls /apex"):
         miss.append("nfcservices APEX not active")
@@ -364,6 +362,50 @@ def check_nfc(run) -> Result:
         miss.append("NFC HAL init .rc missing")
     if not dev.sh("ls /odm/etc/permissions/sku_nfc/*.xml 2>/dev/null").strip():
         miss.append("/odm/etc/permissions/sku_nfc/*.xml missing")
+    return miss
+
+
+def check_quick_nfc(run) -> Result:
+    """Check installed build contents without stage or a physical NFC chip."""
+    from .fbmode import partition_build_ids
+
+    cid = "radios.nfc"
+    dev = run.dev
+    record = {}
+    if run.build_record is not None:
+        record = read_json(run.build_record)
+        if not isinstance(record, dict) or not record.get("build_id"):
+            return Result(cid, FAIL, "invalid or missing build record")
+        bid = record["build_id"]
+        if partition_build_ids(dev) != (bid, bid):
+            return Result(cid, FAIL, "build record does not match the running system and vendor")
+    apk_and_apex = ["/system/apex/com.android.nfcservices.capex", "/system/priv-app/Tag/Tag.apk"]
+    sku_dir = "/odm/etc/permissions/sku_nfc"
+    extra_files = ["/vendor/etc/init/hw/init.river.rc", "/vendor/etc/libnfc-nxp-gcf.conf",
+                   *(f"{sku_dir}/{name}.xml" for name in ("android.hardware.nfc", "android.hardware.nfc.hce",
+                                                          "android.hardware.nfc.hcef", "com.nxp.mifare"))]
+    if record.get("nfc_enabled") is False:
+        hardware_files = [*NFC_PHONE_FILES, *apk_and_apex, *extra_files,
+                          sku_dir, "/apex/com.android.nfcservices"]
+        unexpected = [f for f in hardware_files if dev.sh(f"[ -e {f} ] && echo y").strip() == "y"]
+        if unexpected:
+            return Result(cid, FAIL, "NFC-off build contains " + ", ".join(unexpected))
+        if dev.sh("[ -e /system/framework/framework-nfc.jar ] && echo y").strip() != "y":
+            return Result(cid, FAIL, "NFC-off build is missing its standalone framework jar")
+        return Result(cid, PASS, "NFC-off experiment verified", {"nfc_enabled": False})
+    miss = nfc_phone_missing(dev)
+    for f in [*apk_and_apex, *extra_files]:
+        if dev.sh(f"[ -e {f} ] && echo y").strip() != "y":
+            miss.append(f"{f} missing")
+    if miss:
+        return Result(cid, FAIL, "; ".join(miss))
+    return Result(cid, PASS, "NFC APEX, Tag, HAL, configs, init rules and SKU files present",
+                  {"nfc_enabled": True})
+
+
+def check_nfc(run) -> Result:
+    cid = "radios.nfc"
+    miss = nfc_phone_missing(run.dev)
     if run.batch is None:
         return Result(cid, UNVERIFIED, "no batch: cannot check the staged installed-files", {"phone": miss})
     names = set()

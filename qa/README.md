@@ -21,26 +21,40 @@ scripts/phone-qa --quick          # add --wait straight after a flash
 
 It runs the health group on the live phone: boot completed, SELinux
 enforcing, no crashes since boot, no tombstones since boot, no services
-crashing or restarting in a loop, no telephony. Any FAIL exits 1. INFO lines
+crashing or restarting in a loop, no telephony. It checks the installed NFC
+APEX, Tag app, HAL, configs, SKU permissions, and init files. For an NFC-off
+experiment, pass `--build-record PATH` with its `river-build.json`. Quick QA
+checks the system and vendor build IDs and verifies the experimental file
+set. Any FAIL exits 1. INFO lines
 for the build in `out-stripped`, Wi-Fi, Bluetooth, GPS, cameras, sensors,
 fingerprint and audio are for reading only. `--quick` loads no fixtures and is
 never merge-eligible.
 
 ## Run a trial image
 
-Run `scripts/try-test IMAGES_DIR LABEL [BOOTS]` with a staged image set.
-It wipes the test slot, measures boot and RAM, and runs setup, quick QA,
-and the probe. Evidence goes in `$BENCH_HOME/tries/LABEL/`.
+Run `scripts/try-test IMAGES_DIR LABEL` with a staged image set and a
+matching `river-build.json` beside or inside the images directory. It
+wipes the test slot, records three benchmark boots, and then runs setup,
+quick QA, and the probe. Evidence goes in `$BENCH_HOME/tries/LABEL/`.
 
-After setup, the trial holds the display awake on Perch for five minutes.
-It records Used RAM in `post-setup-used-ram-kb.txt` and the Wi-Fi IPv4
-address in `post-setup-wlan0.txt`. The pre-setup benchmark remains the keep
-gate.
+After setup, the trial holds the display awake on Perch. It starts
+sampling Used RAM at five minutes and takes two more readings at
+30-second intervals on the same boot. `trial-ram.json` records both
+medians and the settled RAM gate. Partial samples remain in
+`post-setup-ram-samples-kb.txt`. The Wi-Fi IPv4 address goes in
+`post-setup-wlan0.txt`.
+
+The initial reference is the 1,047.8 MB sample in `tries/default-nfc`.
+Set `RIVER_TRY_RAM_REFERENCE` to a kept NFC-enabled trial's evidence
+directory when it supplies a better verified median. NFC-off and low-RAM
+experiments can produce measurements without qualifying as references.
 
 Flash reads the trial slot's bootloader status before the writes and
 verifies the slot is active and has boot retries or a successful boot
-after activation. A failed boot reselects the known-good slot when the
-phone still answers. If the phone cannot be identified in fastboot, stop
+after activation. During the first boot, a return to fastboot, a changed
+Android boot ID, or repeated Android USB reconnects can stop a trial
+early. The existing recovery path reselects the known-good slot and rolls
+back a wiped trial. If the phone cannot be identified in fastboot, stop
 and tell Zak.
 
 The benchmark saves `slabinfo.txt` when the kernel exports

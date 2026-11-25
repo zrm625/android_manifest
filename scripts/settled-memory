@@ -2,14 +2,14 @@
 # Record a settled RAM sample on an already configured river trial.
 set -euo pipefail
 
-if (( $# != 1 )); then
-  echo "Usage: settled-memory OUTPUT_DIR" >&2
+if (( $# < 1 || $# > 2 )) || [[ ${2:-1} != 1 && ${2:-1} != 3 ]]; then
+  echo "Usage: settled-memory OUTPUT_DIR [1|3]" >&2
   exit 1
 fi
 source "$(dirname "$(realpath "$0")")/common.sh"
 device_lock
 
-out=$1
+out=$1 samples=${2:-1}
 serial=ZY225DPT7F
 fail() { echo "error: $*" >&2; exit 1; }
 phone() { timeout --foreground -k 10 120 adb -s "$serial" shell "$@" | tr -d '\r'; }
@@ -22,6 +22,10 @@ phone() { timeout --foreground -k 10 120 adb -s "$serial" shell "$@" | tr -d '\r
 boot_id=$(phone cat /proc/sys/kernel/random/boot_id)
 [[ -n "$boot_id" ]] || fail "cannot read the boot ID"
 build_id=$(phone getprop ro.river.build_id)
+case "$(phone getprop ro.config.low_ram)" in
+  1|y|yes|on|true) low_ram=true ;;
+  *) low_ram=false ;;
+esac
 stay_on=$(phone settings get global stay_on_while_plugged_in)
 [[ "$stay_on" == null || "$stay_on" =~ ^[0-9]+$ ]] || fail "cannot read stay-on setting"
 
@@ -43,6 +47,8 @@ check_home() {
 }
 
 mkdir -p "$out"
+rm -f "$out/post-setup-used-ram-kb.txt"
+: > "$out/post-setup-ram-samples-kb.txt"
 trap restore_stay_on EXIT
 phone settings put global stay_on_while_plugged_in 7
 phone input keyevent KEYCODE_WAKEUP
@@ -52,19 +58,29 @@ check_home
 
 echo "Settling on Perch for five minutes"
 sleep 300
-[[ $(phone cat /proc/sys/kernel/random/boot_id) == "$boot_id" ]] || fail "the phone rebooted while settling"
-check_home
-phone dumpsys meminfo > "$out/post-setup-meminfo.txt"
+for ((sample=1; sample<=samples; sample++)); do
+  [[ $(phone cat /proc/sys/kernel/random/boot_id) == "$boot_id" ]] || fail "the phone rebooted while settling"
+  check_home
+  meminfo="$out/post-setup-meminfo.txt"
+  if (( sample > 1 )); then
+    meminfo="$out/post-setup-meminfo-$sample.txt"
+  fi
+  phone dumpsys meminfo > "$meminfo"
+  ram_kb=$(awk -F: '/^[[:space:]]*Used RAM:/ {
+    sub(/^[[:space:]]*/, "", $2)
+    split($2, fields, "K")
+    gsub(/[[:space:],]/, "", fields[1])
+    print fields[1]
+    exit
+  }' "$meminfo")
+  [[ "$ram_kb" =~ ^[0-9]+$ ]] || fail "dumpsys meminfo did not report Used RAM"
+  [[ $(phone cat /proc/sys/kernel/random/boot_id) == "$boot_id" ]] || fail "the phone rebooted while sampling"
+  check_home
+  printf '%s\n' "$ram_kb" >> "$out/post-setup-ram-samples-kb.txt"
+  printf 'Used RAM after setup, sample %d: %s KiB\n' "$sample" "$ram_kb"
+  if (( sample < samples )); then sleep 30; fi
+done
 phone ip -4 -o addr show wlan0 > "$out/post-setup-wlan0.txt"
-printf 'build=%s\nboot_id=%s\ncaptured_at=%s\n' "$build_id" "$boot_id" "$(date -Iseconds)" > "$out/post-setup-state.txt"
-
-ram_kb=$(awk -F: '/^[[:space:]]*Used RAM:/ {
-  sub(/^[[:space:]]*/, "", $2)
-  split($2, fields, "K")
-  gsub(/,/, "", fields[1])
-  print fields[1]
-  exit
-}' "$out/post-setup-meminfo.txt")
-[[ "$ram_kb" =~ ^[0-9]+$ ]] || fail "dumpsys meminfo did not report Used RAM"
-printf '%s\n' "$ram_kb" > "$out/post-setup-used-ram-kb.txt"
-printf 'Used RAM after setup: %s KiB\n' "$ram_kb"
+printf 'build=%s\nboot_id=%s\nlow_ram=%s\ncaptured_at=%s\n' \
+  "$build_id" "$boot_id" "$low_ram" "$(date -Iseconds)" > "$out/post-setup-state.txt"
+sort -n "$out/post-setup-ram-samples-kb.txt" | sed -n "$((samples / 2 + 1))p" > "$out/post-setup-used-ram-kb.txt"

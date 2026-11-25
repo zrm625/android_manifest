@@ -1,28 +1,45 @@
 #!/usr/bin/env bash
 # Run a wiped trial on river and save its benchmark and QA evidence.
 set -euo pipefail
-if (( $# < 2 || $# > 3 )); then
-  echo "Usage: try-test IMAGES_DIR LABEL [BOOTS]" >&2
+if (( $# < 2 || $# > 3 )) || [[ ${3:-3} != 3 ]]; then
+  echo "Usage: try-test IMAGES_DIR LABEL [3]" >&2
   exit 1
 fi
 source "$(dirname "$(realpath "$0")")/common.sh"
 
-images=$1 label=$2 boots=${3:-1}
-if [[ ! "$label" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ || ! "$boots" =~ ^[1-9][0-9]*$ ]]; then
-  echo "error: use a single directory name for LABEL and a positive BOOTS count" >&2
+images=$(realpath -- "$1") label=$2
+if [[ ! "$label" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+  echo "error: use a single directory name for LABEL" >&2
   exit 1
 fi
 
 out="$BENCH_HOME/tries/$label"
+reference=${RIVER_TRY_RAM_REFERENCE:-"$BENCH_HOME/tries/default-nfc"}
+if [[ $(realpath -m "$out") == $(realpath -m "$reference") ]]; then
+  echo "error: the trial output must be separate from its RAM reference" >&2
+  exit 1
+fi
+ram="$QA_LIB/riverqa/trial_ram.py"
+record="$(dirname "$images")/river-build.json"
+[[ -f "$record" ]] || record="$images/river-build.json"
+[[ -f "$record" ]] || { echo "error: missing river-build.json for $images" >&2; exit 1; }
+python3 -I "$ram" reference "$reference" >/dev/null
+if [[ -z ${BENCH_LOCK_TOKEN:-} ]]; then
+  exec "$SCRIPTS_DIR/device-lock" "$0" "$@"
+fi
 mkdir -p "$out"
+rm -f "$out/trial-ram.json" "$out/pre-setup-used-ram-kb.txt"
 keys="$HOME/.config/river-keys"
 step() { echo "=== $(date +%H:%M:%S) $*"; }
 
 step flash
 "$SCRIPTS_DIR/flash" "$images" --wipe || { echo "RESULT flash-failed"; exit 1; }
 step bench
-"$SCRIPTS_DIR/bench/device-bench" current --boots "$boots" --slab-dir "$out" ||
+"$SCRIPTS_DIR/bench/device-bench" current --boots 3 --slab-dir "$out" ||
   { echo "RESULT bench-failed"; exit 1; }
+csv="$BENCH_HOME/results/device.csv"
+{ head -n 1 "$csv"; tail -n 3 "$csv"; } > "$out/pre-setup-boots.csv"
+python3 -I "$ram" before "$out" "$record"
 
 step meminfo
 adb -s ZY225DPT7F shell dumpsys meminfo > "$out/meminfo.txt"
@@ -37,20 +54,29 @@ if ! "$SCRIPTS_DIR/phone-setup" --wifi "$keys/wifi-ssid" "$keys/wifi-psk"; then
 fi
 
 step settled-memory
-"$SCRIPTS_DIR/settled-memory" "$out" || echo "RESULT settled-memory-failed"
+settled=0
+"$SCRIPTS_DIR/settled-memory" "$out" 3 || settled=$?
 
 step quick
 quick=0
-"$SCRIPTS_DIR/phone-qa" --quick || quick=$?
+"$SCRIPTS_DIR/phone-qa" --quick --build-record "$record" || quick=$?
 if (( quick != 0 )); then
   echo "RESULT quick-exit=$quick"
   "$SCRIPTS_DIR/flash" --rollback
   exit 1
 fi
 
+ram_gate=2
+if (( settled == 0 )); then
+  ram_gate=0
+  python3 -I "$ram" "$out" "$record" "$reference" || ram_gate=$?
+else
+  echo "RESULT ram-gate=unverified"
+fi
 step qa
 rc=0
 "$SCRIPTS_DIR/phone-qa" --probe || rc=$?
 step 'done'
 echo "RESULT qa-exit=$rc"
-tail -n "$boots" "$BENCH_HOME/results/device.csv" | cut -d, -f1-9
+cut -d, -f1-9 "$out/pre-setup-boots.csv" | tail -n 3
+exit "$ram_gate"

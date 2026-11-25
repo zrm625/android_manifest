@@ -40,7 +40,7 @@ import time
 from dataclasses import asdict, dataclass, field
 
 from . import bootsig, fbmode
-from .core import bench_path, log, read_json, write_json
+from .core import Deadline, bench_path, log, read_json, write_json
 from .device import Device, GuardError, UsbWatcher, fastboot_ids_seen
 from .results import FAIL, INFO, PASS, UNVERIFIED, worst
 
@@ -165,11 +165,13 @@ def _after(w: UsbWatcher, start_mark: int, event) -> list:
 def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=None,
                    inject_extra_pass: bool = False, mark_planned: bool = True,
                    inject_early_reboot: bool = False,
-                   watcher: UsbWatcher | None = None) -> BootRecord:
+                   watcher: UsbWatcher | None = None,
+                   trial_slot: str | None = None) -> BootRecord:
     """Reboot the phone along ``path`` and wait for boot completion.
 
     ``in_fastboot``: callback run while the phone sits in fastboot (flash
     writes images here); only for the fastboot path.
+    ``trial_slot``: guard an ordinary dev flash with a known-good fallback.
     ``inject_extra_pass``: control mode only, on a gated path. With
     ``mark_planned`` false the injected pass's fastboot enumerations are not
     marked planned, so the unplanned-enumeration rule must catch it.
@@ -177,6 +179,8 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
     """
     if path not in PATHS:
         raise ValueError(path)
+    if trial_slot is not None and (path != "fastboot" or inject_extra_pass or inject_early_reboot):
+        raise ValueError("the trial boot guard requires an ordinary fastboot reboot")
     if (inject_extra_pass or inject_early_reboot) and control_active() is None:
         raise RuntimeError("faults may only be injected in control mode")
     if inject_extra_pass and path not in GATED_PATHS:
@@ -229,6 +233,8 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
                 dev.reboot_fastboot()
                 final = w.wait_gone(mark3, 60)
             else:
+                if trial_slot is not None:
+                    retry_start = dev.getvar(f"slot-retry-count:_{trial_slot}", timeout=2)
                 mark2 = w.mark()
                 dev.reboot_fastboot()
                 clock = final = w.wait_gone(mark2, 60)       # the final reboot's disconnect
@@ -241,7 +247,9 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             rec.control = "extra-pass-unmarked"
         if inject_early_reboot:
             rec.control = inject_reboot_before_completion(dev, boot_timeout, w)
-        first, st, reads = completed_status(dev, boot_timeout)
+        first = (wait_trial_boot(dev, w, start_mark, final, boot_timeout, trial_slot, retry_start)
+                 if trial_slot is not None else None)
+        first, st, reads = completed_status(dev, boot_timeout, first=first)
         rec.completed_wall = st.host_wall
         rec.boot_id, rec.uptime = st.boot_id, st.uptime
         # Review round 4: the clock starts at the earliest possible
@@ -276,7 +284,48 @@ def planned_reboot(dev: Device, path: str, *, boot_timeout: float, in_fastboot=N
             w.stop()
 
 
-def completed_status(dev: Device, boot_timeout: float, tries: int = 3):
+def wait_trial_boot(dev, watcher, mark, departure, seconds, slot, retry_start):
+    """Stop a repeat boot while the fallback is still selectable."""
+    deadline = Deadline(seconds, "trial boot to complete")
+    events = watcher.since(mark)
+    event_index = mark + next(i for i, event in enumerate(events) if event is departure) + 1
+    boot_id = None
+    android_present = False
+    android_starts = 0
+    bootloader_seen = False
+    while True:
+        events = watcher.since(event_index)
+        event_index += len(events)
+        bootloader_seen |= bool(fastboot_ids_seen(events))
+        if bootloader_seen and dev.in_fastboot():
+            retries = dev.getvar(f"slot-retry-count:_{slot}", timeout=2)
+            active = dev.getvar("current-slot", timeout=2).lstrip("_")
+            retry_detail = (f"; slot {slot} retry count fell from {retry_start} to {retries}"
+                            if retries.isdecimal() and retry_start.isdecimal()
+                            and int(retries) < int(retry_start) else
+                            f"; slot {slot} retries {retries or 'unavailable'}")
+            raise RuntimeError(f"trial returned to fastboot (active slot {active or 'unknown'}){retry_detail}")
+        for event in events:
+            if event.kind == "gone":
+                android_present = False
+            elif not android_present and not fastboot_ids_seen([event]):
+                android_present = True
+                android_starts += 1
+        if dev.state() == "device":
+            status = dev.boot_status()
+            if status:
+                if boot_id is not None and status.boot_id != boot_id:
+                    raise RuntimeError("trial rebooted before Android finished booting")
+                if status.completed:
+                    return status
+                boot_id = status.boot_id
+        if android_starts >= 3:
+            raise RuntimeError("trial Android USB repeatedly disconnected before boot completion")
+        deadline.check()
+        time.sleep(0.2)
+
+
+def completed_status(dev: Device, boot_timeout: float, tries: int = 3, *, first=None):
     """(first, used, reads). ``first`` is the first status read that saw
     boot completed; it alone times the boot (host_boot_seconds, R5-2). If
     it was slower than bootsig.STATUS_READ_BOUND_S, read again (up to
@@ -285,7 +334,7 @@ def completed_status(dev: Device, boot_timeout: float, tries: int = 3):
     longer, which is safe (review round 4). If no fast read comes, ``used``
     is ``first`` and the uptime gate is UNVERIFIED. ``reads`` lists every
     read that succeeded, in order."""
-    first = dev.wait_boot_completed(boot_timeout)
+    first = first if first is not None else dev.wait_boot_completed(boot_timeout)
     reads = [first]
     if first.read_s <= bootsig.STATUS_READ_BOUND_S:
         return first, first, reads

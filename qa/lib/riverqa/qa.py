@@ -118,6 +118,7 @@ class Run:
         self.dev = Device(SERIAL)
         self.results: dict[str, Result] = {}
         self.batch = stage.load(batch_id) if batch_id else None
+        self.build_record: Path | None = None
         self.thresholds = read_json(THRESHOLDS_JSON, {}) or {}
         self.journal = jmod.Journal(QA_HOME / "journal.json", QA_HOME)
         self.snapshot: dict = {}
@@ -952,6 +953,7 @@ def quick_presence(run: Run) -> list[Result]:
 def quick(run: Run, wait: bool) -> int:
     dev = run.dev
     from . import fbmode
+    from .features import check_quick_nfc
     if fbmode.pending(run.journal) is not None:
         # A leftover fb_mode obligation (review round 4): the dev loop just
         # clears it and boots Android, verified against the identity it was
@@ -982,7 +984,8 @@ def quick(run: Run, wait: bool) -> int:
           f"build ID {fbmode.partition_build_ids(dev)[0] or 'unstamped'}")
     for cid, fn in (("health.boot", check_boot), ("health.selinux", check_selinux),
                     ("health.crashes", quick_crashes), ("health.tombstones", quick_tombstones),
-                    ("health.services", check_services), ("health.telephony", check_telephony)):
+                    ("health.services", check_services), ("health.telephony", check_telephony),
+                    ("radios.nfc", check_quick_nfc)):
         run_check(run, cid, fn)
     run_check(run, "info", quick_presence)
     return finish(run, QUICK_REQUIRED)
@@ -1118,8 +1121,9 @@ phone-qa: QA for river batches on the Moto G7 test phone (serial ZY225DPT7F,
 fixed in the code). Design: qa/DESIGN.md. Usage notes: qa/README.md.
 
 Usage:
-  phone-qa --quick [--wait]            Health checks on the running build (the
-                                       edit-flash loop). Never merge-eligible.
+  phone-qa --quick [--wait] [--build-record PATH]
+                                       Health and NFC contents on the running build.
+                                       Never merge-eligible.
   phone-qa --batch ID [--only IDS] [--skip IDS]
                                        Full QA of a staged, flashed, benched batch.
   phone-qa --calibrate --batch ID      Every check; regression only records. Never eligible.
@@ -1206,6 +1210,7 @@ def main(argv: list[str]) -> int:
         print(f"{apk} (cache key {key})")
         return 0
     mode, batch_id, only, skip, wait, control = None, None, [], [], False, None
+    build_record = None
     it = iter(argv)
     for a in it:
         if a == "--quick":
@@ -1230,6 +1235,12 @@ def main(argv: list[str]) -> int:
                 return 1
         elif a == "--wait":
             wait = True
+        elif a == "--build-record":
+            record_arg = next(it, None)
+            if record_arg is None:
+                log("error: --build-record needs a file")
+                return 1
+            build_record = Path(record_arg)
         else:
             log(f"unknown option: {a}")
             print(USAGE)
@@ -1239,6 +1250,9 @@ def main(argv: list[str]) -> int:
         return 1
     if mode not in ("quick", "probe") and not batch_id:
         log(f"error: --{mode} needs --batch ID")
+        return 1
+    if build_record is not None and mode != "quick":
+        log("error: --build-record applies only to --quick")
         return 1
     if mode == "control":
         from .controls import CONTROLS
@@ -1255,6 +1269,10 @@ def main(argv: list[str]) -> int:
         return 1
     try:
         run = Run(mode, batch_id, only, skip)
+        run.build_record = build_record
+        if mode == "baseline" and run.batch.get("nfc_enabled") is False:
+            log("error: an NFC-off experiment cannot seed a RAM reference")
+            return 1
         print(f"phone-qa {mode} run {run.run_id}" + (f", batch {batch_id}" if batch_id else "") +
               f", harness {run.version}")
         if mode == "quick":
