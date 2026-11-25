@@ -32,6 +32,11 @@ Run `scripts/try-test IMAGES_DIR LABEL [BOOTS]` with a staged image set.
 It wipes the test slot, measures boot and RAM, and runs setup, quick QA,
 and the probe. Evidence goes in `$BENCH_HOME/tries/LABEL/`.
 
+After setup, the trial holds the display awake on Perch for five minutes.
+It records Used RAM in `post-setup-used-ram-kb.txt` and the Wi-Fi IPv4
+address in `post-setup-wlan0.txt`. The pre-setup benchmark remains the keep
+gate.
+
 Flash reads the trial slot's bootloader status before the writes and
 verifies the slot is active and has boot retries or a successful boot
 after activation. A failed boot reselects the known-good slot when the
