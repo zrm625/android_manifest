@@ -5,7 +5,7 @@ a stack that passes is kept whole, a stack that fails is split.
 How a try runs and when it is kept: [CHARTER.md](CHARTER.md#pipeline-tries).
 
 RAM reference: baseline-2, 1,266 MB (median of 3 boots, 2026-11-23).
-Target: 1,000 MB. Now: 1,059 MB (stack F, kept).
+Target: 1,000 MB. Now: 1,053 MB (stack H, kept).
 
 ## Kept
 
@@ -56,6 +56,15 @@ GPS, audio, and the core apps. The rear flash reproduced the known dark
 frame. Settings launched cold in 838 ms median across three runs. There is
 no matching stack D launch measurement.
 
+**Stack H** (MIDI and Device Diagnostics removed on Stack F): kept in
+sdm632-common #9 and build #5. The three boots used 1,057.6, 1,042.2, and
+1,053.3 MB. The median was 1,053.3 MB, down 5.9 MB from Stack F. The first
+benchmark boot took 51.43 s. System used 7,720 KiB less. Quick QA passed and
+the probe passed 39 checks. The known GPS and rear-flash failures reproduced.
+Default NFC files and SKU rules were present on the phone. The audio probe
+measured 63.5 to 65.0 dB above silence. The isolated images are being measured
+against Stack F for comparison.
+
 ## Dropped
 
 | Try | Branch | Why dropped |
@@ -73,8 +82,9 @@ reference. The MIDI-only image is staged separately.
 
 ## Testing
 
-**Next on Stack F:** MIDI-only and Device Diagnostics removal are staged for
-phone testing.
+**Next:** compare the MIDI-only and Device Diagnostics-only images with
+Stack F. Profile the kept Stack F reference before and after setup to rank
+the next set of changes.
 
 **Low-RAM mode** (experiment on Stack D, branch `try-low-ram`): 1,076.2 MB
 median across three boots (1,076.2, 1,081.6, and 1,067.8 MB), with a 50.20 s
@@ -109,6 +119,12 @@ audio, and the core apps. The rear-flash check reproduced the dark frame.
 | Per-camera build switches | Charter item; changing the camera set needs Zak to merge. |
 
 ## Harness notes
+
+- Manifest #32 reads the test slot's bootloader status before writing and
+  verifies it after activation. On Stack H, rewriting the exhausted slot and
+  activating it took its reported retries from 0 to 7. Current kernels
+  disable SLUB debugging, so the trial saves `slab-sysfs.tsv` when
+  `/proc/slabinfo` is absent.
 
 - Stack F received `192.168.4.61` after a wipe, outside the documented
   Wi-Fi QA firewall rule. Manifest PR #28 makes `phone-setup` select the
