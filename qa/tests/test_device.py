@@ -34,6 +34,18 @@ class FakeRun:
         return [c for c in self.cmds if "reboot" in c]
 
 
+class FastbootMetadata(unittest.TestCase):
+    def test_parses_colon_in_variable_name_and_bootloader_prefix(self):
+        stderr = "(bootloader) slot-successful:_a: Yes\n(bootloader) slot-successful:_b: No\n"
+        with mock.patch.object(device, "run", return_value=subprocess.CompletedProcess([], 0, "", stderr)):
+            self.assertEqual(Device().getvar("slot-successful:_b"), "No")
+
+    def test_ignores_a_failed_getvar(self):
+        stderr = "(bootloader) slot-unbootable:b: not found\n"
+        with mock.patch.object(device, "run", return_value=subprocess.CompletedProcess([], 1, "", stderr)):
+            self.assertEqual(Device().getvar("slot-unbootable:b"), "")
+
+
 class Target(unittest.TestCase):
     def test_only_the_test_phone(self):
         self.assertEqual(Device().serial, "ZY225DPT7F")

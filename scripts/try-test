@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Run a wiped trial on river and save its benchmark and QA evidence.
+set -euo pipefail
+if (( $# < 2 || $# > 3 )); then
+  echo "Usage: try-test IMAGES_DIR LABEL [BOOTS]" >&2
+  exit 1
+fi
+source "$(dirname "$(realpath "$0")")/common.sh"
+
+images=$1 label=$2 boots=${3:-1}
+if [[ ! "$label" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ || ! "$boots" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: use a single directory name for LABEL and a positive BOOTS count" >&2
+  exit 1
+fi
+
+out="$BENCH_HOME/tries/$label"
+mkdir -p "$out"
+keys="$HOME/.config/river-keys"
+step() { echo "=== $(date +%H:%M:%S) $*"; }
+
+step flash
+"$SCRIPTS_DIR/flash" "$images" --wipe || { echo "RESULT flash-failed"; exit 1; }
+step bench
+"$SCRIPTS_DIR/bench/device-bench" current --boots "$boots" --slab-dir "$out" ||
+  { echo "RESULT bench-failed"; exit 1; }
+
+step meminfo
+adb -s ZY225DPT7F shell dumpsys meminfo > "$out/meminfo.txt"
+adb -s ZY225DPT7F shell cat /proc/meminfo > "$out/proc-meminfo.txt"
+adb -s ZY225DPT7F shell ps -A -o PID,RSS,NAME > "$out/ps.txt"
+
+step setup
+if ! "$SCRIPTS_DIR/phone-setup" --wifi "$keys/wifi-ssid" "$keys/wifi-psk"; then
+  echo "RESULT setup-failed"
+  "$SCRIPTS_DIR/flash" --rollback
+  exit 1
+fi
+
+step quick
+quick=0
+"$SCRIPTS_DIR/phone-qa" --quick || quick=$?
+if (( quick != 0 )); then
+  echo "RESULT quick-exit=$quick"
+  "$SCRIPTS_DIR/flash" --rollback
+  exit 1
+fi
+
+step qa
+rc=0
+"$SCRIPTS_DIR/phone-qa" --probe || rc=$?
+step done
+echo "RESULT qa-exit=$rc"
+tail -n "$boots" "$BENCH_HOME/results/device.csv" | cut -d, -f1-9

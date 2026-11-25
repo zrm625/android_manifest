@@ -6,6 +6,7 @@ fallback. No adb or fastboot."""
 import io
 import unittest
 from contextlib import redirect_stderr
+from pathlib import Path
 from unittest import mock
 
 import _path  # noqa: F401
@@ -93,6 +94,10 @@ class SlotPhone(Boots):
 
     def getvar(self, name):
         assert self.where == "fastboot"
+        if name.startswith("slot-successful:"):
+            return "No"
+        if name.startswith("slot-retry-count:"):
+            return "6"
         return f"_{self.active}" if name == "current-slot" else ""
 
     def fb_mode_set(self):
@@ -561,6 +566,61 @@ class PhoneInFastbootNothingPending(unittest.TestCase):
             self.assertEqual(rc, flashing.EXIT_HALT, err)
             self.assertEqual(p.boots, [])
             self.assertIsNotNone(flashing.load_state()["pair"])
+
+
+class ExhaustedTrialSlot(unittest.TestCase):
+    def test_exhausted_slot_is_rewritten_before_activation(self):
+        with bench_home(), redirect_stderr(io.StringIO()):
+            phone = SlotPhone(active="a")
+            getvar = phone.getvar
+
+            def slot_var(name):
+                if name == "slot-retry-count:_b" and phone.active == "a":
+                    return "0"
+                return getvar(name)
+
+            with mock.patch.object(phone, "getvar", side_effect=slot_var):
+                flashing.write_images(phone, Path("/images"), "b", False, {}, None)
+
+        writes = [call for call in phone.calls if call[:2] == ("fastboot", "flash")]
+        self.assertEqual([call[2] for call in writes], ["boot_b", "dtbo_b", "system_b", "vendor_b"])
+        self.assertLess(phone.calls.index(writes[-1]), phone.calls.index(("fastboot", "--set-active=b")))
+        self.assertEqual(phone.active, "b")
+
+    def test_still_exhausted_after_writing_reselects_fallback_without_wiping(self):
+        with bench_home(), redirect_stderr(io.StringIO()):
+            phone = SlotPhone(active="a")
+            getvar = phone.getvar
+
+            def slot_var(name):
+                return "0" if name == "slot-retry-count:_b" else getvar(name)
+
+            with mock.patch.object(phone, "getvar", side_effect=slot_var):
+                with self.assertRaisesRegex(flashing.Halt, "remains unbootable"):
+                    flashing.write_images(phone, Path("/images"), "b", True, {}, None)
+
+        self.assertEqual(phone.active, "a")
+        self.assertIn(("fastboot", "--set-active=b"), phone.calls)
+        self.assertEqual(phone.calls[-1], ("fastboot", "--set-active=a"))
+        self.assertNotIn(("fastboot", "erase", "userdata"), phone.calls)
+        self.assertEqual(phone.boots, [])
+
+    def test_failed_candidate_boot_with_wipe_returns_to_verified_fallback(self):
+        from riverqa import reboots
+
+        def written_then_timeout(dev, path, **kw):
+            kw["in_fastboot"]()
+            raise TimeoutError("candidate never reached sys.boot_completed")
+
+        with bench_home():
+            state(pair_kind=None)
+            phone = SlotPhone(active="a")
+            with patches(dev_inputs()), mock.patch.object(reboots, "planned_reboot", written_then_timeout):
+                rc, err = run_flash(phone, "/nonexistent-product", "--wipe")
+
+        self.assertEqual(rc, flashing.EXIT_RESCUED, err)
+        self.assertIn("candidate never reached sys.boot_completed", err)
+        self.assertEqual(phone.boots, ["a"])
 
 
 class DevFlash(unittest.TestCase):
