@@ -11,8 +11,8 @@
     "torch_delta": 5.0
   },
   "params": {
-    "audio_volume": 7,
-    "audio_amplitude": 0.5,
+    "audio_volume": 3,
+    "audio_amplitude": 0.1,
     "audio_level_floor_dbfs": -70.0,
     "camera0_photo_iso": 800,
     "camera0_photo_exposure_ns": 60000000,
