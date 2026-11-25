@@ -121,6 +121,18 @@ reference. The MIDI-only image is staged separately.
 
 ## Testing
 
+**Default NFC repeat under the settled RAM gate (2026-11-25).** The NFC-enabled
+image `try-default-nfc-restored` matched the current build inputs. Its first
+benchmark reboot took 51.33 s. Used RAM before setup was 1,004.9, 990.1, and
+978.8 MB across three boots, with a median of 990.1 MB. With Perch in the
+foreground and the display awake, the readings on one boot were 1,050.1,
+1,053.5, and 1,055.9 MB. The 1,053.5 MB median was 5.7 MB above the
+1,047.8 MB reference, so the repeat missed the gate by 0.7 MB. The
+reference remains 1,047.8 MB. Quick QA passed all eight checks, including
+the NFC file check. The probe passed 40 checks, including GPS and hardware
+H.264. The known dark rear-flash check failed. Raw evidence is in
+`tries/default-nfc-settled-repeat/` under the benchmark directory.
+
 **MIDI-only comparison on Stack F:** 1,041.7 MB median (1,058.6, 1,041.7,
 and 1,032.0 MB) with a 51.29 s first benchmark boot. Quick QA passed. The
 probe passed 40 checks, including GPS, and reproduced the known rear-flash
@@ -174,6 +186,11 @@ audio, and the core apps. The rear-flash check reproduced the dark frame.
 | Per-camera build switches | Charter item; changing the camera set needs Zak to merge. |
 
 ## Harness notes
+
+- The first live flash with manifest #42 booted the default image on slot
+  b in 50 s. Fastboot reported seven retries before and after activation.
+  Android finished its first boot without a repeat boot. The early
+  rollback path was unexercised.
 
 - Manifest #32 reads the test slot's bootloader status before writing and
   verifies it after activation. On Stack H, rewriting the exhausted slot and
