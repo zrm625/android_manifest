@@ -175,6 +175,25 @@ first benchmark boot. The median is 27.3 MB below Stack D. Shipping this mode
 requires Zak's approval. The probe passed 40 checks, including Wi-Fi, GPS,
 audio, and the core apps. The rear-flash check reproduced the dark frame.
 
+**Low-RAM mode on Stack I (2026-11-25, measurement only).** With
+`ro.config.low_ram=true`, the first benchmark reboot took 49.64 s. Used
+RAM before setup was 966.2, 964.8, and 959.5 MB across three boots, with a
+median of 964.8 MB. The settled readings on Perch were 1,030.6, 1,028.1,
+and 1,025.9 MB. The median was 25.4 MB below the matched default repeat
+and 28.1 MB above the target. Quick QA passed, including the NFC file
+check. The probe passed 40 checks and reproduced the known dark rear-flash
+failure.
+
+The UI retest completed eight Perch-to-app round trips, eight LatinIME
+show and hide cycles, and a Quick Settings expansion. Perch recorded
+29 janky frames out of 190 (15.3%, p95 53 ms). The default repeat
+recorded 19 out of 191 (9.9%, p95 48 ms) for the same switches. These
+are single runs. LatinIME recorded 8 janky frames out of 24 (33.3%,
+p95 57 ms) in low-RAM mode. The default's first keyboard timing run
+stopped before it collected comparable frames. The experiment stays
+on the `measure-low-ram-stack-i` branch. Raw evidence is in
+`tries/measure-low-ram-stack-i/` under the benchmark directory.
+
 ## Open problems
 
 - **GPS** (must-work). `radios.gps` gets 0 status callbacks in 120 s with
