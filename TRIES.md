@@ -63,10 +63,18 @@ no matching stack D launch measurement.
 | No debugfs | kernel `debugfs-off` | Doesn't compile: Qualcomm audio (q6asm, apr, audio codecs) and clock-debug code keep real functions under `CONFIG_DEBUG_FS`. Worth about 6 MB; it would need driver patches. |
 | No ftrace | kernel `ftrace-off` | Stack E (with no SecureElement): 1,097 MB (−6.5 MB, not the 16 MB the tracefs file count suggested). `vendor.lineage.livedisplay-service.sdm` aborted at every boot ("PictureAdjustment backend not ready"), then init restarted it 5 s later. A tombstone on every boot isn't worth 6 MB. |
 
+**Stack G** (virtual-device manager and MIDI service disabled on Stack F):
+dropped. Used RAM was 908.7 MB median (933.8, 908.7, and 871.9 MB). The first
+benchmark boot took 56.26 s. The next two took 47.37 and 124.3 s. SystemUI
+repeatedly crashed during startup because a required Dagger provider returned
+null. SystemUI requires the virtual-device manager. Setup could not advance
+past Start, so the probe could not run. Do not use the RAM result as a
+reference. The MIDI-only image is staged separately.
+
 ## Testing
 
-**Stack G** (virtual-device manager and MIDI service disabled) is staged on
-Stack F for phone measurements.
+**Next on Stack F:** MIDI-only and Device Diagnostics removal are staged for
+phone testing.
 
 **Low-RAM mode** (experiment on Stack D, branch `try-low-ram`): 1,076.2 MB
 median across three boots (1,076.2, 1,081.6, and 1,067.8 MB), with a 50.20 s
@@ -96,7 +104,7 @@ audio, and the core apps. The rear-flash check reproduced the dark frame.
 | Process count | 60k of 100k `vm_area_struct` are copies of zygote's mappings in forked apps; each app that doesn't start saves its VMAs as well as its PSS. |
 | system_server (262 MB) and SystemUI (103 MB) | system_server is mostly file mappings (.jar 53 MB, .apk 40 MB, .dex 40 MB, .so 27 MB); heaps are 22 MB each. Fewer services means fewer classes loaded. |
 | Low-RAM mode (`ro.config.low_ram`) | Measure only; shipping it needs Zak. |
-| Remove x86 and x86_64 WebView projects | Sync and checkout size (`default.xml`). |
+| Remove x86 and x86_64 WebView projects | Manifest #30 removed both for new syncs. `m nothing` passed with both project directories absent. |
 | Perch follow-ups | Go-edition launcher overrides, `PRODUCT_DEXPREOPT_SPEED_APPS`, GestureService only in gesture nav. |
 | Per-camera build switches | Charter item; changing the camera set needs Zak to merge. |
 
