@@ -4,7 +4,7 @@
 # than hours.
 #
 # Usage: build [--tree baseline|stripped] [--installclean] [--clean] [--ccache] [--jobs N] [--target T]
-#              [--build-id ID | --batch ID]
+#              [--build-id ID | --batch ID] [--without-nfc]
 #
 #   --tree     Which tree to build. Default: stripped (this tree).
 #   --installclean  Delete the staged partitions and images first, but keep
@@ -26,6 +26,11 @@
 #   --batch ID Build for batch ID: the build ID is "ID-<commit set hash>", which
 #              is what phone-qa stage requires of a batch. Refuses a dirty tree.
 #
+#   --without-nfc Build the stripped river image without NFC hardware
+#              support. Retains the framework Java APIs needed at boot.
+#              This experiment changes the staged output and cannot be a
+#              batch. A subsequent build without the flag restores NFC.
+#
 # Output goes to $BENCH_HOME/out-<tree>/, which is what scripts/flash installs.
 # A successful build also writes out-<tree>/river-build.json: the build ID,
 # the commit set (each fork's HEAD and the manifest's) it was built from, and
@@ -38,11 +43,12 @@ source "$(dirname "$(realpath "$0")")/bench/lib.sh"
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
-env_name=stripped installclean=0 clean=0 ccache=0 jobs=$(nproc) target=bacon build_id=${RIVER_BUILD_ID:-} batch=
+env_name=stripped installclean=0 clean=0 ccache=0 jobs=$(nproc) target=bacon build_id=${RIVER_BUILD_ID:-} batch= without_nfc=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tree) env_name=$2; shift ;;
     --installclean) installclean=1 ;;
+    --without-nfc) without_nfc=true ;;
     --clean) clean=1 ;;
     --ccache) ccache=1 ;;
     --jobs) jobs=$2; shift ;;
@@ -54,6 +60,10 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+if [[ "$without_nfc" == true && ( "$env_name" != stripped || -n "$batch" ) ]]; then
+  echo "error: --without-nfc is only for a stripped dev build" >&2
+  exit 1
+fi
 tree=$(tree_for "$env_name") || usage 1
 [[ -d "$tree/.repo" ]] || { echo "error: no repo tree at $tree" >&2; exit 1; }
 
@@ -101,21 +111,34 @@ if [[ "$clean" == 1 ]]; then
   find "$out" -mindepth 1 -delete
 fi
 
+# Also clean after an interrupted NFC-off build when switching back.
+nfc_off_marker="$out/.river-nfc-off"
+if [[ "$without_nfc" == true ]]; then
+  touch "$nfc_off_marker"
+fi
+if [[ -e "$nfc_off_marker" ]]; then
+  installclean=1
+fi
+
 log=$BENCH_HOME/logs/build-$(date +%Y%m%d-%H%M%S)-$env_name.log
 echo "Building $target for $env_name into $out, build ID $build_id (log: $log)"
 rc=0
-run_build "$tree" "$out" "$target" "$jobs" "$ccache" "$log" "$installclean" || rc=$?
+run_build "$tree" "$out" "$target" "$jobs" "$ccache" "$log" "$installclean" "$without_nfc" || rc=$?
 read -r _ wall _ < <(cat "$out/.bench-result" 2>/dev/null || echo "$rc 0 ")
 echo
 if [[ "$rc" == 0 ]]; then
   python3 -I -c '
 import json, sys
-build_id, commit_hash, commits, image_id, out = sys.argv[1:6]
+build_id, commit_hash, commits, image_id, out, without_nfc = sys.argv[1:7]
 rows = [l.split(" ", 1) for l in commits.splitlines() if l.strip()]
 with open(out, "w") as f:
     json.dump({"build_id": build_id, "commit_set_hash": commit_hash,
-               "commit_set": {p: s for p, s in rows}, "image_id": image_id}, f, indent=2)
-' "$build_id" "$commit_hash" "$commits" "$IMAGE" "$out/river-build.json"
+               "commit_set": {p: s for p, s in rows}, "image_id": image_id,
+               "nfc_enabled": without_nfc == "false"}, f, indent=2)
+' "$build_id" "$commit_hash" "$commits" "$IMAGE" "$out/river-build.json" "$without_nfc"
+  if [[ "$without_nfc" == false ]]; then
+    rm -f "$nfc_off_marker"
+  fi
   echo "Built $build_id in ${wall}s. Install with: scripts/flash $env_name"
 else
   echo "Build failed (exit $rc). Log: $log"
