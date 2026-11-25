@@ -82,9 +82,15 @@ reference. The MIDI-only image is staged separately.
 
 ## Testing
 
-**Next:** compare the MIDI-only and Device Diagnostics-only images with
-Stack F. Profile the kept Stack F reference before and after setup to rank
-the next set of changes.
+**MIDI-only comparison on Stack F:** 1,041.7 MB median (1,058.6, 1,041.7,
+and 1,032.0 MB) with a 51.29 s first benchmark boot. Quick QA passed. The
+probe passed 40 checks, including GPS, and reproduced the known rear-flash
+failure. Speaker and microphone measured 65.2 to 68.2 dB above silence.
+MIDI is already in Stack H. The Device Diagnostics-only run is pending, so
+the difference between these medians does not isolate its effect.
+
+**Next:** run the staged Device Diagnostics-only image. Profile the kept
+Stack F reference before and after setup to rank the next set of changes.
 
 **Low-RAM mode** (experiment on Stack D, branch `try-low-ram`): 1,076.2 MB
 median across three boots (1,076.2, 1,081.6, and 1,067.8 MB), with a 50.20 s
