@@ -8,7 +8,7 @@ these rules on 2026-11-23. Change them only in a pull request that Zak approves.
 
 | Goal | Target | How it is measured |
 | --- | --- | --- |
-| RAM | At most 1,000 MB used (1,233 MB on 2026-11-23) | `device-bench` "used RAM", taken after a boot on a freshly wiped phone. See [Measuring RAM](#measuring-ram). |
+| RAM | At most 1,000 MB used | Median Used RAM after setup. See [Measuring RAM](#measuring-ram). |
 | Must-work list | Every item passes | `phone-qa --quick` on every try, the full `phone-qa` daily. |
 | Autonomy | No hands | Build, flash, set up, QA, then keep or drop, with no one at the phone. |
 | No regressions | Boot ≤ 55 s; RAM no worse; `/system` no bigger unless RAM went down | See [Regressions](#regressions). |
@@ -16,9 +16,15 @@ these rules on 2026-11-23. Change them only in a pull request that Zak approves.
 
 ### Measuring RAM
 
-- Each try measures RAM after one boot.
-- Once a try gets to 1,050 MB or less, measure three boots and use the median.
-- A boot takes several minutes, so don't measure more often than that.
+Zak chose the after-setup RAM gate on 2026-11-25. The first reference
+reading was 1,047.8 MB on the NFC-enabled Stack I rebuild.
+
+- After `phone-setup`, leave Perch in the foreground and the screen on.
+  Take the first Used RAM sample after five minutes. Take two more settled
+  samples on the same boot and use the median. If the phone cannot provide
+  all three samples, record what was collected and leave the gate unverified.
+- Continue to record the median Used RAM across three benchmark boots
+  before setup.
 
 ### Regressions
 
@@ -26,10 +32,10 @@ these rules on 2026-11-23. Change them only in a pull request that Zak approves.
   `device.csv`) for the first `device-bench` boot. That is the reboot after the
   first boot following the wipe. The first boot itself runs setup work, takes
   minutes, and is only recorded.
-- **RAM:** no worse than the reference. The reference is the lowest
-  three-boot median of any known-good build. If one boot comes out more than
-  10 MB over the reference, measure three boots. The try fails if the median
-  is more than 5 MB over the reference. This allows for measurement noise.
+- **RAM:** use the median of the three settled samples. The reference is the
+  lowest verified settled median from a kept, NFC-enabled build. The
+  initial Stack I reading is the reference until a kept run has a verified
+  median. The try fails if its median is more than 5 MB over the reference.
 - **Size:** `/system` and `/vendor` may not grow compared with the latest
   known-good build, unless the same try lowers the RAM median below the
   reference. This applies to upstream merges as well.
@@ -117,12 +123,11 @@ qualify`) are no longer part of it.
 3. **Build while testing.** The next try builds (`scripts/build`, incremental)
    while the phone tests the last one, so the phone never waits for a review.
 4. **Test.** Flash the try's images with a wipe to the slot that isn't
-   known-good, run `phone-setup`, `phone-qa --quick`, then `device-bench
-   current` for RAM and boot time.
+   known-good and run `device-bench current` before setup. Run `phone-setup`,
+   record settled RAM, and run `phone-qa --quick`.
 5. **Keep or drop.**
-   - **Keep** when QA passes, boot is 55 s or less and RAM is no worse (see
-     [Regressions](#regressions); measure three boots when one boot is within
-     10 MB of the reference). The tester merges the try's PRs into
+   - **Keep** when QA passes, boot is 55 s or less, and the settled RAM
+     median passes [Regressions](#regressions). The tester merges the try's PRs into
      `river-22.2` and writes the result in TRIES.md.
    - **Drop** when any of that fails. The tester writes why in TRIES.md and
      closes the PRs. A try comes back only with a fix for the reason it failed.
