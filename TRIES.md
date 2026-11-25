@@ -21,7 +21,7 @@ The target is 1,000 MB Used RAM after setup. The first settled reference is
 | Two SurfaceFlinger framebuffers | sdm632-common #6 | `max_frame_buffer_acquired_buffers` 3 → 2; SurfaceFlinger 87 → 77 MB. |
 | No ClearKey DRM service | sdm632-common #7 | Test DRM scheme; Widevine stays. |
 | Tiny default wallpaper | vendor_lineage #6 | 32×32 dark image; the wallpaper surface shrank and SurfaceFlinger went 77 → 63 MB. |
-| No CAS HIDL service, traced off | build #3 | The HIDL service and default Perfetto daemons are gone. The AIDL CAS example service still runs at about 4.8 MB PSS. Use `setprop persist.traced.enable 1` for a trace. |
+| No CAS HIDL service, traced off | build #3 | The HIDL service and default Perfetto daemons are gone. The AIDL CAS example service used 0.9 MB PSS and 4.7 MB RSS in the default NFC repeat. Use `setprop persist.traced.enable 1` for a trace. |
 
 **Stack A** (Perch, zygote64, lazy camera): 1,144 MB (−122 MB), boot 49.7 s.
 `phone-qa --probe`: 34 pass. Failed: GPS (open, below), Brave and Tailscale
@@ -119,6 +119,22 @@ null. SystemUI requires the virtual-device manager. Setup could not advance
 past Start, so the probe could not run. Do not use the RAM result as a
 reference. The MIDI-only image is staged separately.
 
+**Stack J (dead heap properties and the AIDL CAS example APEX).** Dropped
+at the settled RAM gate. The first benchmark reboot took 49.68 s. The
+pre-setup median was 987.5 MB. The three settled samples were 1,052.0,
+1,054.8, and 1,055.9 MB. The median was 7.0 MB above the 1,047.8 MB
+reference and 1.3 MB above the unchanged default repeat. `/system` used
+the same space as the default repeat and `/vendor` used 296 KiB less.
+Quick QA passed, including the NFC file check. The probe passed 40 checks,
+including hardware H.264 and the core apps. The known dark rear-flash
+check failed. The effective ART settings stayed at 0.75, 512k, and 8m.
+The CAS example APEX and service were absent. Widevine identified the
+same Google 15.0.0 plugin as the unchanged default. Both wiped builds
+required provisioning before opening a DRM session. The trial commits are
+`70d8bec5` in sdm632-common and `0e77dff1a5` in build/make. Raw
+evidence is in `tries/stack-j-heap-props-cas/` under the benchmark
+directory.
+
 ## Testing
 
 **Default NFC repeat under the settled RAM gate (2026-11-25).** The NFC-enabled
@@ -180,7 +196,6 @@ audio, and the core apps. The rear-flash check reproduced the dark frame.
 | Process count | 60k of 100k `vm_area_struct` are copies of zygote's mappings in forked apps; each app that doesn't start saves its VMAs as well as its PSS. |
 | system_server (262 MB) and SystemUI (103 MB) | system_server is mostly file mappings (.jar 53 MB, .apk 40 MB, .dex 40 MB, .so 27 MB); heaps are 22 MB each. Fewer services means fewer classes loaded. |
 | Low-RAM mode (`ro.config.low_ram`) | Measure only; shipping it needs Zak. |
-| Vendor AIDL CAS example | About 4.8 MB PSS. Try removing the example service APEX and check hardware video and the core apps. |
 | Remove x86 and x86_64 WebView projects | Manifest #30 removed both for new syncs. `m nothing` passed with both project directories absent. |
 | Perch follow-ups | Go-edition launcher overrides, `PRODUCT_DEXPREOPT_SPEED_APPS`, GestureService only in gesture nav. |
 | Per-camera build switches | Charter item; changing the camera set needs Zak to merge. |
