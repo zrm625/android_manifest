@@ -123,7 +123,7 @@ def clear_then_set_active(dev: Device, slot: str, then: str = "flash --rollback"
     return owed
 
 
-def recovery_halt(e: BaseException, advice: str | None = None) -> int:
+def recovery_halt(e: BaseException | str, advice: str | None = None) -> int:
     """The one way slot recovery stops on a failure (R6-1): a clean
     ``error:`` line, what to do next, and exit 3. Nothing is resolved
     here. ``advice`` replaces the generic note on a pending fb_mode
@@ -162,6 +162,41 @@ def promote_halt(e: BaseException, batch_id: str, target: str, fallback: str) ->
         f"the phone back to slot {target}, then runs flash --promote {batch_id} again."))
 
 
+def slot_unbootable(dev: Device, slot: str) -> bool:
+    """River exposes the success and retry values with an underscore slot suffix."""
+    unbootable = dev.getvar(f"slot-unbootable:{slot}").lower()
+    successful = dev.getvar(f"slot-successful:_{slot}").lower()
+    retries = dev.getvar(f"slot-retry-count:_{slot}")
+    log(f"  slot {slot}: unbootable={unbootable or 'unavailable'}, "
+        f"successful={successful or 'unavailable'}, retries={retries or 'unavailable'}")
+    if unbootable == "yes":
+        return True
+    if successful not in ("yes", "no") or not retries.isdecimal():
+        raise Halt(f"cannot verify bootability of slot {slot}; check fastboot slot metadata")
+    return successful == "no" and int(retries) == 0
+
+
+def select_fallback(dev: Device, fallback: str, *, then: str = "flash --rollback") -> None:
+    """Inspect the failed slot and reselect the fallback before leaving fastboot."""
+    to_fastboot(dev)
+    dev.fastboot_guard()
+    try:
+        slot_unbootable(dev, slots.other(fallback))
+    except (RuntimeError, TimeoutError) as e:
+        # A metadata read error must not strand the phone on a failed slot.
+        log(f"  could not read candidate slot state: {e}")
+    clear_then_set_active(dev, fallback, then=then)
+
+
+def halt_on_fallback(dev: Device, fallback: str, reason: str) -> int:
+    try:
+        select_fallback(dev, fallback)
+    except (RuntimeError, TimeoutError) as e:
+        return recovery_halt(f"{reason}; could not select fallback slot {fallback}: {e}")
+    return recovery_halt(reason, advice=f"Slot {fallback} is active in fastboot. "
+                         "Run flash --rollback to wipe userdata and verify the fallback boot.")
+
+
 def rollback(dev: Device, st: dict, reason: str, attempt_id: str | None = None,
              then: str = "flash --rollback") -> dict:
     """The one rollback procedure: in fastboot, clear fb_mode, --set-active
@@ -182,9 +217,7 @@ def rollback(dev: Device, st: dict, reason: str, attempt_id: str | None = None,
     # timeout, a guard failure or an unreachable phone. The pair and any
     # fb_mode obligation stay as they are.
     try:
-        to_fastboot(dev)
-        dev.fastboot_guard()
-        clear_then_set_active(dev, fallback, then=then)
+        select_fallback(dev, fallback, then=then)
         r = dev.fastboot("erase", "userdata", timeout=300)
         if r.returncode != 0:
             raise Halt(f"rollback: fastboot erase userdata failed: {(r.stderr or r.stdout).strip()[-300:]}",
@@ -254,6 +287,8 @@ def write_images(dev: Device, images_dir: Path, target: str, wipe: bool, attempt
     # caller with a VerifiedBoot of the slot written. A failed clear with
     # none pending is logged and the flash goes on (R5-1).
     fbmode.clear(dev)
+    if slot_unbootable(dev, target):
+        log(f"  slot {target} has exhausted its boot retries; rewriting it before activation")
     if st is not None:
         slots.mark_written(st, attempt["attempt_id"], now_iso())
         save_state(st)
@@ -266,6 +301,17 @@ def write_images(dev: Device, images_dir: Path, target: str, wipe: bool, attempt
         # R11-2: a timeout leaves it unknown whether slot target is active.
         raise WipeFailed(f"fastboot --set-active={target} timed out; slot {target} may be active"
                          + ("" if not wipe else " and userdata was not erased") + f": {e}") from e
+    try:
+        if slot_unbootable(dev, target):
+            raise Halt(f"slot {target} remains unbootable after rewriting and activation")
+        active = dev.getvar("current-slot").lstrip("_")
+        if active != target:
+            raise Halt(f"expected active slot {target}, bootloader reports {active or 'unavailable'}")
+    except (RuntimeError, TimeoutError) as e:
+        fallback = st["known_good_slot"] if st else slots.other(target)
+        clear_then_set_active(dev, fallback)
+        raise Halt(f"could not verify slot {target} after activation: {e}. "
+                   f"Slot {fallback} is active in fastboot.") from e
     if wipe:
         # Not fastboot -w: river's bootloader also tries to erase a metadata
         # partition the phone doesn't have, and fails.
@@ -409,8 +455,24 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
     log(f"Flashing {product} to slot {target} (current slot: {current or '?'})")
     back = st["known_good_slot"] if st else current
 
+    write_finished = False
+
     def in_fb():
+        nonlocal write_finished
         write_images(dev, product, target, wipe, attempt, None)
+        write_finished = True
+
+    def return_after_failed_boot(e: Exception) -> int:
+        reason = f"the dev flash of slot {target} did not boot and verify: {e}"
+        if st is None:
+            return recovery_halt(reason, advice=way_back(None))
+        if not wipe:
+            return halt_on_fallback(dev, back, reason)
+        try:
+            rescue(dev, st, reason, attempt["attempt_id"])
+        except (RuntimeError, TimeoutError) as h:
+            return recovery_halt(h)
+        return EXIT_RESCUED
 
     def way_back(active: str | None) -> str:
         """Where to go with the obligation pending (R10-3): before the first
@@ -434,6 +496,8 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
                                      + way_back(current))
             return recovery_halt(e, advice=f"The fb_mode obligation stays pending. Clear it by hand (fastboot -s "
                                  f"{SERIAL} oem fb_mode_clear), then run the flash again.")
+        if isinstance(e, Halt):
+            return recovery_halt(e)
         if isinstance(e, WipeFailed):
             # R10-5, R11-2: slot target is (or may be) active and its wipe is
             # not confirmed; always a halt.
@@ -475,19 +539,10 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         rec = reboots.planned_reboot(dev, "fastboot", boot_timeout=FIRST_BOOT_TIMEOUT, in_fastboot=in_fb)
     except Unreachable:                # R10-4
         raise
-    except RuntimeError as e:
+    except (RuntimeError, TimeoutError) as e:
+        if write_finished:
+            return return_after_failed_boot(e)
         return write_failed(e)
-    except TimeoutError as e:
-        if fbmode.pending() is not None:
-            if st is None:
-                return recovery_halt(e, advice=way_back(None))
-            return recovery_halt(e, advice=f"The fb_mode obligation stays pending. Roll back with flash --rollback "
-                                 f"(it wipes userdata), or fastboot -s {SERIAL} --set-active={back} and phone-qa "
-                                 "recover.")
-        log(f"error: {e}. Roll back to the {'known-good' if st else 'previous'} slot: "
-            + (f"flash --rollback, or fastboot -s {SERIAL} --set-active={back}" if st else
-               f"fastboot -s {SERIAL} --set-active={back}"))
-        return EXIT_ERROR
     # R8-1: the boot of the slot written must be verified, and that proof
     # alone settles a pending obligation. R9-5: the version shown below is
     # read before the settle; nothing is read from the phone after it.
@@ -496,13 +551,7 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         version = dev.getprop("ro.lineage.display.version") or "?"
         fbmode.settle(proof)
     except (RuntimeError, TimeoutError) as e:
-        if fbmode.pending() is not None:
-            return recovery_halt(RuntimeError(f"the dev flash of slot {target} could not be verified: {e}"),
-                                 advice=way_back(None))
-        log(f"error: the dev flash of slot {target} could not be verified: {e}. "
-            + (f"Flash again, or return to slot {back} with flash --rollback." if st else
-               f"Return to slot {back} with fastboot -s {SERIAL} --set-active={back}."))
-        return EXIT_ERROR
+        return return_after_failed_boot(e)
     if st:
         st.setdefault("history", []).append({"event": "dev-flash", "at": now_iso(), "slot": target})
         save_state(st)

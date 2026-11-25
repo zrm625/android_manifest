@@ -26,6 +26,24 @@ for the build in `out-stripped`, Wi-Fi, Bluetooth, GPS, cameras, sensors,
 fingerprint and audio are for reading only. `--quick` loads no fixtures and is
 never merge-eligible.
 
+## Run a trial image
+
+Run `scripts/try-test IMAGES_DIR LABEL [BOOTS]` with a staged image set.
+It wipes the test slot, measures boot and RAM, and runs setup, quick QA,
+and the probe. Evidence goes in `$BENCH_HOME/tries/LABEL/`.
+
+Flash reads the trial slot's bootloader status before the writes and
+verifies the slot is active and has boot retries or a successful boot
+after activation. A failed boot reselects the known-good slot when the
+phone still answers. If the phone cannot be identified in fastboot, stop
+and tell Zak.
+
+The benchmark saves `slabinfo.txt` when the kernel exports
+`/proc/slabinfo`. With the current river kernel, which disables
+`CONFIG_SLUB_DEBUG`, it saves `slab-sysfs.tsv` instead. These are the
+counters the kernel exposes without slab debugging. They omit full-slab
+counts and allocation call sites, so use a diagnostic kernel for those.
+
 ## The batch sequence
 
 The runner holds the device lock across the whole sequence. Without a runner,

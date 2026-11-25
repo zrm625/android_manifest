@@ -148,6 +148,7 @@ Usage: device-bench <baseline|stripped|current> [--flash] [--wipe] [--boots N] [
   current            Measure whatever the phone runs now. Cannot be combined with --flash.
   --flash   Install the build with scripts/flash (fastboot, inactive slot).
   --wipe    Factory reset while flashing.
+  --slab-dir PATH  Save a slab snapshot in PATH after the last measured boot.
   --boots N   Reboot and measure N times. Default: 3. Boot 1 of a flash is a
               normal `adb reboot` (the charter's boot time); every later boot is
               the immediate sysrq reboot, which has an uptime gate. With --batch
@@ -166,6 +167,38 @@ Only the phone with serial ZY225DPT7F is touched (fixed in the code).
 """
 
 
+SLAB_SYSFS = """
+for cache in /sys/kernel/slab/*; do
+    [ -d "$cache" ] && [ ! -L "$cache" ] || continue
+    objects=$(cat "$cache/objects") || exit 1
+    object_size=$(cat "$cache/object_size") || exit 1
+    objects_per_slab=$(cat "$cache/objs_per_slab") || exit 1
+    order=$(cat "$cache/order") || exit 1
+    printf '%s\t%s\t%s\t%s\t%s\n' "${cache##*/}" "$objects" "$object_size" "$objects_per_slab" "$order"
+done
+"""
+
+
+def capture_slab(dev: Device, out: Path) -> None:
+    """Capture native slabinfo, or the limited SLUB sysfs counters on river."""
+    dev.root()
+    dev.guard()
+    native = dev.read("cat /proc/slabinfo")
+    if native.rc == 0 and native.out.startswith("slabinfo - version:") and len(native.out.splitlines()) > 2:
+        (out / "slabinfo.txt").write_text(native.out)
+        (out / "slab-sysfs.tsv").unlink(missing_ok=True)
+        return
+
+    counters = dev.read(SLAB_SYSFS, timeout=120)
+    if counters.rc != 0 or not counters.out.strip():
+        raise RuntimeError(f"/proc/slabinfo: {native.err.strip() or 'invalid output'}; "
+                           f"SLUB sysfs: {counters.err.strip() or 'no cache rows'}")
+    (out / "slab-sysfs.tsv").write_text(
+        "cache\tobjects_reported\tobject_size\tobjects_per_slab\torder\n" + counters.out)
+    (out / "slabinfo.txt").unlink(missing_ok=True)
+    log("  /proc/slabinfo unavailable; saved SLUB sysfs counters to slab-sysfs.tsv")
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="device-bench", usage=USAGE, add_help=False)
     ap.add_argument("env", nargs="?")
@@ -174,6 +207,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--boots", type=int, default=3)
     ap.add_argument("--settle", type=int, default=120)
     ap.add_argument("--batch")
+    ap.add_argument("--slab-dir", type=Path, help="save a slab snapshot after the last benchmark boot")
     ap.add_argument("-h", "--help", action="store_true")
     a = ap.parse_args(argv)
     if a.help or a.env not in ("baseline", "stripped", "current"):
@@ -251,11 +285,19 @@ def run(a) -> int:
         batch.setdefault("bench_runs", []).append(run_id)
         stage.save(batch)
     timing = reboots.load_timing()
+    st = flashing.load_state() if not batch else None
+    fallback = st["known_good_slot"] if st else None
+    try_slot = flashing.running_slot(dev) if fallback is not None else None
+    running_try = try_slot is not None and try_slot != fallback
     for i, (path, inject) in enumerate(plan, 1):
         log(f"Boot {i}/{len(plan)} ({path} reboot)")
-        dev.root()
         try:
+            dev.root()
             rec = reboots.planned_reboot(dev, path, boot_timeout=flashing.BOOT_TIMEOUT, inject_early_reboot=inject)
+            if running_try:
+                slot = flashing.running_slot(dev)
+                if slot != try_slot:
+                    raise RuntimeError(f"the phone booted slot {slot}, expected try slot {try_slot}")
         except (TimeoutError, RuntimeError) as e:
             log(f"error: boot {i} failed: {e}")
             if batch:
@@ -266,6 +308,8 @@ def run(a) -> int:
                     return flashing.EXIT_RESCUED
                 except (flashing.Halt, Exception) as h:  # noqa: BLE001 - halt on anything here
                     return flashing.recovery_halt(h)     # R7-5: the error: line and the obligation note
+            if running_try:
+                return flashing.halt_on_fallback(dev, fallback, f"benchmark boot {i} failed: {e}")
             return 1
         if rec.control in ("early-reboot", "early-reboot-missed"):
             b = stage.load(a.batch)
@@ -325,6 +369,13 @@ def run(a) -> int:
             f"{row['processes']} processes, {row['packages']} packages, CPU idle {row['cpu_idle_pct']}%, "
             f"signals {row['signals']}")
     log(f"Results: {csv_path()}")
+    slab_dir = getattr(a, "slab_dir", None)
+    if slab_dir is not None:
+        try:
+            capture_slab(dev, slab_dir)
+        except (OSError, RuntimeError) as e:
+            log(f"error: slab capture failed: {e}")
+            return 1
     return 0
 
 

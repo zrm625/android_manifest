@@ -42,9 +42,20 @@ class FakePhone(Boots):
     def fastboot_guard(self):
         self.events.append(("fastboot_guard",))
 
+    def getvar(self, name):
+        if name == "current-slot":
+            return self.slot
+        if name.startswith("slot-successful:"):
+            return "No"
+        if name.startswith("slot-retry-count:"):
+            return "6"
+        return ""
+
     def fastboot_ok(self, *args, timeout=300):
         st = core.read_json(self.home / "slot-state.json")
         self.events.append(("fastboot", args, dict(st["pair"]) if st.get("pair") else None))
+        if args[0].startswith("--set-active="):
+            self.slot = args[0].split("=", 1)[1]
 
     def fastboot(self, *args, timeout=120):
         self.events.append(("fastboot", args, None))

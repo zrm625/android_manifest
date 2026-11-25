@@ -471,10 +471,13 @@ class Device:
 
     def getvar(self, name: str) -> str:
         r = self.fastboot("getvar", name, timeout=20)
+        if r.returncode != 0:
+            return ""
+        prefix = f"{name}:"
         for line in (r.stdout + r.stderr).splitlines():
-            k, sep, v = line.partition(":")
-            if sep and k.strip() == name:
-                return v.strip()
+            line = line.strip().removeprefix("(bootloader) ").lstrip()
+            if line.startswith(prefix):
+                return line[len(prefix):].strip()
         return ""
 
     def wait_fastboot(self, seconds: float) -> None:
