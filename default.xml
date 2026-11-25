@@ -84,8 +84,6 @@
   </project>
   <project name="LineageOS/android_external_chromium-webview_prebuilt_arm" path="external/chromium-webview/prebuilt/arm" revision="472d0ac3cf8e78982807bedd20279a537d6cdf68" upstream="main" dest-branch="main" groups="pdk"/>
   <project name="LineageOS/android_external_chromium-webview_prebuilt_arm64" path="external/chromium-webview/prebuilt/arm64" revision="5de662a4d42b57a2efe4114e499d38fa3ce41f9d" upstream="main" dest-branch="main" groups="pdk"/>
-  <project name="LineageOS/android_external_chromium-webview_prebuilt_x86" path="external/chromium-webview/prebuilt/x86" revision="63a11af88b3c3ef7daa95f5d059740b354df9f2b" upstream="main" dest-branch="main" groups="pdk"/>
-  <project name="LineageOS/android_external_chromium-webview_prebuilt_x86_64" path="external/chromium-webview/prebuilt/x86_64" revision="a71893ba05acc77405e46262d458b47ab2b11e54" upstream="main" dest-branch="main" groups="pdk"/>
   <project name="LineageOS/android_external_conscrypt" path="external/conscrypt" revision="061bca0ac3832e314b0d15909748b993fd629b8c" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk"/>
   <project name="LineageOS/android_external_cronet" path="external/cronet" revision="1f9498a97b1cc802a4c837902fd5e95ff9217330" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk"/>
   <project name="LineageOS/android_external_dng_sdk" path="external/dng_sdk" revision="6dd5737b40c91b148673a29648281b89e1f2f62b" upstream="refs/heads/lineage-22.2" dest-branch="refs/heads/lineage-22.2" groups="pdk"/>
