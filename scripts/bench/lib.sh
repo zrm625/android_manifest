@@ -44,14 +44,14 @@ ensure_image() {
   [[ -n "$IMAGE" ]] || { echo "error: cannot resolve $IMAGE_TAG to an image ID" >&2; exit 1; }
 }
 
-# run_build TREE OUT TARGET JOBS CCACHE(0|1) LOG [INSTALLCLEAN(0|1)]
+# run_build TREE OUT TARGET JOBS CCACHE(0|1) LOG [INSTALLCLEAN(0|1)] [WITHOUT_NFC(true|false)]
 # Runs `m TARGET` in the container with TREE read-only and OUT writable.
 # With INSTALLCLEAN=1, runs `m installclean` first (not timed).
 # Writes "<exit code> <seconds> <peak memory bytes>" to OUT/.bench-result
 # and returns the exit code of m.
 run_build() {
   local tree=$1 out=$2 target=$3 jobs=$4 use_ccache=$5 log=$6 installclean=${7:-0}
-  local ccache_args
+  local ccache_args without_nfc=${8:-false}
   if [[ "$use_ccache" == 1 ]]; then
     mkdir -p "$CCACHE_HOME"
     ccache_args=(-v "$CCACHE_HOME:/ccache:rw" -e USE_CCACHE=1 -e CCACHE_EXEC=/usr/bin/ccache
@@ -73,6 +73,7 @@ run_build() {
     --tmpfs /home/build:exec -e HOME=/home/build -e USER=build \
     -v "$tree:/src:ro" -v "$tree/.repo:/src/.repo:O" -v "$out:/src/out:rw" -w /src \
     "${ccache_args[@]}" ${RIVER_BUILD_ID:+-e RIVER_BUILD_ID="$RIVER_BUILD_ID"} -e BUILD_TARGET="$target" -e BUILD_JOBS="$jobs" -e BUILD_INSTALLCLEAN="$installclean" \
+    -e RIVER_WITHOUT_NFC="$without_nfc" \
     "$IMAGE" bash -c '
       source build/envsetup.sh >/dev/null
       breakfast river >/dev/null || { echo "90 0 " > out/.bench-result; exit 90; }
