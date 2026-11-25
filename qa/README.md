@@ -466,7 +466,7 @@ whose chain did not pass in `$BENCH_HOME/qa/pstore-nopass/`.
   rule once (it needs sudo):
 
   ```sh
-  sudo ufw allow from 192.168.4.60 to 192.168.4.44 port 47801 proto tcp comment 'river phone-qa Wi-Fi check'
+  sudo ufw allow from 192.168.4.61 to 192.168.4.44 port 47801 proto tcp comment 'river phone-qa Wi-Fi check'
   ```
 
   Until the rule is in place, the Wi-Fi check is UNVERIFIED with "LAN
