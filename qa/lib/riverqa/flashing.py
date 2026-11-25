@@ -536,7 +536,8 @@ def flash_dev(product: Path, wipe: bool, reboot: bool) -> int:
         return EXIT_OK
     log("Waiting for boot (the first boot after a wipe takes a few minutes)")
     try:
-        rec = reboots.planned_reboot(dev, "fastboot", boot_timeout=FIRST_BOOT_TIMEOUT, in_fastboot=in_fb)
+        rec = reboots.planned_reboot(dev, "fastboot", boot_timeout=FIRST_BOOT_TIMEOUT,
+                                     in_fastboot=in_fb, trial_slot=target if st else None)
     except Unreachable:                # R10-4
         raise
     except (RuntimeError, TimeoutError) as e:

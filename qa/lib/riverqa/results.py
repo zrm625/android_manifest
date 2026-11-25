@@ -33,9 +33,9 @@ REQUIRED: list[str] = [c for checks in GROUPS.values() for c in checks]
 # Checks run by --baseline: no functional checks, so it works on Trebuchet.
 BASELINE_REQUIRED = (GROUPS["preflight"][:3] + ["preflight.journal", "preflight.continuity"] + GROUPS["identity"] +
                      [c for c in GROUPS["health"]])
-# Checks run by --quick: the health group on the live phone only.
+# Checks run by --quick: live health and NFC build contents.
 QUICK_REQUIRED = ["preflight.guards", "health.boot", "health.selinux", "health.crashes",
-                  "health.tombstones", "health.services", "health.telephony"]
+                  "health.tombstones", "health.services", "health.telephony", "radios.nfc"]
 
 # Checks whose helper test must reach a terminal result for eligibility.
 HELPER_CHECKS = {"radios.wifi", "radios.bluetooth", "radios.gps", "hardware.cameras",

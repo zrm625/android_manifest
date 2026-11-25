@@ -469,8 +469,8 @@ class Device:
             return False
         return any(line.split()[:1] == [self.serial] for line in r.stdout.splitlines())
 
-    def getvar(self, name: str) -> str:
-        r = self.fastboot("getvar", name, timeout=20)
+    def getvar(self, name: str, *, timeout: float = 20) -> str:
+        r = self.fastboot("getvar", name, timeout=timeout)
         if r.returncode != 0:
             return ""
         prefix = f"{name}:"

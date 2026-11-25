@@ -158,6 +158,8 @@ def stage(batch_id: str, product: Path, kind: str, experiment: bool, build_info:
         raise SystemExit(f"error: {bdir} already staged")
     sys_prop, ven_prop = product / "system/build.prop", product / "vendor/build.prop"
     info = read_json(build_info or (product.parents[2] / "river-build.json"), {}) or {}
+    if info.get("nfc_enabled") is False and kind != "experiment":
+        raise SystemExit("error: stage an NFC-off build as an experiment")
     ident = {"batch": batch_id, "build_id": read_prop(sys_prop, "ro.river.build_id"),
              "vendor_build_id": read_prop(ven_prop, "ro.vendor.river.build_id"),
              "commit_set": info.get("commit_set") or {}, "commit_set_hash": info.get("commit_set_hash")}
@@ -188,7 +190,8 @@ def stage(batch_id: str, product: Path, kind: str, experiment: bool, build_info:
         "version": 1,
         "batch": batch_id,
         "kind": kind,
-        "experiment": bool(experiment),
+        "experiment": bool(experiment) or info.get("nfc_enabled") is False,
+        "nfc_enabled": info.get("nfc_enabled"),
         "build_id": ident["build_id"],
         "vendor_build_id": ident["vendor_build_id"],
         "commit_set": ident["commit_set"],
