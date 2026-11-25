@@ -86,11 +86,18 @@ reference. The MIDI-only image is staged separately.
 and 1,032.0 MB) with a 51.29 s first benchmark boot. Quick QA passed. The
 probe passed 40 checks, including GPS, and reproduced the known rear-flash
 failure. Speaker and microphone measured 65.2 to 68.2 dB above silence.
-MIDI is already in Stack H. The Device Diagnostics-only run is pending, so
-the difference between these medians does not isolate its effect.
+MIDI is already in Stack H. See the Device Diagnostics-only comparison below.
 
-**Next:** run the staged Device Diagnostics-only image. Profile the kept
-Stack F reference before and after setup to rank the next set of changes.
+**Device Diagnostics-only comparison on Stack F:** 1,043.1 MB median
+before setup (1,058.2, 1,043.1, and 1,029.5 MB), 1,133.6 MB after five
+minutes on Perch, and a 51.69 s first benchmark boot. Quick QA passed.
+The probe passed 40 checks, including GPS, and reproduced the known
+rear-flash failure. Wi-Fi used 192.168.4.61 after setup. Both isolated
+comparisons passed the try gate against Stack F. Stack H remains the
+kept build. The separate boots do not establish an additive RAM saving.
+
+**Next:** profile the kept Stack F reference before and after setup to
+rank the next set of changes.
 
 **Low-RAM mode** (experiment on Stack D, branch `try-low-ram`): 1,076.2 MB
 median across three boots (1,076.2, 1,081.6, and 1,067.8 MB), with a 50.20 s
