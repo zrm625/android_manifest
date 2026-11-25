@@ -135,8 +135,9 @@ audio, and the core apps. The rear-flash check reproduced the dark frame.
 - Stack F received `192.168.4.61` after a wipe, outside the documented
   Wi-Fi QA firewall rule. Manifest PR #28 makes `phone-setup` select the
   factory MAC for the test SSID, but the phone still received `.61` after
-  the low-RAM wipe. The temporary `.61` firewall rule covers this lease.
-  Retest the `.60` reservation before removing that rule.
+  the low-RAM wipe, and again after the Stack H trials. Zak chose to move
+  the reservation, the QA fixture, the docs and the firewall rule to `.61`
+  instead of restarting the eero network.
 
 - `hardware.cameras`: the rear flash check (`on >= 20`) fails now and then in
   a dark room. Consider a relative threshold.

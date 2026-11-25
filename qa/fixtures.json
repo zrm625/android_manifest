@@ -4,7 +4,7 @@
     "lan_addr": "192.168.4.44",
     "lan_port": 47801,
     "local_port": 47800,
-    "phone_wifi_addr": "192.168.4.60",
+    "phone_wifi_addr": "192.168.4.61",
     "forge_bt_addr": "04:68:74:AA:CC:26"
   },
   "files": {

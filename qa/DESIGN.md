@@ -74,7 +74,7 @@ check like that would let a broken camera, speaker or sensor auto-merge.
     is true, so `mWakefulness` stays `Dozing` and never becomes `Asleep`.
   - River has no AVB vbmeta (`ro.boot.vbmeta.digest` is empty), so nothing on
     the phone identifies the flashed images by itself.
-  - The phone (192.168.4.60) and forge (192.168.4.44) are on the same Wi-Fi
+  - The phone (192.168.4.61) and forge (192.168.4.44) are on the same Wi-Fi
     LAN.
   - The phone hard-reset twice during review. Boot reason: `hardware_reset`.
     pstore had no panic.

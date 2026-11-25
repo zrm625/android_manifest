@@ -82,7 +82,7 @@ elif [[ -n "$ssid_file" ]]; then
   q() { printf "'%s'" "$(sed "s/'/'\\\\''/g" <<<"$1")"; }
   psk=$(<"$psk_file")
   # -r none: use the factory MAC, so the router's DHCP reservation
-  # (192.168.4.60, which forge's ufw rule for the QA Wi-Fi check expects) holds after a wipe.
+  # (192.168.4.61, which forge's ufw rule for the QA Wi-Fi check expects) holds after a wipe.
   a shell "cmd wifi connect-network $(q "$want_ssid") wpa2 $(q "$psk") -r none" >/dev/null 2>&1 || true
   unset psk
   for _ in $(seq 20); do wifi_ok && break; sleep 2; done
