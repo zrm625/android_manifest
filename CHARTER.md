@@ -8,7 +8,7 @@ these rules on 2026-11-23. Change them only in a pull request that Zak approves.
 
 | Goal | Target | How it is measured |
 | --- | --- | --- |
-| RAM | At most 1,000 MB used | Median Used RAM after setup. See [Measuring RAM](#measuring-ram). |
+| RAM | 1,044.4 MB settled accepted by Zak on 2026-11-26 | Use the settled reference to check for regressions. See [Measuring RAM](#measuring-ram). |
 | Must-work list | Every item passes | `phone-qa --quick` on every try, the full `phone-qa` daily. |
 | Autonomy | No hands | Build, flash, set up, QA, then keep or drop, with no one at the phone. |
 | No regressions | Boot ≤ 55 s; RAM no worse; `/system` no bigger unless RAM went down | See [Regressions](#regressions). |
@@ -18,6 +18,9 @@ these rules on 2026-11-23. Change them only in a pull request that Zak approves.
 
 Zak chose the after-setup RAM gate on 2026-11-25. The first reference
 reading was 1,047.8 MB on the NFC-enabled Stack I rebuild.
+On 2026-11-26, Zak accepted 1,044.4 MB on the kept system server build as
+good enough and closed the 1,000 MB goal. RAM measurements now check
+for regressions against the settled reference.
 
 - After `phone-setup`, leave Perch in the foreground and the screen on.
   Take the first Used RAM sample after five minutes. Take two more settled
@@ -166,7 +169,7 @@ These need Zak's approval:
 ## Order of work
 
 1. Perch and the GPS fix, the first tries.
-2. RAM work toward 1 GB.
+2. Check for RAM regressions against the settled reference.
 3. Better UI.
 4. Per-camera build switches.
 5. The backlog for removing compatibility code.
