@@ -194,6 +194,43 @@ stopped before it collected comparable frames. The experiment stays
 on the `measure-low-ram-stack-i` branch. Raw evidence is in
 `tries/measure-low-ram-stack-i/` under the benchmark directory.
 
+**HWUI cache policies (2026-11-25).** On the NFC-enabled default image,
+each policy ran twice on one boot. The second pass reversed the order.
+Perch, the test activities, and LatinIME restarted for each policy.
+After warm-up, each run recorded eight home-to-app round trips and
+eight keyboard show and hide cycles with six-second dwells.
+`default` selected the stock policy for the live test. The stock
+image trial omits the property.
+
+| Policy | Perch janky frames, forward and reverse | Perch p95, forward and reverse | LatinIME p95, forward and reverse |
+| --- | --- | --- | --- |
+| `extremelowram` | 36/189 and 33/192 | 57 ms and 46 ms | 46 ms and 65 ms |
+| `lowram` | 35/197 and 25/198 | 57 ms and 34 ms | 48 ms and 61 ms |
+| Stock | 43/199 and 39/199 | 57 ms and 57 ms | 46 ms and 46 ms |
+
+LatinIME recorded 8 janky frames out of 24 in every run. The test app
+recorded 16 out of 16 janky frames across app switches on
+`extremelowram`, 11 on `lowram`, and 9 on stock. Perch recorded 9.9%
+janky frames in the first run on the default image and 17.2% to 19.0%
+with its shipped policy in these repeats. The low-RAM mode result of
+15.3% falls within the observed default range, as does its LatinIME p95
+of 57 ms.
+Raw frame data is in `tries/hwui-live-compare/gfx/` under the benchmark
+directory.
+
+| Baked HWUI policy | Median RAM before setup | Median settled RAM | First benchmark boot |
+| --- | ---: | ---: | ---: |
+| `extremelowram` (current default repeat) | 990.1 MB | 1,053.5 MB | 51.33 s |
+| `lowram` | 991.2 MB | 1,054.3 MB | 49.69 s |
+| Stock (property unset) | 992.7 MB | 1,057.0 MB | 49.68 s |
+
+The two alternate images passed quick QA, and each probe passed 40 checks
+with the known dark rear-flash failure. The running properties matched the
+images. `lowram` missed the settled RAM limit by 1.5 MB, and stock missed
+it by 4.2 MB. The current default retains `extremelowram`. The candidate
+branches and evidence directories are `try-hwui-lowram` and
+`try-hwui-stock`.
+
 ## Open problems
 
 - **GPS** (must-work). `radios.gps` gets 0 status callbacks in 120 s with
