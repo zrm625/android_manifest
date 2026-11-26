@@ -108,7 +108,7 @@ fastboot -s ZY225DPT7F --set-active=<other slot>
 fastboot -s ZY225DPT7F reboot
 ```
 
-## Use
+## Using the build
 
 - The build is `userdebug`: `adb -s ZY225DPT7F root` works, and
   `adb -s ZY225DPT7F shell` gives a root shell after that.
@@ -120,6 +120,21 @@ fastboot -s ZY225DPT7F reboot
 - Apps: Files, Settings, Clock, the keyboard and the launcher. No calls, texts,
   mobile data, camera app, browser or gallery. Install apps with
   `adb -s ZY225DPT7F install <apk>` if you need one for a test.
+
+### Change the HWUI app cache policy
+
+River uses the `lowram` app graphics cache policy by default. On the debug
+build, set `persist.debug.river.hwui_memory_policy` to `lowram`,
+`extremelowram`, or `off`. The `off` setting selects Android's stock app
+cache policy.
+
+```sh
+adb -s ZY225DPT7F shell setprop persist.debug.river.hwui_memory_policy off
+adb -s ZY225DPT7F shell getprop debug.hwui.app_memory_policy  # default
+```
+
+Restart the affected app process or reboot the phone to apply the policy.
+The setting survives reboot. Set it to `lowram` to restore River's default.
 
 ## Measure on the phone
 
