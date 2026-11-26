@@ -4,9 +4,12 @@ Things to try on the river build. Small tries are stacked into one image;
 a stack that passes is kept whole, a stack that fails is split.
 How a try runs and when it is kept: [CHARTER.md](CHARTER.md#pipeline-tries).
 
-The target is 1,000 MB Used RAM after setup. The first settled reference is
-1,047.8 MB from the default Stack I rebuild. Its pre-setup median was
-989.8 MB. The old baseline-2 pre-setup median was 1,266 MB.
+The target is 1,000 MB Used RAM after setup. The current settled reference
+is 1,044.4 MB from `tries/try-system-server-verify/`. Set
+`RIVER_TRY_RAM_REFERENCE` to that directory under the benchmark directory
+for new trials. The first settled reference was 1,047.8 MB from the default
+Stack I rebuild. Its pre-setup median was 989.8 MB. The old baseline-2
+pre-setup median was 1,266 MB.
 
 ## Kept
 
@@ -103,6 +106,22 @@ app, HAL, vendor configs, SKU files, and init rules. These checks cover
 build contents on the XT1962-1. Reading a tag requires an NFC-equipped SKU.
 The 1,047.8 MB default settled sample is the first after-setup reference.
 
+**System server dexpreopt (`verify`).** The first benchmark reboot took
+51.80 s. Used RAM was 988.6 MB before setup and 1,044.4 MB settled, with
+settled samples of 1,041.0, 1,044.4, and 1,046.6 MB. The median was 3.4 MB
+below the original reference and 9.1 MB below the unchanged default
+repeat. `services.odex` shrank from 5,899,240 to 168,880 bytes.
+`/system` used 5,612 KiB less and `/vendor` usage was unchanged.
+Median `system_server` PSS fell from 162.9 MB on the default repeat
+to 159.3 MB. The running OAT header reported `compiler-filter=verify`.
+The post-probe snapshot recorded 3,296 KiB app JIT PSS, 21,255 KiB Dalvik
+heap PSS, and 22,108 KiB native heap PSS.
+
+Quick QA passed, including the NFC file check. The probe passed 39 checks
+and reproduced the dark rear-flash failure and the intermittent GPS
+failure. The targeted GPS rerun reported one satellite after 98 s.
+Kept in [sdm632-common #11](https://github.com/zrm625/android_device_motorola_sdm632-common/pull/11).
+
 ## Dropped
 
 | Try | Branch | Why dropped |
@@ -143,8 +162,8 @@ benchmark reboot took 51.33 s. Used RAM before setup was 1,004.9, 990.1, and
 978.8 MB across three boots, with a median of 990.1 MB. With Perch in the
 foreground and the display awake, the readings on one boot were 1,050.1,
 1,053.5, and 1,055.9 MB. The 1,053.5 MB median was 5.7 MB above the
-1,047.8 MB reference, so the repeat missed the gate by 0.7 MB. The
-reference remains 1,047.8 MB. Quick QA passed all eight checks, including
+1,047.8 MB reference, so the repeat missed the gate by 0.7 MB and
+kept the reference at 1,047.8 MB. Quick QA passed all eight checks, including
 the NFC file check. The probe passed 40 checks, including GPS and hardware
 H.264. The known dark rear-flash check failed. Raw evidence is in
 `tries/default-nfc-settled-repeat/` under the benchmark directory.
