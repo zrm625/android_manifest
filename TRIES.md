@@ -4,8 +4,9 @@ Things to try on the river build. Small tries are stacked into one image;
 a stack that passes is kept whole, a stack that fails is split.
 How a try runs and when it is kept: [CHARTER.md](CHARTER.md#pipeline-tries).
 
-The target is 1,000 MB Used RAM after setup. The current settled reference
-is 1,044.4 MB from `tries/try-system-server-verify/`. Set
+On 2026-11-26 Zak accepted 1,044.4 MB Used RAM after setup and closed the
+original 1,000 MB goal. The settled reference is 1,043.8 MB from
+`tries/river-hwui-runtime-policy/`. Set
 `RIVER_TRY_RAM_REFERENCE` to that directory under the benchmark directory
 for new trials. The first settled reference was 1,047.8 MB from the default
 Stack I rebuild. Its pre-setup median was 989.8 MB. The old baseline-2
@@ -121,6 +122,30 @@ Quick QA passed, including the NFC file check. The probe passed 39 checks
 and reproduced the dark rear-flash failure and the intermittent GPS
 failure. The targeted GPS rerun reported one satellite after 98 s.
 Kept in [sdm632-common #11](https://github.com/zrm625/android_device_motorola_sdm632-common/pull/11).
+
+**Runtime HWUI app cache policy (2026-11-26).** The default is `lowram`.
+The first benchmark reboot took 50.93 s. Used RAM was 991.8 MB before
+setup and 1,043.8 MB settled. The settled samples were 1,040.9, 1,043.8,
+and 1,046.7 MB. Zak waived the RAM gate for this try to prioritize
+Perch frame timing. The measured median also passed the gate. Quick QA
+passed all eight checks, including the NFC file check. The init file
+added 4 KiB of used space on `/system`.
+
+The two `lowram` runs recorded 27 janky Perch frames out of 198 and
+26 out of 201, with p95 frame times of 36 ms and 30 ms. The earlier
+`lowram` runs recorded 35 out of 197 and 25 out of 198, with p95 of 57 ms
+and 34 ms. LatinIME recorded 8 out of 24 in both new runs, with p95 of
+48 ms and 46 ms. The launch fixture recorded 8 out of 8 and 6 out of 8
+janky frames, with p95 of 30 ms and 24 ms. On the same image,
+`extremelowram` recorded 28 janky Perch frames out of 189 (p95 48 ms)
+and 7 janky launch frames out of 8 (p95 40 ms).
+
+Setting `persist.debug.river.hwui_memory_policy=off` selected Android's
+stock cache policy and survived a reboot. Fresh Perch processes rendered
+frames with `off` and after restoring `lowram`. Kept in
+[river #11](https://github.com/zrm625/android_device_motorola_river/pull/11).
+Raw evidence is in
+`tries/river-hwui-runtime-policy/` under the benchmark directory.
 
 ## Dropped
 
@@ -246,8 +271,8 @@ directory.
 The two alternate images passed quick QA, and each probe passed 40 checks
 with the known dark rear-flash failure. The running properties matched the
 images. `lowram` missed the settled RAM limit by 1.5 MB, and stock missed
-it by 4.2 MB. The current default retains `extremelowram`. The candidate
-branches and evidence directories are `try-hwui-lowram` and
+it by 4.2 MB. That comparison retained `extremelowram` as the default.
+The candidate branches and evidence directories are `try-hwui-lowram` and
 `try-hwui-stock`.
 
 ## Open problems
@@ -260,7 +285,7 @@ branches and evidence directories are `try-hwui-lowram` and
   desk is weak. Next: compare the official build with the same check at the
   same spot, then try by a window.
 
-## Ideas
+## Archived ideas
 
 | Try | Why |
 | --- | --- |
